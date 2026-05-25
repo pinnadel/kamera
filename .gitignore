@@ -1,0 +1,43 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.db
+data/
+/previews/
+.env
+Photo culling playground pics/
+*.jpg
+*.jpeg
+*.png
+*.RAF
+*.NEF
+*.HIF
+*.hif
+.claude/
+
+# Claude assistant project notes — may contain PII / personal workflow detail
+CLAUDE.md
+**/CLAUDE.md
+
+# Personal / portfolio docs — not for public consumption
+docs/PROJECT_WIKI.md
+docs/Learning-Journal.md
+docs/MOBILE_STATUS.md
+docs/portfolio-overview.md
+docs/perf-analysis-*.md
+
+# Internal planning / sprint docs — keep private
+docs/PLAN-next-sprints.md
+docs/phase2-plan.md
+docs/iphone-culling-plan.md
+
+# Internal experiment scratch — contains real personal paths + decision data
+docs/auto-cull-experiment/
+scripts/auto-cull-experiment/
+
+# Whitelisted asset folders — committed despite the global *.png / *.jpg
+# blocks that exist to keep RAW previews and source photos out of git.
+!kamera_app_icons_complete/**
+!frontend/public/**
+!docs/images/**

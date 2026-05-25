@@ -1,0 +1,375 @@
+/* ── Google Fonts: Inter ── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+/* ── GeistMono via jsDelivr (Vercel Geist package) ── */
+@import url('https://cdn.jsdelivr.net/npm/geist@1.3.0/dist/fonts/geist-mono/style.css');
+
+@import "tailwindcss";
+
+@theme {
+  --color-canvas:          #07080a;
+  --color-surface-100:     #101111;
+  --color-surface-200:     #161718;
+  --color-card:            #1b1c1e;
+  --color-text-primary:    #f9f9f9;
+  --color-text-secondary:  #cecece;
+  --color-text-tertiary:   #9c9c9d;
+  --color-text-disabled:   #6a6b6c;
+  --color-border-subtle:   rgba(255,255,255,0.06);
+  --color-border-default:  hsl(195 5% 15%);
+
+  /* Color swap applied:
+     accent-amber → Maybe state color (Warm Amber)
+     accent-cyan  → Selection / focus / best ring (Cool Cyan) */
+  --color-accent-amber:    #E8B84A;
+  --color-accent-cyan:     #5BB8D4;
+
+  --color-state-keep:      #7DB89A;
+  --color-state-maybe:     #E8B84A;
+  --color-state-reject:    #C97B7B;
+  --color-score-personal:  #7B82C9;
+
+  --font-sans: "Inter", "Inter Fallback", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "GeistMono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+
+  --radius-thumb:  6px;
+  --radius-panel:  12px;
+  --radius-input:  8px;
+  --radius-key:    4px;
+
+  --shadow-card:      0 1.2px 2.4px rgba(0,0,0,0.28);
+  --shadow-ring:      0 0 0 1px rgb(27,28,30), inset 0 0 0 1px rgb(7,8,10);
+  --shadow-floating:
+    0 0 0 2px rgba(0,0,0,0.5),
+    0 0 14px rgba(255,255,255,0.10),
+    inset 0 1px 0 rgba(255,255,255,0.05);
+  --shadow-key:
+    0 1.5px 0.5px 2.5px rgba(0,0,0,0.4),
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    inset 0 -1px 0 rgba(0,0,0,0.4),
+    0 1px 0 rgba(0,0,0,0.5),
+    0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-best-halo:  0 0 24px 4px rgba(232,184,74,0.10);
+  --shadow-loupe-halo: 0 0 80px 20px rgba(255,255,255,0.04);
+}
+
+html {
+  font-feature-settings: "calt" 1, "kern" 1, "liga" 1;
+}
+
+/* App logo: card-stack fills follow system theme (matches favicon + .icns family) */
+:root {
+  --logo-red:    #FF5A5A;
+  --logo-yellow: #FFC940;
+  --logo-green:  #3DDC84;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --logo-red:    #E8484A;
+    --logo-yellow: #E8AD35;
+    --logo-green:  #34C771;
+  }
+}
+
+/* ── UI Scale ──────────────────────────────────────────────────────────────
+   Applied as data-ui-scale on <html>. S = current default (compact),
+   M = 15% larger (recommended), L = 30% larger (accessible).
+   zoom scales every pixel value including Tailwind's hardcoded px classes
+   and Lucide SVG icon sizes without touching any individual component. */
+html[data-ui-scale="S"] { zoom: 1.0; }
+html[data-ui-scale="M"] { zoom: 1.15; }
+html[data-ui-scale="L"] { zoom: 1.30; }
+
+.font-mono {
+  font-feature-settings: "tnum" 1;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-text-primary);
+  letter-spacing: 0.2px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+
+@layer utilities {
+  .scrollbar-hide {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar { display: none; }
+
+  .label {
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.002em;
+    color: var(--color-text-secondary);
+    display: block;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, #1c1d1f 0%, #1c1d1f 40%, #2e3033 50%, #1c1d1f 60%, #1c1d1f 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.8s linear infinite;
+}
+
+/* ── AI animated border ───────────────────────────────────────────────────
+   Same vibe as VS Code's "agent is editing" indicator: a slow conic
+   rainbow runs around the card's stroke. Implementation uses a
+   registered CSS custom property so the gradient angle can be animated
+   (browsers can't animate raw conic-gradient `from` angles without it).
+
+   Usage:
+     <div class="ai-border ...">
+       <div class="ai-border-inner ...">…content…</div>
+     </div>
+
+   The outer .ai-border paints the rotating gradient and acts as the
+   stroke. The inner .ai-border-inner sits 1.5px inset and holds the real
+   card chrome (background, padding, copy). Inset method avoids needing
+   border-image (which doesn't accept conic gradients on Safari < 16).
+*/
+@property --ai-border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes ai-border-spin {
+  to { --ai-border-angle: 360deg; }
+}
+
+.ai-border {
+  position: relative;
+  border-radius: 12px;
+  /* 1.5px stroke painted as a conic gradient that spins. The pause stops at
+     0%/100% match so the loop is seamless. Colors deliberately span the
+     full hue wheel for the "AI is doing something" cue, then stop in
+     muted blues so it doesn't scream. */
+  background:
+    conic-gradient(
+      from var(--ai-border-angle),
+      #5BB8D4 0deg,        /* cyan (selection accent) */
+      #7B82C9 60deg,       /* personal score indigo */
+      #E8B84A 140deg,      /* maybe amber */
+      #C97B7B 210deg,      /* reject coral */
+      #7DB89A 280deg,      /* keep green */
+      #5BB8D4 360deg       /* loop back to cyan */
+    );
+  padding: 1.5px;
+  animation: ai-border-spin 14s linear infinite;
+  /* Subtle outer glow so the stroke reads as luminescent, not painted. */
+  box-shadow: 0 0 18px -6px rgba(123,130,201,0.45);
+}
+
+.ai-border-inner {
+  border-radius: 10.5px; /* outer radius − padding so the curve nests cleanly */
+  background: var(--color-surface-100);
+  /* The actual card chrome layers on top of this via the consumer's classes. */
+}
+
+/* Compact animated border for small controls (inputs, buttons).
+   Uses ::before with inset: -1px so the stroke sits outside the element
+   and adds zero to its dimensions. isolation: isolate keeps z-index: -1
+   scoped to this stacking context so the pseudo-element doesn't leak
+   behind unrelated ancestors. */
+.ai-border-sm {
+  isolation: isolate;
+}
+
+.ai-border-sm::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 5px; /* input rounded (4px) + 1px overhang */
+  background:
+    conic-gradient(
+      from var(--ai-border-angle),
+      #5BB8D4 0deg,
+      #7B82C9 60deg,
+      #E8B84A 140deg,
+      #C97B7B 210deg,
+      #7DB89A 280deg,
+      #5BB8D4 360deg
+    );
+  z-index: -1;
+  animation: ai-border-spin 14s linear infinite;
+  box-shadow: 0 0 10px -4px rgba(123,130,201,0.30);
+}
+
+/* Urgency variant: 2× spin speed for "AI is actively working right now"
+   surfaces (e.g. the GroupLoupe burst-ranking chip). Default is 14s — the
+   ambient brand cadence used by PersonalModelBanner and semantic search. */
+.ai-border-fast::before {
+  animation-duration: 7s;
+}
+
+/* Empty-state folder CTA — hover lifts the cyan focus ring from a barely-
+   there 10% to 60% so the disc reads as interactive, plus a soft outer halo
+   that mirrors the selection color. */
+.folder-cta > div {
+  box-shadow:
+    inset 0 0 0 1px rgba(255,255,255,0.04),
+    0 0 0 1px rgba(91,184,212,0.10);
+}
+.folder-cta:hover > div {
+  box-shadow:
+    inset 0 0 0 1px rgba(91,184,212,0.20),
+    0 0 0 1px rgba(91,184,212,0.60),
+    0 0 24px -6px rgba(91,184,212,0.45);
+}
+.folder-cta:focus-visible > div {
+  box-shadow:
+    inset 0 0 0 1px rgba(91,184,212,0.20),
+    0 0 0 2px rgba(91,184,212,0.80);
+}
+
+/* Animated rainbow text — reuses the same --ai-border-angle property and
+   spin keyframe so the text gradient is in sync with any nearby border. */
+.ai-text-rainbow {
+  background:
+    conic-gradient(
+      from var(--ai-border-angle),
+      #5BB8D4 0deg,
+      #7B82C9 60deg,
+      #E8B84A 140deg,
+      #C97B7B 210deg,
+      #7DB89A 280deg,
+      #5BB8D4 360deg
+    );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: ai-border-spin 14s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-border,
+  .ai-border-sm,
+  .ai-text-rainbow {
+    animation: none;
+  }
+}
+
+/* ── Primary CTA: refined cyan fill with gradient + depth ─────────────────
+   Layout (padding, font weight, flex, border-radius) comes from the
+   BTN_PRIMARY class string in ui/buttons.js. This rule layers on the
+   visual chrome — vertical gradient, inset highlight + shadow, drop
+   shadow, tinted ring, and a cyan glow on hover. The macOS HIG primary
+   button done in cyan. */
+.btn-primary {
+  position: relative;
+  color: #07080a;
+  background: linear-gradient(180deg, #6FC9DF 0%, #4FA8C4 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.22),     /* top inner highlight */
+    inset 0 -1px 0 rgba(0,0,0,0.18),          /* bottom inner shadow */
+    0 1px 2px rgba(0,0,0,0.40),               /* drop shadow */
+    0 0 0 1px rgba(91,184,212,0.45);          /* tinted ring */
+  transition: box-shadow 180ms ease, opacity 120ms ease, transform 80ms ease;
+}
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.96;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.28),
+    inset 0 -1px 0 rgba(0,0,0,0.18),
+    0 2px 6px rgba(0,0,0,0.45),
+    0 0 0 1px rgba(91,184,212,0.65),
+    0 0 14px -2px rgba(91,184,212,0.55);      /* outer cyan glow */
+}
+.btn-primary:active:not(:disabled) {
+  transform: translateY(0.5px);
+  box-shadow:
+    inset 0 1px 1px rgba(0,0,0,0.20),
+    0 0 0 1px rgba(91,184,212,0.55);
+}
+/* "+ New analysis" outline button — cyan stroke + cyan glow on hover,
+   mirrors .btn-primary's hover chrome but stays transparent-filled. */
+.new-analysis-btn {
+  color: #5BB8D4;
+  background: transparent;
+  box-shadow: 0 0 0 1px rgba(91,184,212,0.55);
+  transition: box-shadow 180ms ease, color 120ms ease;
+}
+.new-analysis-btn:hover {
+  color: #6FC9DF;
+  box-shadow:
+    0 0 0 1px rgba(91,184,212,0.75),
+    0 0 14px -2px rgba(91,184,212,0.55);
+}
+.new-analysis-btn:active {
+  box-shadow: 0 0 0 1px rgba(91,184,212,0.55);
+}
+
+.btn-primary:disabled {
+  /* Don't desaturate — the Tailwind disabled:opacity-40 from BTN_PRIMARY
+     handles dimming. Just drop the heavy shadows so the button reads
+     "inactive" without a competing rim. */
+  box-shadow: 0 0 0 1px rgba(91,184,212,0.20);
+}
+
+/* ── react-day-picker (v10) dark theme ────────────────────────────────────
+   The package's own style.css is imported in FilterPill.jsx and lands AFTER
+   our base styles, so plain class-level overrides lose specificity. We boost
+   specificity with a wrapper class and rely on inline CSS variables on the
+   wrapper for hue/size — those win regardless of import order. */
+.pca-day-picker {
+  color: #cecece;
+  font-size: 12px;
+  color-scheme: dark;
+}
+.pca-day-picker .rdp-caption_label,
+.pca-day-picker .rdp-month_caption {
+  color: #f0f0f0;
+  font-weight: 500;
+}
+.pca-day-picker .rdp-weekday {
+  color: #6a6b6c;
+  font-weight: 400;
+  text-transform: none;
+}
+.pca-day-picker .rdp-day:not(.rdp-disabled):not(.rdp-selected):hover {
+  background-color: rgba(255,255,255,0.06);
+  border-radius: 6px;
+}
+.pca-day-picker .rdp-day_button:focus-visible {
+  outline: 1px solid #5BB8D4;
+}
+.pca-day-picker .rdp-today:not(.rdp-selected) .rdp-day_button {
+  color: #E8B84A;
+  font-weight: 500;
+}
+.pca-day-picker .rdp-outside .rdp-day_button {
+  color: #4a4a4a;
+}
+.pca-day-picker .rdp-chevron {
+  fill: #cecece;
+}
+.pca-day-picker .rdp-button_previous:hover .rdp-chevron,
+.pca-day-picker .rdp-button_next:hover .rdp-chevron {
+  fill: #f0f0f0;
+}
+.pca-day-picker .rdp-nav button {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+.pca-day-picker .rdp-nav button:hover {
+  background: rgba(255,255,255,0.06);
+}

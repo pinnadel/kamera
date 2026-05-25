@@ -1,0 +1,96 @@
+name: Bug report
+description: Something is broken, crashing, or behaving wrong
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The more specific, the easier to fix.
+
+        If the app crashed or the backend exited, the log at `data/app.log` usually has the answer — please paste the relevant lines below.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead?
+      placeholder: |
+        I expected K to move the photo to _Keeps/.
+        Instead the photo stayed in the source folder and nothing happened in the UI.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: A list of steps that reliably triggers it. "Sometimes" is OK — say so.
+      placeholder: |
+        1. Open a folder of ~200 RAFs
+        2. Wait for analysis to finish
+        3. Select the first photo
+        4. Press K
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: e.g. macOS 15.4 / Windows 11 / Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: Especially helpful for performance bugs.
+      placeholder: e.g. MacBook Pro M3 Pro 18 GB / Windows desktop with RTX 3060
+    validations:
+      required: false
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: e.g. 3.13.2
+    validations:
+      required: false
+
+  - type: dropdown
+    id: cameras
+    attributes:
+      label: Camera / file format involved
+      multiple: true
+      options:
+        - Fujifilm X100VI (.RAF)
+        - Fujifilm X Half (.RAF)
+        - Other Fuji (.RAF)
+        - Nikon Z6III (.NEF)
+        - Other Nikon (.NEF)
+        - JPEG / PNG
+        - HEIC / HIF
+        - Other RAW format
+        - Not relevant (UI / general bug)
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste the last ~50 lines of `data/app.log`, or any error message from the terminal.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, screen recordings, anything you think might help.
+    validations:
+      required: false

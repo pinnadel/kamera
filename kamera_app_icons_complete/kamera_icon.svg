@@ -1,0 +1,55 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="iconClip">
+      <rect x="0" y="0" width="1024" height="1024" rx="226" ry="226"/>
+    </clipPath>
+
+    <!-- Red ground shadow: closest to surface, sharpest -->
+    <filter id="redGnd" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="12.8"/>
+      <feOffset dx="15.4" dy="20.5"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.22"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <!-- Yellow ground shadow: one card height above, softer -->
+    <filter id="yellGnd" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="35.8"/>
+      <feOffset dx="30.7" dy="41"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.22"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <!-- Green ground shadow: two card heights above, very soft and faint -->
+    <filter id="grnGnd" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="61.4"/>
+      <feOffset dx="41" dy="61.4"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.12"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <!-- Card-on-card shadow: close distance, soft but defined -->
+    <filter id="c2c" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10.2"/>
+      <feOffset dx="10.2" dy="12.8"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.32"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#iconClip)">
+    <!-- Background -->
+    <rect x="0" y="0" width="1024" height="1024" fill="#F5F2EC"/>
+
+    <!-- Red card: back/bottom, ground shadow only -->
+    <rect x="338" y="451" width="492" height="369" rx="51" fill="#FF5A5A" filter="url(#redGnd)"/>
+
+    <!-- Yellow card: middle, ground shadow + card-on-card onto red -->
+    <rect x="246" y="328" width="492" height="369" rx="51" fill="#FFC940" filter="url(#yellGnd)"/>
+    <rect x="246" y="328" width="492" height="369" rx="51" fill="#FFC940" filter="url(#c2c)"/>
+
+    <!-- Green card: front/top, ground shadow (very soft) + card-on-card onto yellow -->
+    <rect x="154" y="205" width="492" height="369" rx="51" fill="#3DDC84" filter="url(#grnGnd)"/>
+    <rect x="154" y="205" width="492" height="369" rx="51" fill="#3DDC84" filter="url(#c2c)"/>
+  </g>
+</svg>

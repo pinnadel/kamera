@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 3 personal-model feature vector",
+  "snapshot_date": "2026-05-04",
+  "source_file": "phase3_learning/feature_extractor.py",
+  "vector_dtype": "float32",
+  "vector_length": 17,
+  "missing_value_strategy": "SimpleImputer(strategy='mean') — fills NaN with training-set mean. NO 'feature was missing' indicator companion features.",
+  "label_mapping": {
+    "keep":   1.0,
+    "maybe":  0.0,
+    "reject": -1.0
+  },
+  "score_formula": "personal_score = clamp(overall_score + clamp(model.predict(features) * 25, -25, +25), 0, 100)",
+  "training_constraint": {
+    "min_decisions": 20,
+    "enforced_at": "phase3_learning/personal_model.py::train()"
+  },
+  "pipeline": [
+    { "step": "SimpleImputer", "config": { "strategy": "mean" } },
+    { "step": "StandardScaler", "config": {} },
+    { "step": "GradientBoostingRegressor", "config": {
+        "n_estimators": 200,
+        "max_depth": 3,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "random_state": 42
+    } }
+  ],
+  "features": [
+    { "index": 0,  "name": "sharpness_score",      "source_column": "images.sharpness_score",      "dtype": "float", "range": "[0, 100]", "semantics": "Phase 1 tile-p90 multi-measure fusion (Laplacian + Tenengrad + Modified-Laplacian). 100 = tack sharp." },
+    { "index": 1,  "name": "exposure_score",       "source_column": "images.exposure_score",       "dtype": "float", "range": "[0, 100]", "semantics": "Phase 1 histogram-based exposure score. Penalises mean deviation from 128 + clipping > 10% + low contrast." },
+    { "index": 2,  "name": "overall_score",        "source_column": "images.overall_score",        "dtype": "float", "range": "[0, 100]", "semantics": "sharpness*w + exposure*(1-w), w=0.65 default. WARNING: this is also the additive base for personal_score — known double-counting risk." },
+    { "index": 3,  "name": "iqa_score",            "source_column": "images.iqa_score",            "dtype": "float", "range": "[0, 100]", "semantics": "TOPIQ no-reference perceptual IQA. 0 raw → clamped → x100." },
+    { "index": 4,  "name": "aesthetic_score",      "source_column": "images.aesthetic_score",      "dtype": "float", "range": "[0, 100]", "semantics": "LAION Aesthetic Predictor V2 linearMSE on CLIP-L/14 (L2-normed) embedding. 1-10 raw → (raw-1)/9*100." },
+    { "index": 5,  "name": "highlight_clip_pct",   "source_column": "images.highlight_clip_pct",   "dtype": "float", "range": "[0, 100]", "semantics": "% of preview pixels at value 255 (any channel). Computed live from the preview, not RAW." },
+    { "index": 6,  "name": "shadow_clip_pct",      "source_column": "images.shadow_clip_pct",      "dtype": "float", "range": "[0, 100]", "semantics": "% of preview pixels at value 0." },
+    { "index": 7,  "name": "shake_detected",       "source_column": "images.shake_detected",       "dtype": "int",   "range": "{0, 1}",   "semantics": "Boolean fused from EXIF rule (shutter vs. safe threshold) and pixel rule (gradient direction consistency + FFT elongation)." },
+    { "index": 8,  "name": "face_detected",        "source_column": "images.face_detected",        "dtype": "int",   "range": "{0, 1}",   "semantics": "True if FaceLandmarker OR BlazeFace fallback found a face." },
+    { "index": 9,  "name": "face_count",           "source_column": "images.face_count",           "dtype": "int",   "range": "[0, N]",   "semantics": "Total faces detected. Aggregation policy across faces is 'worst case' (e.g., eyes_open=False if any face has closed eyes)." },
+    { "index": 10, "name": "face_sharpness_score", "source_column": "images.face_sharpness_score", "dtype": "float", "range": "[0, 100] or NULL", "semantics": "Laplacian variance on the face crop ONLY (not the whole image). NULL when face_detected=0. NaN imputed with population mean — known correctness risk." },
+    { "index": 11, "name": "eyes_open",            "source_column": "images.eyes_open",            "dtype": "int",   "range": "{0, 1, NULL}", "semantics": "True iff blendshape mean(left+right blink) <= 0.4. From FaceLandmarker only — BlazeFace fallback returns NULL." },
+    { "index": 12, "name": "eye_openness_ratio",   "source_column": "images.eye_openness_ratio",   "dtype": "float", "range": "[0, 1] or NULL", "semantics": "1 - mean(left_blink, right_blink). 1.0 = fully open, 0.0 = fully closed. NULL with no face data." },
+    { "index": 13, "name": "face_size_ratio",      "source_column": "images.face_size_ratio",      "dtype": "float", "range": "[0, 1] or NULL", "semantics": "Face bbox area / image area. Bigger = more portrait-like framing." },
+    { "index": 14, "name": "focal_length_mm",      "source_column": "images.focal_length_mm",      "dtype": "float", "range": "(0, ~600] or NULL", "semantics": "EXIF focal length. Lens-dependent. Often missing on RAFs without complete EXIF parsing." },
+    { "index": 15, "name": "aperture",             "source_column": "images.aperture",             "dtype": "float", "range": "(0.7, ~64] or NULL", "semantics": "EXIF f-number. Lower = wider aperture, shallower DoF." },
+    { "index": 16, "name": "iso",                  "source_column": "images.iso",                  "dtype": "int",   "range": "[64, 51200] or NULL", "semantics": "EXIF ISO speed. Higher → more noise → harder to score sharpness honestly." }
+  ],
+  "feature_correlation_warnings": [
+    "feature[2] (overall_score) is a deterministic linear combination of feature[0] and feature[1] with known weights. Including all three may cause GBR to over-weight the sharpness/exposure axis.",
+    "feature[2] is ALSO the additive base for personal_score — double-counted.",
+    "feature[8] (face_detected) and feature[9] (face_count) are highly correlated (face_count >= 1 ↔ face_detected = 1).",
+    "feature[8], feature[10], feature[11], feature[12], feature[13] are jointly NULL when face_detected=0. Imputation strategy invents 'eyes mostly open' values for no-face rows."
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KaMeRa — dependency inventory",
+  "snapshot_date": "2026-05-04",
+  "platform_constraint": "macOS-only (folder picker uses osascript; send2trash uses macOS Trash)",
+  "python": {
+    "min_version": "3.10",
+    "tested_on": "3.13",
+    "source_file": "requirements.txt",
+    "production": [
+      { "name": "fastapi",                "version": "==0.136.0", "license": "MIT",        "purpose": "HTTP server framework." },
+      { "name": "uvicorn[standard]",      "version": "==0.44.0",  "license": "BSD-3",      "purpose": "ASGI server." },
+      { "name": "pydantic",               "version": "==2.13.2",  "license": "MIT",        "purpose": "Request/response model validation." },
+      { "name": "Pillow",                 "version": "==12.2.0",  "license": "HPND",       "purpose": "Generic image I/O. Backbone for previews + scorer preprocessing." },
+      { "name": "pillow-heif",            "version": "==1.3.0",   "license": "LGPL-3",     "purpose": "HEIF/HIF decoder. Registers a Pillow plugin so PIL.Image.open() handles .heic/.hif (Fuji X-series camera-baked previews)." },
+      { "name": "opencv-contrib-python",  "version": "==4.13.0.92","license": "Apache-2",  "purpose": "Strict superset of opencv-python and opencv-python-headless. Pinning contrib gives one consistent install across mediapipe (pulls contrib) and pyiqa (pulls headless)." },
+      { "name": "rawpy",                  "version": "==0.26.1",  "license": "MIT (binding); LGPL (LibRaw)", "purpose": "RAF + NEF demosaicing. CANNOT decode Nikon HE* compression — pipeline falls back to extract_thumb()." },
+      { "name": "numpy",                  "version": "==2.4.4",   "license": "BSD-3",      "purpose": "Numerical core for all scorers." },
+      { "name": "mediapipe",              "version": "==0.10.33", "license": "Apache-2",   "purpose": "FaceLandmarker (478 landmarks + blendshapes) + BlazeFace fallback. Verified compatible with Python 3.13 + macOS CPU." },
+      { "name": "pyiqa",                  "version": "==0.1.15",  "license": "Apache-2",   "purpose": "TOPIQ no-reference IQA. ~100 MB weights to ~/.cache/pyiqa/. CPU-pinned (MPS adaptive_avg_pool2d incompatibility)." },
+      { "name": "transformers",           "version": ">=4.40.0",  "license": "Apache-2",   "purpose": "Loads CLIP-L/14 (LAION backbone) and SigLIP-base from huggingface_hub. The huggingface_hub dep is transitive." },
+      { "name": "ExifRead",               "version": "==3.5.1",   "license": "BSD-3",      "purpose": "EXIF metadata extraction (camera, lens, focal_length, aperture, shutter, ISO)." },
+      { "name": "watchdog",               "version": "==6.0.0",   "license": "Apache-2",   "purpose": "Folder monitoring (single-folder, non-recursive observer)." },
+      { "name": "scikit-learn",           "version": ">=1.4.0",   "license": "BSD-3",      "purpose": "Phase 3 personal model: SimpleImputer + StandardScaler + GradientBoostingRegressor." },
+      { "name": "openai",                 "version": ">=1.0.0",   "license": "Apache-2",   "purpose": "OpenAI-compatible client used to call LM Studio at localhost:1234. Optional / opt-in." },
+      { "name": "send2trash",             "version": ">=1.8.0",   "license": "BSD-3",      "purpose": "macOS Trash integration for POST /trash-rejects." },
+      { "name": "python-dotenv",          "version": "==1.2.2",   "license": "BSD-3",      "purpose": "Load .env files (development convenience)." }
+    ],
+    "transitive_notable": [
+      { "name": "torch",                  "purpose": "Pulled by pyiqa + transformers. Used for all PyTorch inference." },
+      { "name": "huggingface_hub",        "purpose": "Pulled by transformers. Manages weight downloads to ~/.cache/huggingface/." },
+      { "name": "pyexiftool",             "purpose": "Used for XMP sidecar writes (UUID + rating). Required to be installed in the venv." }
+    ]
+  },
+  "javascript": {
+    "node_min": "18",
+    "source_file": "frontend/package.json",
+    "production": [
+      { "name": "react",                "version": "^19.2.4", "license": "MIT", "purpose": "UI runtime." },
+      { "name": "react-dom",            "version": "^19.2.4", "license": "MIT", "purpose": "DOM renderer." },
+      { "name": "react-hotkeys-hook",   "version": "^5.2.4",  "license": "MIT", "purpose": "Keyboard shortcut bindings (K/M/R, arrows, ⌘Z, etc.)." },
+      { "name": "tailwindcss",          "version": "^4.2.2",  "license": "MIT", "purpose": "Atomic CSS." },
+      { "name": "@tailwindcss/vite",    "version": "^4.2.2",  "license": "MIT", "purpose": "Tailwind v4 Vite integration." }
+    ],
+    "dev": [
+      { "name": "vite",                          "version": "^8.0.4",  "license": "MIT", "purpose": "Dev server + build tool." },
+      { "name": "@vitejs/plugin-react",          "version": "^6.0.1",  "license": "MIT", "purpose": "React fast refresh in Vite." },
+      { "name": "eslint",                        "version": "^9.39.4", "license": "MIT" },
+      { "name": "@eslint/js",                    "version": "^9.39.4", "license": "MIT" },
+      { "name": "eslint-plugin-react-hooks",     "version": "^7.0.1",  "license": "MIT" },
+      { "name": "eslint-plugin-react-refresh",   "version": "^0.5.2",  "license": "MIT" },
+      { "name": "globals",                       "version": "^17.4.0", "license": "MIT" },
+      { "name": "@types/react",                  "version": "^19.2.14",  "license": "MIT" },
+      { "name": "@types/react-dom",              "version": "^19.2.3",   "license": "MIT" }
+    ]
+  },
+  "model_weights": {
+    "downloaded_on_first_use": [
+      { "name": "MediaPipe FaceLandmarker",   "size": "3.6 MB",  "destination": "data/models/face_landmarker.task" },
+      { "name": "MediaPipe BlazeFace short-range", "size": "224 KB", "destination": "data/models/blaze_face_short_range.tflite" },
+      { "name": "TOPIQ",                       "size": "~100 MB", "destination": "~/.cache/pyiqa/" },
+      { "name": "OpenAI CLIP ViT-L/14",        "size": "~890 MB", "destination": "~/.cache/huggingface/openai/clip-vit-large-patch14" },
+      { "name": "LAION Aesthetic Predictor V2 linearMSE head", "size": "3.7 MB", "destination": "~/.cache/huggingface/camenduru/improved-aesthetic-predictor" },
+      { "name": "google/siglip-base-patch16-224", "size": "~300 MB", "destination": "~/.cache/huggingface/google/siglip-base-patch16-224" }
+    ],
+    "user_supplied": [
+      { "name": "LM Studio vision model", "size": "varies (1-30 GB)", "destination": "user's LM Studio install; communicated over localhost:1234 OpenAI-compat API" }
+    ],
+    "trained_on_user_decisions": [
+      { "name": "personal_model.pkl", "size": "<1 MB", "destination": "data/models/personal_model.pkl", "created_after": "POST /train-model with >= 20 decisions" }
+    ]
+  },
+  "license_concerns": [
+    {
+      "package_or_model": "discus0434/aesthetic-predictor-v2-5",
+      "license": "AGPL",
+      "status": "REJECTED",
+      "reason": "AGPL is incompatible with potential future commercial use of the app. Sticking with LAION V2 linearMSE."
+    },
+    {
+      "package_or_model": "TOPIQ + CLIP ViT-L/14",
+      "license": "research-only training corpora",
+      "status": "MONITOR",
+      "reason": "Both are research-trained on datasets with murky commercial licensing. Blockers if commercialised; clean for personal use."
+    },
+    {
+      "package_or_model": "LibRaw (via rawpy)",
+      "license": "LGPL",
+      "status": "OK",
+      "reason": "Dynamic linkage via rawpy. Compatible with personal-use distribution; needs review if redistributed."
+    }
+  ]
+}

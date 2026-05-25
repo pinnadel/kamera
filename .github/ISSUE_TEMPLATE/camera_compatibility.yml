@@ -1,0 +1,55 @@
+name: Camera / RAW compatibility report
+description: A camera or file format that did or didn't work
+title: "[camera] "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compatibility reports — positive and negative — are extremely useful. KaMeRa is only tested on three cameras; every additional data point helps.
+
+  - type: input
+    id: camera
+    attributes:
+      label: Camera model
+      placeholder: e.g. Sony A7 IV / Canon R6 / Fuji X-T5
+    validations:
+      required: true
+
+  - type: input
+    id: format
+    attributes:
+      label: File format and extension
+      placeholder: e.g. .ARW (Sony lossless compressed RAW)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What happened?
+      options:
+        - "Worked perfectly"
+        - "Worked, but with quirks (describe below)"
+        - "Analysis ran but previews look wrong"
+        - "Analysis failed / files skipped"
+        - "Crashed the app"
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Anything more — error messages, what looked wrong, sample file sizes, etc.
+    validations:
+      required: false
+
+  - type: textarea
+    id: sample-exif
+    attributes:
+      label: Sample EXIF (optional)
+      description: Output of `exiftool yourfile.raw | head -40` is gold for diagnosing format quirks.
+      render: shell
+    validations:
+      required: false

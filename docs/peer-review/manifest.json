@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KaMeRa — peer review package manifest",
+  "package_version": "1.0",
+  "snapshot_date": "2026-05-04",
+  "app_version": "0.9",
+  "repository": "../..",
+  "author_role": "Senior UX designer, learning to code (single-developer personal tool)",
+  "review_axes": [
+    { "id": "architecture", "primary_doc": "01-architecture.md", "review_prompt": "07-review-prompts.md#prompt-1" },
+    { "id": "models",       "primary_doc": "02-models.md",       "review_prompt": "07-review-prompts.md#prompt-2" },
+    { "id": "ux",           "primary_doc": "04-ux.md",           "review_prompt": "07-review-prompts.md#prompt-3" }
+  ],
+  "reading_order": {
+    "30_minutes": ["00-overview.md", "06-known-risks.md", "07-review-prompts.md"],
+    "2_hours": ["00-overview.md", "01-architecture.md", "02-models.md", "04-ux.md", "06-known-risks.md", "07-review-prompts.md"],
+    "deep_dive": ["00-overview.md", "01-architecture.md", "02-models.md", "03-scoring.md", "04-ux.md", "05-decisions-log.md", "06-known-risks.md", "07-review-prompts.md", "endpoints.json", "schema.sql", "features.json", "dependencies.json"]
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Index. Start here.",
+      "sha256": "81e0229c95780bea4d8dea1264233b2627d4e43419ed06e75ada76153ab7d170",
+      "bytes": 7337,
+      "lines": 108
+    },
+    {
+      "path": "00-overview.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "TL;DR + glossary + 10 system invariants + hardware profile + what this app is NOT.",
+      "sha256": "feee9df42debb7eee0264fd6dad17ad551b68fa92818388728809fd5d70d7c5a",
+      "bytes": 6484,
+      "lines": 71
+    },
+    {
+      "path": "01-architecture.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Process model, single-photo data flow diagram, threading contract, storage layers, frontend state model, design rationale, strain points.",
+      "sha256": "7b08196031f9ac2d5838426dbd9b3795500e30a4a0bef5715b3fd9df99b539fc",
+      "bytes": 19422,
+      "lines": 238
+    },
+    {
+      "path": "02-models.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Inventory of all 8 ML/algorithmic components: weights, preprocessing, output range, integration code, calibration risks per model. Plus stack-level critique.",
+      "sha256": "49424a5053184eeb7b41c8b6db1efc038833f411e3294b739b58ebdf39859223",
+      "bytes": 16925,
+      "lines": 243
+    },
+    {
+      "path": "03-scoring.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Algebraic detail of Phase 1 (sharpness fusion, exposure, shake), the auto-cull rules, and the Phase 3 personal-model math.",
+      "sha256": "2226e16693ab224aa151f1cd410eb06fac59726dade1c9def231846542d28b0d",
+      "bytes": 12675,
+      "lines": 222
+    },
+    {
+      "path": "04-ux.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Five views, keyboard model, DetailView panel patterns, tab system, design system tokens, empty states, toast layers, stop honesty, friction inventory.",
+      "sha256": "1e3fc5931449165b50cccd8980cbaf00ad45e0912ecc713c7bade6990d5d29f9",
+      "bytes": 14509,
+      "lines": 228
+    },
+    {
+      "path": "05-decisions-log.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Notable past trade-offs: ML-stack swaps, architecture choices, UX decisions, deferred futures, discarded prototypes.",
+      "sha256": "f52f5ce7e746e230550b68875a68a7090497ee9cd0c3d1ce6045b8f766cde817",
+      "bytes": 10602,
+      "lines": 147
+    },
+    {
+      "path": "06-known-risks.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Author's honest list of weak spots, severity-tagged. Read this FIRST if reviewer is time-constrained.",
+      "sha256": "6facc33489ae29399d0ed19b7593c3e05d7bc70f9eefa60754c5831448306183",
+      "bytes": 10683,
+      "lines": 138
+    },
+    {
+      "path": "07-review-prompts.md",
+      "type": "markdown",
+      "audience": ["human", "ai"],
+      "purpose": "Pre-written prompts a reviewer can paste into another LLM to attack a specific axis (architecture / models / UX / composite / specific-challenge).",
+      "sha256": "2ff4e020bb893e3730c7f80e570979894cd94f8e6e7b378a40a932f6f3324daf",
+      "bytes": 10360,
+      "lines": 125
+    },
+    {
+      "path": "endpoints.json",
+      "type": "json",
+      "audience": ["ai", "tooling"],
+      "purpose": "All 36 HTTP endpoints with method, path, source line, purpose, destructive/long-running flags. Machine-readable.",
+      "sha256": "5c60bb3635d14e53c18f1c0544364cf312bc3667822968314c47bb6f43aa9c07",
+      "bytes": 7426,
+      "lines": 52
+    },
+    {
+      "path": "features.json",
+      "type": "json",
+      "audience": ["ai", "tooling"],
+      "purpose": "The 17-dim Phase 3 feature vector with exact order, source column, dtype, range, semantics, plus pipeline config and feature-correlation warnings.",
+      "sha256": "de1ec88f6f2017105ad38ad591a9ef8d3d848b2274aa5a83318296e714e6d61b",
+      "bytes": 6010,
+      "lines": 55
+    },
+    {
+      "path": "schema.sql",
+      "type": "sql",
+      "audience": ["ai", "tooling", "human"],
+      "purpose": "Full SQLite schema (post-migration state) with column-level comments. Ready to load via `sqlite3 :memory: < schema.sql`.",
+      "sha256": "e1866dfcb7193daa0f94074d17fc8f1cd4d7d116c7e88c7fefe5028d0ba98b5d",
+      "bytes": 9981,
+      "lines": 170
+    },
+    {
+      "path": "dependencies.json",
+      "type": "json",
+      "audience": ["ai", "tooling"],
+      "purpose": "All Python + JS dependencies with versions, licenses, purpose. Plus model weight inventory + license-concern flags.",
+      "sha256": "7142084bbf7dfa650f66df2778efc50bb52e8fdb5704d2aabf72d90a191d07aa",
+      "bytes": 7633,
+      "lines": 93
+    }
+  ],
+  "cross_links": {
+    "process_model": ["01-architecture.md#process-model", "endpoints.json", "schema.sql"],
+    "ml_stack":     ["02-models.md", "features.json", "dependencies.json"],
+    "scoring_math": ["03-scoring.md", "features.json"],
+    "ux_inventory": ["04-ux.md", "00-overview.md#glossary"],
+    "risks":        ["06-known-risks.md", "05-decisions-log.md"]
+  },
+  "verify_integrity": "shasum -a 256 -c <(jq -r '.files[] | \"\\(.sha256)  \\(.path)\"' manifest.json)"
+}

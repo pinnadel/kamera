@@ -1,0 +1,388 @@
+/* ─── Mobile-only utilities and overrides ───────────────────────────────────
+   Layered on top of the shared index.css. Keep this file focused on things
+   that don't make sense on the desktop bundle: safe-area insets, larger
+   touch targets, sheets, vignette, decision pills sized for thumbs.
+*/
+
+:root {
+  /* Safe-area shorthands. iOS Safari + standalone PWAs honor these inset
+     constants on the body. Pre-fill 0 for desktop browsers without them. */
+  --safe-top:    env(safe-area-inset-top, 0px);
+  --safe-right:  env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left:   env(safe-area-inset-left, 0px);
+
+  /* Mobile-tuned chrome sizes. Tied to WCAG 2.5.8 — every interactive
+     control rendered with these heights clears the 24×24 minimum (and is
+     comfortably above the 44pt iOS / 48dp Android comfort guidance). */
+  --m-topbar-h:    56px;
+  --m-bottomnav-h: 64px;
+  --m-decision-h: 100px;  /* 88px pill + 12px outer pad */
+  --m-tap-min:    44px;
+
+  /* Set by each view to tell ToastStack where the bottom chrome ends.
+     - Browse / Dashboard:    --m-bottomnav-h  (64)
+     - Cull / Group / Train:  --m-decision-h  (100)
+     - Other forms:           0 */
+  --m-bottom-chrome: var(--m-bottomnav-h);
+}
+
+html[data-mobile-view="cull"],
+html[data-mobile-view="group"],
+html[data-mobile-view="train"] {
+  --m-bottom-chrome: var(--m-decision-h);
+}
+html[data-mobile-view="autoCull"],
+html[data-mobile-view="settings"],
+html[data-mobile-view="modelStatus"],
+html[data-mobile-view="pickFolder"] {
+  --m-bottom-chrome: 0px;
+}
+
+/* Mobile bundle owns the body — desktop has the same selector but its
+   App root is a min-h-screen flex container, so this is harmless on
+   desktop (it never imports this file). */
+html, body, #root {
+  height: 100%;
+  overscroll-behavior: none;       /* kill iOS rubber-band on chrome */
+  touch-action: manipulation;      /* disable double-tap zoom (we provide our own) */
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  /* Honor the safe-area on viewport-fit=cover. The chrome inside still
+     applies its own insets where appropriate (top bar, bottom nav, decision
+     bar) — body-level padding is just a baseline so background reaches edges. */
+  padding-left:  var(--safe-left);
+  padding-right: var(--safe-right);
+}
+
+/* ── Mobile typography step-up ───────────────────────────────────────────── */
+.m-body  { font-size: 17px; line-height: 1.45; }
+.m-label { font-size: 15px; line-height: 1.40; font-weight: 500; }
+.m-h1    { font-size: 28px; line-height: 1.20; font-weight: 600; letter-spacing: -0.01em; }
+.m-h2    { font-size: 22px; line-height: 1.25; font-weight: 600; letter-spacing: -0.005em; }
+.m-tabular { font-variant-numeric: tabular-nums; }
+
+/* ── Photo viewport vignette ─────────────────────────────────────────────── */
+.m-photo-frame {
+  position: relative;
+  background: #07080a;
+  overflow: hidden;
+}
+.m-photo-frame::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 120px rgba(0,0,0,0.45);
+}
+
+/* ── Decision pill (Reject / Maybe / Keep) ──────────────────────────────────
+   Tinted bg @ ~16% with full-color icon/text and a 1px ring. Hover is
+   pointer-only via a media query so touch users don't see a sticky hover
+   state after the tap-up event. Active scale + haptic-ish micro-press. */
+.m-decision-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 64px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-weight: 600;
+  font-size: 17px;
+  letter-spacing: 0.01em;
+  transition: transform 90ms ease, background-color 140ms ease, border-color 140ms ease;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.m-decision-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #07080a, 0 0 0 4px #5BB8D4;
+}
+@media (hover: hover) {
+  .m-decision-btn:hover { filter: brightness(1.1); }
+}
+.m-decision-btn:active { transform: scale(0.97); }
+
+.m-decision-btn[data-kind="reject"] {
+  background: rgba(201,123,123,0.18);
+  border-color: rgba(201,123,123,0.55);
+  color: #E8A0A0;
+}
+.m-decision-btn[data-kind="maybe"] {
+  background: rgba(232,184,74,0.18);
+  border-color: rgba(232,184,74,0.55);
+  color: #F0CD7A;
+}
+.m-decision-btn[data-kind="keep"] {
+  background: rgba(125,184,154,0.18);
+  border-color: rgba(125,184,154,0.55);
+  color: #9DD0B5;
+}
+
+/* "Decided" highlight — used to mirror the current decision back on the
+   button when the user lands on an already-decided photo. */
+.m-decision-btn[data-active="true"] {
+  filter: brightness(1.15);
+  box-shadow: 0 0 0 1px currentColor inset, 0 0 0 1px currentColor;
+}
+
+/* ── Bottom sheet ─────────────────────────────────────────────────────────── */
+.m-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.50);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  z-index: 70;
+}
+.m-sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  background: #161718;
+  border-top-left-radius: 24px;
+  border-top-right-radius: 24px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  box-shadow: 0 -12px 32px rgba(0,0,0,0.5);
+  z-index: 71;
+  padding-bottom: var(--safe-bottom);
+  display: flex;
+  flex-direction: column;
+  will-change: transform;
+}
+.m-sheet-handle {
+  align-self: center;
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.20);
+  margin: 10px 0 6px;
+  flex-shrink: 0;
+}
+.m-sheet-handle-tap {
+  /* Invisible 44px tap target around the visible 4px handle (SC 2.5.8). */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 44px;
+  flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+}
+.m-sheet-handle-tap:active { cursor: grabbing; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .m-sheet { transition: transform 220ms cubic-bezier(0.4, 0.0, 0.2, 1); }
+}
+
+/* ── AI-pick amber glow ──────────────────────────────────────────────────── */
+.m-ai-pick {
+  box-shadow: 0 0 0 2px rgba(232,184,74,0.85), 0 0 16px 2px rgba(232,184,74,0.30);
+}
+.m-ai-pick-soft {
+  box-shadow: 0 0 0 2px rgba(232,184,74,0.65);
+}
+
+/* ── Sticky surfaces with blur (top bar, bottom nav) ─────────────────────── */
+.m-blur-surface {
+  background: rgba(7,8,10,0.78);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  border-color: rgba(255,255,255,0.06);
+}
+
+/* ── Bottom nav item ─────────────────────────────────────────────────────── */
+.m-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: var(--m-bottomnav-h);
+  min-width: var(--m-tap-min);
+  color: #9c9c9d;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  transition: color 120ms ease;
+}
+.m-nav-item:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px #5BB8D4;
+  border-radius: 8px;
+}
+.m-nav-item[aria-current="page"] {
+  color: #f9f9f9;
+}
+.m-nav-item[aria-current="page"] svg {
+  color: #5BB8D4;
+}
+
+/* ── Tap-suppression for native double-tap zoom on the photo viewport ────── */
+.m-pannable {
+  touch-action: none;
+}
+
+/* ── Filmstrip thumbnails ────────────────────────────────────────────────── */
+.m-filmstrip-thumb {
+  position: relative;
+  flex-shrink: 0;
+  height: 56px;
+  width: 56px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1b1c1e;
+  border: 2px solid transparent;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.m-filmstrip-thumb[data-current="true"] {
+  border-color: #5BB8D4;
+  transform: scale(1.05);
+}
+.m-filmstrip-thumb[data-pick="true"] {
+  border-color: #E8B84A;
+}
+.m-filmstrip-thumb[data-current="true"][data-pick="true"] {
+  border-color: #E8B84A;
+  box-shadow: 0 0 0 2px #5BB8D4;
+}
+.m-filmstrip-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.m-filmstrip-thumb-tap {
+  /* Wrap the thumb in a 44pt-tall tap target without growing the visual. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--m-tap-min);
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+/* ── Reveal flash for training mode ───────────────────────────────────────── */
+@keyframes m-reveal-fade {
+  0%   { opacity: 0; transform: scale(0.96); }
+  20%  { opacity: 1; transform: scale(1.00); }
+  90%  { opacity: 1; transform: scale(1.00); }
+  100% { opacity: 0; transform: scale(1.02); }
+}
+.m-reveal {
+  animation: m-reveal-fade 1500ms ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .m-reveal { animation: none; opacity: 1; }
+}
+
+/* ── Ring tints for the photo viewport based on current decision ─────────── */
+.m-decision-tint-keep   { box-shadow: inset 0 0 0 2px rgba(125,184,154,0.55), inset 0 0 80px rgba(125,184,154,0.10); }
+.m-decision-tint-maybe  { box-shadow: inset 0 0 0 2px rgba(232,184,74,0.55),  inset 0 0 80px rgba(232,184,74,0.10);  }
+.m-decision-tint-reject { box-shadow: inset 0 0 0 2px rgba(201,123,123,0.55), inset 0 0 80px rgba(201,123,123,0.10); }
+
+/* ── Touch-friendly form controls ────────────────────────────────────────── */
+.m-input {
+  width: 100%;
+  height: 48px;
+  padding: 0 14px;
+  border-radius: 12px;
+  background: #1b1c1e;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: #f9f9f9;
+  font-size: 16px;
+  font-weight: 500;
+}
+.m-input:focus-visible {
+  outline: none;
+  border-color: rgba(91,184,212,0.55);
+  box-shadow: 0 0 0 3px rgba(91,184,212,0.20);
+}
+
+.m-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 18px;
+  min-width: 96px;
+  border-radius: 12px;
+  font-weight: 500;
+  font-size: 16px;
+  letter-spacing: 0.005em;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.m-btn-primary {
+  background: linear-gradient(180deg, #6FC9DF 0%, #4FA8C4 100%);
+  color: #07080a;
+  border: 1px solid rgba(91,184,212,0.55);
+  font-weight: 600;
+}
+.m-btn-primary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #07080a, 0 0 0 4px #5BB8D4;
+}
+.m-btn-ghost {
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.10);
+  color: #cecece;
+}
+.m-btn-ghost:focus-visible {
+  outline: none;
+  border-color: rgba(91,184,212,0.55);
+  box-shadow: 0 0 0 3px rgba(91,184,212,0.20);
+}
+.m-btn-danger {
+  background: rgba(201,123,123,0.14);
+  border: 1px solid rgba(201,123,123,0.45);
+  color: #E8A0A0;
+}
+
+/* ── Toast ───────────────────────────────────────────────────────────────── */
+.m-toast {
+  background: #1f2022;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: #f9f9f9;
+  border-radius: 14px;
+  padding: 12px 14px;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+.m-toast button.m-toast-action {
+  margin-left: auto;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 10px;
+  background: rgba(91,184,212,0.14);
+  border: 1px solid rgba(91,184,212,0.40);
+  color: #5BB8D4;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* ── Mini histogram (luminance only) ─────────────────────────────────────── */
+.m-histogram {
+  width: 100%;
+  height: 64px;
+  background: #0f1011;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/* ── Skeleton tile shimmer (re-uses .shimmer from index.css) ─────────────── */
+.m-skeleton {
+  border-radius: 12px;
+  aspect-ratio: 1;
+}
+
+/* Hide the default scrollbar but keep scrollability — used inside the
+   horizontal filmstrip and inside scrollable sheets. */
+.m-no-scrollbar::-webkit-scrollbar { display: none; }
+.m-no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

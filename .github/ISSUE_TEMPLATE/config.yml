@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read first — project status
+    url: https://github.com/pinnadel/kamera#readme
+    about: KaMeRa is an early personal project shared for feedback. Please read the README before filing to understand what kind of issues are most useful.

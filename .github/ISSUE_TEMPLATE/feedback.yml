@@ -1,0 +1,38 @@
+name: Feedback or feature idea
+description: Share your experience — what felt good, what felt wrong, what you wish existed
+title: "[feedback] "
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Honest feedback is the main thing I'm looking for right now — what your culling workflow actually looks like, what you wish KaMeRa did differently, what felt slow, what felt magic. Speculative ideas are welcome too.
+
+  - type: textarea
+    id: thoughts
+    attributes:
+      label: Your thoughts
+      description: As short or as long as you like. No format expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Your current culling workflow
+      description: What do you cull with today, and roughly how many photos per shoot? Helps me understand the context.
+      placeholder: |
+        Lightroom Classic, ~2000 RAFs per wedding, takes me a full day.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: How blocking is this?
+      options:
+        - "Nice-to-have idea"
+        - "Would noticeably improve my workflow"
+        - "I'd stop using KaMeRa if this isn't fixed"
+    validations:
+      required: false
