@@ -16,6 +16,9 @@ Photo culling playground pics/
 *.hif
 .claude/
 
+# Output of fetch_fitiv_support.sh — scraped support content, not source
+fitiv_support_dump/
+
 # Claude assistant project notes — may contain PII / personal workflow detail
 CLAUDE.md
 **/CLAUDE.md
