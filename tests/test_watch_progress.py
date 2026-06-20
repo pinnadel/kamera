@@ -60,3 +60,42 @@ def test_handle_ignores_unsupported_extensions(monkeypatch):
     h = _PhotoEventHandler(Path("/tmp/x.db"))
     h._handle("/card/folder/notes.txt")
     assert spawned == []
+
+
+def test_vanished_file_is_skipped_not_errored(monkeypatch, tmp_db, tmp_path):
+    """A file moved/renamed out from under the watcher during analysis must be
+    skipped silently — no 'error' row, no on_error toast (the [Errno 2] case)."""
+    from backend import file_watcher
+
+    gone = tmp_path / "DSCF0857.RAF"   # never created → does not exist
+    def _raise_enoent(p):
+        raise FileNotFoundError(2, "No such file or directory", str(gone))
+    monkeypatch.setattr(file_watcher, "analyze_photo_quality", _raise_enoent)
+
+    errors = []
+    file_watcher._analyze_and_store(gone, tmp_db, on_error=errors.append)
+    assert errors == []   # no toast for a vanished file
+
+    # And no 'error' row was written for it.
+    from backend.database import get_db
+    with get_db(tmp_db) as conn:
+        row = conn.execute(
+            "SELECT analysis_status FROM images WHERE file_path = ?",
+            (str(gone),)).fetchone()
+    assert row is None
+
+
+def test_real_failure_still_errors_and_toasts(monkeypatch, tmp_db, tmp_path):
+    """A genuine analysis failure on a file that EXISTS still surfaces an error
+    (we only suppress the vanished-file race, not real corruption)."""
+    from backend import file_watcher
+
+    bad = tmp_path / "corrupt.RAF"
+    bad.write_bytes(b"not a real raw")   # exists, but unanalyzable
+    def _raise_value(p):
+        raise ValueError("Could not load image: corrupt")
+    monkeypatch.setattr(file_watcher, "analyze_photo_quality", _raise_value)
+
+    errors = []
+    file_watcher._analyze_and_store(bad, tmp_db, on_error=errors.append)
+    assert len(errors) == 1 and "corrupt.RAF" in errors[0]["file"]

@@ -108,6 +108,17 @@ def _analyze_and_store(file_path: Path, db_path: Path,
         log.info("Watcher analyzed: %s (score %.1f)", file_path.name, result["overall_quality_score"])
 
     except Exception as e:
+        # If the file vanished while we were analyzing it, that's an expected
+        # race — an external mover (Provenance's import staging / archive, or a
+        # K/M/R decision) moved or renamed it out from under us between the
+        # settle check and now. Don't mark it 'error' or toast a "[Errno 2] No
+        # such file or directory" — just drop it silently. (FileNotFoundError
+        # covers the direct case; the broad not-exists check also catches a
+        # FileNotFoundError surfaced as a generic Exception by a scorer.)
+        if isinstance(e, FileNotFoundError) or not file_path.exists():
+            log.info("Watcher skipped vanished file (moved/renamed): %s",
+                     file_path.name)
+            return
         log.exception("Watcher failed to analyze: %s", file_path.name)
         # Mark as error so the UI doesn't show it as pending forever
         try:
