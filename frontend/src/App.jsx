@@ -88,7 +88,7 @@ import { TabBar } from './views/TabBar'
 import { TabFoldersForm } from './views/TabFoldersForm'
 import { PersonalModelBanner } from './views/PersonalModelBanner'
 import { BannerStates } from './views/BannerStates'
-import { makeNewTab, tabLabel } from './tabs'
+import { makeNewTab, makeReadyTab, tabLabel } from './tabs'
 import { buildTrainingQueue } from './training'
 import { usePolling } from './hooks/usePolling'
 import { useTabs } from './hooks/useTabs'
@@ -658,6 +658,35 @@ export default function App() {
     }
   }, [addToast, loadGroups, setLoupeAnchorId])
 
+  // Ensure a tab exists (and is active) for a folder the backend is analyzing
+  // that the frontend doesn't yet know about. This is what makes Provenance's
+  // "Import & Analyze" work when KaMeRa was already running (warm): Provenance
+  // POSTs /watch + /analyze-folder straight to the backend, so no remount
+  // happens and useTabs' mount-time /watch restore never fires. The polling
+  // hook calls this when /analyze-progress reports a source_folder with no
+  // matching tab. Idempotent: a second call for the same folder just
+  // re-activates the existing tab. New tabs are inserted before the trailing
+  // empty placeholder so the "+" tab stays rightmost.
+  const ensureTabForFolder = useCallback((folderPath) => {
+    if (!folderPath) return
+    setTabs(prev => {
+      const existing = prev.find(t => t.folderPath === folderPath)
+      if (existing) {
+        setActiveTabId(existing.id)
+        return prev
+      }
+      const fresh = makeReadyTab(folderPath)
+      setActiveTabId(fresh.id)
+      // Insert before a trailing empty placeholder if one exists; otherwise
+      // append and add a new placeholder so the "+" tab is always last.
+      const last = prev[prev.length - 1]
+      if (last && last.status === 'empty' && !last.folderPath) {
+        return [...prev.slice(0, -1), fresh, last]
+      }
+      return [...prev, fresh, makeNewTab()]
+    })
+  }, [setTabs, setActiveTabId])
+
   // ── Polling (usePolling) ──────────────────────────────────────────────────
   // Placed *after* useGroups so we can hand it `loadGroupsAndPrerank` as
   // the batch-complete callback. Two things happen on batch completion:
@@ -672,6 +701,7 @@ export default function App() {
     tabs,
     setTabs,
     setModelStatus,
+    ensureTabForFolder,
     onBatchComplete: loadGroupsAndPrerank,
     // When the prerank worker advances, re-fetch /similarity-groups (NOT
     // /prerank-groups — we don't want to re-enqueue, just refresh per-tile

@@ -22,7 +22,7 @@ import { API } from '../api'
 // network-wise.
 const MID_BATCH_PRERANK_EVERY = 50
 
-export function usePolling({ tabs, setTabs, setModelStatus, onBatchComplete, onPrerankAdvance }) {
+export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onBatchComplete, onPrerankAdvance }) {
   // Keep a ref that always points at the current tabs array so the polling
   // closure never reads a stale snapshot. The effect that writes it is
   // intentionally NOT in this hook — App.jsx owns tabs state and syncs it.
@@ -48,6 +48,14 @@ export function usePolling({ tabs, setTabs, setModelStatus, onBatchComplete, onP
   const onPrerankAdvanceRef = useRef(onPrerankAdvance)
   useEffect(() => { onPrerankAdvanceRef.current = onPrerankAdvance }, [onPrerankAdvance])
 
+  // Same ref pattern for ensureTabForFolder — the polling closure calls it
+  // when the backend reports analysis on a folder no tab is bound to yet
+  // (Provenance's "Import & Analyze" against a warm KaMeRa, which POSTs
+  // /watch straight to the backend with no remount to trigger the mount-time
+  // tab restore). App.jsx owns tab state; we just ask it to materialize one.
+  const ensureTabForFolderRef = useRef(ensureTabForFolder)
+  useEffect(() => { ensureTabForFolderRef.current = ensureTabForFolder }, [ensureTabForFolder])
+
   // /analyze-progress — 400 ms
   useEffect(() => {
     let lastDone = -1
@@ -61,6 +69,12 @@ export function usePolling({ tabs, setTabs, setModelStatus, onBatchComplete, onP
     // mid-batch prerank refresh, so we fire at most once per MID_BATCH_PRERANK_EVERY.
     // Reset when wasRunning flips back to false (new batch starts clean).
     let lastPrerankBucket = 0
+    // Folders we've already asked App.jsx to materialize a tab for, so we
+    // call ensureTabForFolder at most once per folder per batch instead of
+    // every 400 ms tick while the new tab is still propagating through state.
+    // Cleared when the batch ends (running:false branch) so a later analysis
+    // of the same folder can re-create its tab if the user closed it.
+    const autoCreatedFolders = new Set()
 
     const id = setInterval(() => {
       fetch(`${API}/analyze-progress`)
@@ -114,6 +128,7 @@ export function usePolling({ tabs, setTabs, setModelStatus, onBatchComplete, onP
             trackingTabId = null
             if (lastDone !== -1) lastDone = -1
             lastPrerankBucket = 0
+            autoCreatedFolders.clear()
             return
           }
 
@@ -126,7 +141,21 @@ export function usePolling({ tabs, setTabs, setModelStatus, onBatchComplete, onP
           // path), then fall back to any tab whose folderPath matches.
           let target = currentTabs.find(t => t.status === 'analyzing')
           if (!target) target = currentTabs.find(t => t.folderPath === targetFolder)
-          if (!target) return
+          if (!target) {
+            // No tab is bound to the folder the backend is analyzing. This is
+            // the warm-KaMeRa "Import & Analyze" path: Provenance POSTed
+            // /watch + /analyze-folder directly, so the running frontend never
+            // learned about this folder. Ask App.jsx to create + activate a
+            // tab for it, once — the tab appears on the next state flush and
+            // the NEXT tick (400 ms later) routes progress to it normally.
+            if (!autoCreatedFolders.has(targetFolder)) {
+              autoCreatedFolders.add(targetFolder)
+              if (typeof ensureTabForFolderRef.current === 'function') {
+                try { ensureTabForFolderRef.current(targetFolder) } catch { /* non-fatal */ }
+              }
+            }
+            return
+          }
 
           const targetId = target.id
           trackingTabId = targetId
