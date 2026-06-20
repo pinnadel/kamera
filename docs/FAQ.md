@@ -105,6 +105,25 @@ routed. The routing only fires when the personal model is in "Ready" state
 ([decisions.py:208](backend/routers/decisions.py#L208)). Below readiness the
 ensemble isn't consulted.
 
+### Does auto-cull teach the personal model?
+
+No. The personal model learns **only** from your manual K/M/X decisions —
+never from auto-cull's own output. If auto-cull fed itself, it would lock in
+its own mistakes (a self-reinforcement loop) and your taste would stop
+steering it.
+
+Mechanically, the training-corpus write is gated in
+[`_apply_decision(..., is_auto=...)`](backend/routers/decisions.py#L220):
+`POST /auto-cull` passes `is_auto=True` and writes the `decisions` row but
+skips `training_samples`; manual `POST /decision` and `POST /bulk-decision`
+use the default `is_auto=False` and write the sample.
+
+The payoff is the override case: when you **disagree** with an auto-cull
+call and change it by hand — e.g. auto-cull rejected a frame you then Keep —
+that manual decision *is* recorded as a training sample, so the model learns
+from exactly the moments it got you wrong. A photo auto-culled and never
+touched contributes nothing to training.
+
 ---
 
 ## Files & workflow
@@ -119,8 +138,11 @@ ensemble isn't consulted.
    Luminar Neo see the decision on import. Toggle in Settings → Display
    ("Write decisions to XMP sidecars", default ON). Best-effort — XMP failures
    log but never abort the decision.
-3. **A row in `decisions`** + a frozen feature snapshot in `training_samples`
-   (durable, no FK to `images`, survives Clear Analysis).
+3. **A row in `decisions`**. For *manual* K/M/X, also a frozen feature
+   snapshot in `training_samples` (durable, no FK to `images`, survives Clear
+   Analysis). Auto-cull decisions write the `decisions` row but **not** the
+   `training_samples` row — see "Does auto-cull teach the personal model?"
+   below.
 
 If `reject_to_system_trash` is enabled, the reject branch routes through
 `send2trash` instead of `_Trash/` and skips the XMP write (the file is no

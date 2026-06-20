@@ -14,6 +14,18 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Hide the Python interpreter from the macOS dock. The UI lives in a Chrome
+# PWA window; the backend should not present a second icon. Must run before
+# any AppKit-touching import (torch/MediaPipe pull in CoreFoundation).
+if sys.platform == "darwin":
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Logging — must be configured before any module that calls logging.getLogger.
 # ---------------------------------------------------------------------------

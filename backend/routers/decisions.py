@@ -217,10 +217,19 @@ def _compute_auto_decision(
     return "reject", "threshold_reject"
 
 
-def _apply_decision(image_id: int, decision: str) -> dict:
+def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict:
     """
     Move the file to its destination folder and record the decision in DB.
-    Shared by POST /decision and POST /auto-cull so the behaviour is identical.
+    Shared by POST /decision and POST /auto-cull so the file-move + decisions
+    write behave identically.
+
+    `is_auto` distinguishes a system-made auto-cull decision from a manual
+    K/M/X by the user. Only MANUAL decisions feed the personal model's
+    training corpus — auto-cull decisions are deliberately excluded so the
+    model never learns from its own output (a self-reinforcement loop). When
+    the user later manually changes (or confirms) an auto-cull decision, that
+    manual call writes the training sample as normal.
+
     Raises HTTPException on 404 / 409 / 500.
     """
     with get_db() as conn:
@@ -285,8 +294,15 @@ def _apply_decision(image_id: int, decision: str) -> dict:
         # Captured here so the photo's analyzed features are frozen at the
         # exact moment the user judges it. Re-decisions on the same photo
         # (same UUID) replace the old row so taste evolution wins.
+        #
+        # Auto-cull decisions are NEVER written here: the model must learn
+        # only from the user's own judgments, not from its own predictions.
+        # A later manual decision on the same photo (override or confirm)
+        # comes through with is_auto=False and INSERTs the sample then.
         sample_uuid = image_row.get("uuid")
-        if sample_uuid:
+        if is_auto:
+            pass  # system decision — not a training sample
+        elif sample_uuid:
             try:
                 conn.execute(
                     """
@@ -814,7 +830,7 @@ def run_auto_cull(source_folder: str | None = None):
     for row in rows_dicts:
         decision = decisions[row["id"]]
         try:
-            _apply_decision(row["id"], decision)
+            _apply_decision(row["id"], decision, is_auto=True)
             counts[decision] += 1
         except HTTPException as exc:
             errors.append({"id": row["id"], "error": exc.detail})
