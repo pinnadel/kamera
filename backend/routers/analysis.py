@@ -654,6 +654,17 @@ def _run_batch(
                     # will see stop_requested and break on the next iteration.
                     break
                 except Exception as e:
+                    # If the file vanished mid-batch (moved/renamed/archived out
+                    # from under us — e.g. Provenance archiving a keeper, or a
+                    # K/M/R decision), that's an expected race, not a failure.
+                    # Skip it silently: no error row, no /debug/last-errors entry,
+                    # no "[Errno 2] No such file or directory" toast. (Mirrors the
+                    # same guard in file_watcher._analyze_and_store.)
+                    if isinstance(e, FileNotFoundError) or not file_path.exists():
+                        logger.info("Batch skipped vanished file (moved/renamed): %s",
+                                    file_path.name)
+                        _progress["done"] += 1
+                        continue
                     step = _progress.get("_current_step") or "unknown"
                     logger.exception("Batch fail — %s [step: %s]", file_path.name, step)
                     errors.append({"file": file_path.name, "error": str(e), "step": step})
