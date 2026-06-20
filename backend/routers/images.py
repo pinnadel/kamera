@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from backend.constants import SUPPORTED_EXTENSIONS
+from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS
 from backend.database import get_db
 from backend.state import PREVIEW_CACHE_DIR, _personal_model, _progress
 
@@ -214,7 +214,7 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
         raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
 
     if include_subfolders:
-        skip_dirs = {"_Keeps", "_Maybes", "_Trash"}
+        skip_dirs = DECISION_SUBFOLDERS
         candidates = [
             f for f in folder.rglob("*")
             if f.is_file()

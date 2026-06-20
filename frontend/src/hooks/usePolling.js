@@ -22,7 +22,7 @@ import { API } from '../api'
 // network-wise.
 const MID_BATCH_PRERANK_EVERY = 50
 
-export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onBatchComplete, onPrerankAdvance }) {
+export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onWatchProgress, onBatchComplete, onPrerankAdvance }) {
   // Keep a ref that always points at the current tabs array so the polling
   // closure never reads a stale snapshot. The effect that writes it is
   // intentionally NOT in this hook — App.jsx owns tabs state and syncs it.
@@ -55,6 +55,13 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
   // tab restore). App.jsx owns tab state; we just ask it to materialize one.
   const ensureTabForFolderRef = useRef(ensureTabForFolder)
   useEffect(() => { ensureTabForFolderRef.current = ensureTabForFolder }, [ensureTabForFolder])
+
+  // Same ref pattern for onWatchProgress — fired each model-status tick with
+  // the watcher's live state {watching, folder, in_flight, analyzed} from
+  // GET /watch-progress. Drives the "analyzing… (N left)" indicator for the
+  // /watch live-analysis path (which /analyze-progress does NOT report on).
+  const onWatchProgressRef = useRef(onWatchProgress)
+  useEffect(() => { onWatchProgressRef.current = onWatchProgress }, [onWatchProgress])
 
   // /analyze-progress — 400 ms
   useEffect(() => {
@@ -223,19 +230,27 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
     }
 
     function tick() {
-      // Pull both endpoints in parallel — no need to await one to start
-      // the other. The cadence decision uses model-status; prerank just
-      // fires its callback on change.
+      // Pull all three endpoints in parallel — no need to await one to start
+      // the others. The cadence decision uses model-status AND watch activity;
+      // prerank + watch-progress just fire their callbacks.
       Promise.all([
         fetch(`${API}/model-status`).then(r => r.json()).catch(() => null),
         fetch(`${API}/prerank-status`).then(r => r.json()).catch(() => null),
+        fetch(`${API}/watch-progress`).then(r => r.json()).catch(() => null),
       ])
-        .then(([model, prerank]) => {
+        .then(([model, prerank, watch]) => {
           if (cancelled) return
           if (model) setModelStatus(model)
           // Loading = at least one model is downloading or initializing.
           // The backend's /model-status returns `models: []` when idle.
           const hasActive = Array.isArray(model?.models) && model.models.length > 0
+          // Watch is "active" while it's watching a folder OR still has files
+          // in flight — keep polling fast (1s) so the "analyzing… (N left)"
+          // indicator stays live and clears promptly.
+          const watchActive = !!(watch && (watch.watching || watch.in_flight > 0))
+          if (watch && typeof onWatchProgressRef.current === 'function') {
+            try { onWatchProgressRef.current(watch) } catch { /* host-side error, don't break polling */ }
+          }
           // Detect prerank progress: any of the three terminal counters
           // ticked up, OR the in-flight hash changed (worker moved to
           // a new group). Both signals mean per-group states may have
@@ -252,7 +267,7 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
             }
             prevPrerank = prerank
           }
-          scheduleNext(hasActive ? 1000 : 10000)
+          scheduleNext(hasActive || watchActive ? 1000 : 10000)
         })
         .catch(() => {
           // Network blip or backend restart — back off but keep trying.

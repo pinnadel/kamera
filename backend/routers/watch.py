@@ -112,6 +112,23 @@ def get_watch():
     return {"folder": watcher.watching}
 
 
+@router.get("/watch-progress")
+def get_watch_progress():
+    """Live progress for the file watcher (the /watch live-analysis path).
+
+    Unlike /analyze-progress (batch-only), this reflects the watcher's own
+    activity: in_flight = files currently settling/analyzing, analyzed = files
+    finished this watch session. Drives KaMeRa's live "analyzing… (N left)"
+    indicator and Provenance's wait-for-settle gate before auto-cull.
+    """
+    return {
+        "watching": watcher.watching is not None,
+        "folder": watcher.watching,
+        "in_flight": watcher.in_flight,
+        "analyzed": watcher.analyzed,
+    }
+
+
 @router.post("/watch")
 def start_watch(request: WatchRequest):
     """Start watching a folder for new photos. Replaces any existing watch."""

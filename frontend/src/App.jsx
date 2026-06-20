@@ -687,6 +687,53 @@ export default function App() {
     })
   }, [setTabs, setActiveTabId])
 
+  // Route the watcher's live progress (/watch-progress) to a tab as a
+  // "analyzing… (N left)" indicator. The /watch live-analysis path (Provenance's
+  // "Import & Analyze") is invisible to /analyze-progress, so this is the only
+  // signal that the watcher is still working.
+  //
+  // Clear rule (the JPG→RAF requirement): do NOT clear on in_flight===0 alone —
+  // in_flight dips to 0 in the gap between a Fuji frame's fast JPG finishing and
+  // its slow RAF's settle window. Only clear once in_flight===0 AND
+  // GET /folders/unfinished reports 0 files still pending, so the spinner
+  // survives the gap and clears only when the folder is truly done.
+  const onWatchProgress = useCallback((watch) => {
+    const folder = watch?.folder
+    if (!folder) return
+    if (watch.in_flight > 0) {
+      ensureTabForFolder(folder)
+      setTabs(prev => prev.map(t =>
+        t.folderPath === folder
+          ? { ...t, liveAnalyzing: true, liveLeft: watch.in_flight }
+          : t
+      ))
+      return
+    }
+    // in_flight === 0 → confirm the slow RAF is done before clearing. We don't
+    // need to know whether a tab is currently live: the setTabs updaters below
+    // only touch a tab whose liveAnalyzing flag actually needs flipping, and
+    // are no-ops otherwise. (Cheap: this fetch only fires on the in_flight→0
+    // edge while watch-progress is being polled.)
+    fetch(`${API}/folders/unfinished?folder_path=${encodeURIComponent(folder)}`)
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        if ((data.unfinished ?? 0) > 0) {
+          // RAF still pending — keep the indicator up, show files remaining.
+          setTabs(prev => prev.map(t =>
+            t.folderPath === folder && t.liveAnalyzing
+              ? { ...t, liveLeft: data.unfinished } : t
+          ))
+        } else {
+          // Truly done — clear the indicator on any tab still showing it.
+          setTabs(prev => prev.map(t =>
+            t.folderPath === folder && t.liveAnalyzing
+              ? { ...t, liveAnalyzing: false, liveLeft: 0 } : t
+          ))
+        }
+      })
+      .catch(() => {})
+  }, [ensureTabForFolder, setTabs])
+
   // ── Polling (usePolling) ──────────────────────────────────────────────────
   // Placed *after* useGroups so we can hand it `loadGroupsAndPrerank` as
   // the batch-complete callback. Two things happen on batch completion:
@@ -702,6 +749,7 @@ export default function App() {
     setTabs,
     setModelStatus,
     ensureTabForFolder,
+    onWatchProgress,
     onBatchComplete: loadGroupsAndPrerank,
     // When the prerank worker advances, re-fetch /similarity-groups (NOT
     // /prerank-groups — we don't want to re-enqueue, just refresh per-tile

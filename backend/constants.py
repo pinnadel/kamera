@@ -36,3 +36,11 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
 RAW_FORMATS: frozenset[str] = frozenset({
     "RAF", "NEF", "ARW", "CR2", "CR3", "DNG",
 })
+
+# Subfolder names a photo is moved INTO once a keep/maybe/reject decision is
+# made (see file_mover.resolve_dest_folder). Files here are post-decision and
+# must never be (re)analyzed: the watcher skips them, so an external archiver
+# (Provenance) moving a keeper out of _Keeps can't race the watcher into a
+# "Could not load image" error. Canonical home — previously duplicated as
+# inline literals in routers/images.py, routers/analysis.py, file_mover.py.
+DECISION_SUBFOLDERS: frozenset[str] = frozenset({"_Keeps", "_Maybes", "_Trash"})

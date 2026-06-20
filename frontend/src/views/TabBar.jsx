@@ -24,9 +24,11 @@ function TabItem({ tab, isActive, isDragOver, dragHandlers, onSelect, onClose, w
       className={`group flex items-center gap-2 px-3 py-1.5 rounded-[6px] cursor-pointer flex-shrink-0 max-w-[220px] text-[14px] font-medium transition-colors ${baseClass} ${ringClass}`}
       title={tabTitle}
     >
-      {/* Status dot — analyzing > watching > error precedence */}
+      {/* Status dot — analyzing > liveAnalyzing > watching > error precedence */}
       {tab.status === 'analyzing' ? (
         <span className="w-1.5 h-1.5 rounded-full bg-[#5BB8D4] animate-pulse flex-shrink-0" />
+      ) : tab.liveAnalyzing ? (
+        <span className="w-1.5 h-1.5 rounded-full bg-[#5BB8D4] animate-pulse flex-shrink-0" title="Analyzing imported photos" />
       ) : tab.watchLive ? (
         <span className="w-1.5 h-1.5 rounded-full bg-[#5BB8D4] animate-pulse flex-shrink-0" title="Watching folder live" />
       ) : tab.status === 'error' ? (
@@ -34,6 +36,15 @@ function TabItem({ tab, isActive, isDragOver, dragHandlers, onSelect, onClose, w
       ) : null}
 
       <span className="truncate">{tabLabel(tab)}</span>
+
+      {/* Live-analysis chip — shows while the watcher is still analyzing the
+          imported photos (the /watch path, e.g. Provenance's Import & Analyze).
+          Stays up across the JPG→RAF gap until the folder is truly done. */}
+      {tab.liveAnalyzing && (
+        <span className="px-1.5 py-0.5 rounded text-[12px] flex-shrink-0 bg-[rgba(91,184,212,0.12)] text-[#5BB8D4] whitespace-nowrap">
+          analyzing…{tab.liveLeft ? ` ${tab.liveLeft}` : ''}
+        </span>
+      )}
 
       {/* Image count chip */}
       {tab.images.length > 0 && (

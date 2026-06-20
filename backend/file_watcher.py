@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 # error logs (e.g. /debug/last-errors).
 ErrorCallback = Callable[[dict], None]
 
-from backend.constants import SUPPORTED_EXTENSIONS  # noqa: E402 — re-export for callers that imported from here historically
+from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS  # noqa: E402 — re-export for callers that imported from here historically
 # .hif is intentionally excluded — Fuji writes it next to every .RAF in RAW+HIF
 # mode. We treat HIF as a sidecar of the RAF (move-only, never analyzed).
 
@@ -134,14 +134,27 @@ def _analyze_and_store(file_path: Path, db_path: Path,
 class _PhotoEventHandler(FileSystemEventHandler):
     """Called by watchdog on file system events."""
 
-    def __init__(self, db_path: Path, on_error: Optional[ErrorCallback] = None):
+    def __init__(self, db_path: Path, on_error: Optional[ErrorCallback] = None,
+                 owner: Optional["FolderWatcher"] = None):
         super().__init__()
         self._db_path = db_path
         self._on_error = on_error
+        # Back-reference so analyze threads can report in-flight / analyzed
+        # counts to the owning FolderWatcher (drives GET /watch-progress).
+        self._owner = owner
 
     def _handle(self, path_str: str) -> None:
         path = Path(path_str)
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return
+        # Skip files that already live in a decision subfolder (_Keeps/_Maybes/
+        # _Trash). A keep/maybe/reject MOVE into _Keeps fires on_moved with that
+        # destination; re-analyzing it is both pointless (already decided) and
+        # racy — an external archiver (Provenance) may move the keeper out of
+        # _Keeps before our 2s settle elapses, making cv2.imread fail and toast
+        # a spurious "Could not load image". Dropping it here, before any thread
+        # spawns, fixes that at the source and keeps the counters honest.
+        if any(part in DECISION_SUBFOLDERS for part in path.parts):
             return
         # Run analysis in a daemon thread so we don't block the watchdog event loop
         threading.Thread(
@@ -151,10 +164,25 @@ class _PhotoEventHandler(FileSystemEventHandler):
         ).start()
 
     def _settle_then_analyze(self, path: Path) -> None:
-        """Wait for the file to finish writing before analyzing."""
-        time.sleep(SETTLE_SECONDS)
-        if path.exists():
-            _analyze_and_store(path, self._db_path, on_error=self._on_error)
+        """Wait for the file to finish writing before analyzing.
+
+        In-flight is incremented at the very START (before the settle sleep) so a
+        burst of on_created events (e.g. a Fuji frame's fast JPG followed by its
+        slow RAF) keeps in_flight > 0 across the gap — the live "analyzing…"
+        indicator must not clear between them. The finally always decrements, so
+        a failing file can't strand the counter.
+        """
+        if self._owner is not None:
+            self._owner._enter_inflight()
+        analyzed = False
+        try:
+            time.sleep(SETTLE_SECONDS)
+            if path.exists():
+                _analyze_and_store(path, self._db_path, on_error=self._on_error)
+                analyzed = True
+        finally:
+            if self._owner is not None:
+                self._owner._exit_inflight(analyzed)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -196,11 +224,39 @@ class FolderWatcher:
         self._on_error  = on_error
         self._observer  = None
         self._watch_path: str | None = None
+        # Live-analysis counters for GET /watch-progress. _in_flight = analyze
+        # threads currently settling/running; _analyzed = files this session has
+        # finished. Guarded by _lock (touched from many daemon analyze threads).
+        self._in_flight = 0
+        self._analyzed  = 0
+        self._lock = threading.Lock()
 
     @property
     def watching(self) -> str | None:
         """Currently watched folder path, or None."""
         return self._watch_path
+
+    @property
+    def in_flight(self) -> int:
+        """Number of files currently being settled/analyzed by the watcher."""
+        with self._lock:
+            return self._in_flight
+
+    @property
+    def analyzed(self) -> int:
+        """Files analyzed since the current watch session started."""
+        with self._lock:
+            return self._analyzed
+
+    def _enter_inflight(self) -> None:
+        with self._lock:
+            self._in_flight += 1
+
+    def _exit_inflight(self, analyzed: bool) -> None:
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            if analyzed:
+                self._analyzed += 1
 
     def start(self, folder_path: str) -> None:
         """Start watching a folder. Stops any existing watch first."""
@@ -209,7 +265,14 @@ class FolderWatcher:
         if not path.is_dir():
             raise ValueError(f"Not a directory: {folder_path}")
 
-        handler = _PhotoEventHandler(self._db_path, on_error=self._on_error)
+        # Fresh session → reset counters so /watch-progress reflects only this
+        # watch's activity.
+        with self._lock:
+            self._in_flight = 0
+            self._analyzed = 0
+
+        handler = _PhotoEventHandler(self._db_path, on_error=self._on_error,
+                                     owner=self)
         self._observer = Observer()
         self._observer.schedule(handler, str(path), recursive=False)
         self._observer.start()

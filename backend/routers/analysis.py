@@ -49,7 +49,7 @@ router = APIRouter()
 # /folders/unfinished endpoint, burst_ranker's RAW fallback) should import
 # directly from backend.constants to avoid pulling in this module's heavy
 # transitive deps (rawpy, pyiqa, torch).
-from backend.constants import SUPPORTED_EXTENSIONS, RAW_FORMATS
+from backend.constants import SUPPORTED_EXTENSIONS, RAW_FORMATS, DECISION_SUBFOLDERS
 # .hif is intentionally excluded from SUPPORTED_EXTENSIONS — Fuji writes it
 # next to every .RAF in RAW+HIF mode. We treat HIF as a sidecar of the RAF
 # (move-only, never analyzed on its own).
@@ -707,7 +707,7 @@ def has_subfolders(folder_path: str):
     folder = Path(folder_path)
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
-    skip_dirs = {"_Keeps", "_Maybes", "_Trash"}
+    skip_dirs = DECISION_SUBFOLDERS
     count = 0
     for sub in folder.iterdir():
         if not sub.is_dir() or sub.name in skip_dirs:
@@ -744,7 +744,7 @@ def analyze_folder(request: AnalyzeFolderRequest):
     if request.include_subfolders:
         # Recursive walk. Skip the conventional decision subfolders so a
         # re-analysis doesn't suck in already-decided photos as fresh inputs.
-        skip_dirs = {"_Keeps", "_Maybes", "_Trash"}
+        skip_dirs = DECISION_SUBFOLDERS
         candidates = sorted(
             f for f in folder.rglob("*")
             if f.is_file()
