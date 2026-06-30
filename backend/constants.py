@@ -25,7 +25,7 @@ constants here is the cheapest fix.
 # phase2_quality/burst_ranker.py::_DIRECT_PASS_FORMATS /
 # _RAW_FALLBACK_FORMATS when adding a new format.
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".raf", ".nef", ".png", ".tiff", ".tif",
+    ".jpg", ".jpeg", ".raf", ".nef", ".3fr", ".png", ".tiff", ".tif",
 })
 
 # Uppercase canonical format names used in `images.format` column for
@@ -34,7 +34,7 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
 # code paths (preview demosaic, sidecar-pref invalidation, the burst
 # ranker's on-demand preview fallback).
 RAW_FORMATS: frozenset[str] = frozenset({
-    "RAF", "NEF", "ARW", "CR2", "CR3", "DNG",
+    "RAF", "NEF", "3FR", "ARW", "CR2", "CR3", "DNG",
 })
 
 # Subfolder names a photo is moved INTO once a keep/maybe/reject decision is

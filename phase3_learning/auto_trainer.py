@@ -197,7 +197,18 @@ def _train_worker(model: "PersonalModel") -> None:
             logger.info("Auto-train skipped — corpus below MIN_DECISIONS")
             return
         X, decisions, overall_scores, decided_at, base_weights = corpus
-        logger.info("Auto-train starting on %d samples", X.shape[0])
+        prior_size = model.training_size if model.ready else 0
+        logger.info(
+            "Auto-train starting on %d samples (prior fit: %d)",
+            X.shape[0], prior_size,
+        )
+        if X.shape[0] < prior_size:
+            logger.warning(
+                "Auto-train corpus (%d) is SMALLER than the prior fit (%d) — "
+                "the training_samples table appears to have shrunk. save() will "
+                "refuse the overwrite; investigate the corpus before forcing.",
+                X.shape[0], prior_size,
+            )
         model.train_from_samples(X, decisions, overall_scores, decided_at=decided_at,
                                  base_weights=base_weights)
         model.save()

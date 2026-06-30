@@ -39,6 +39,7 @@ THRESHOLDS = {
     'JPEG': 2.3,
     'RAF':  2.3,
     'NEF':  2.3,
+    '3FR':  2.3,
 }
 
 # Tile grid and aggregation percentile for regional focus measurement.
@@ -158,7 +159,7 @@ def detect_sharpness(image_path):
     """
     try:
         # Load image (raw via rawpy demosaic, with thumbnail fallback)
-        if image_path.suffix.upper() in ['.RAF', '.NEF']:
+        if image_path.suffix.upper() in ['.RAF', '.NEF', '.3FR']:
             try:
                 with rawpy.imread(str(image_path)) as raw:
                     rgb = raw.postprocess(

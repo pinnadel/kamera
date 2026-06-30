@@ -618,7 +618,7 @@ class PersonalModel:
 
     # ── Persist ──────────────────────────────────────────────────────────────
 
-    def save(self, path: Path = _MODEL_PATH) -> None:
+    def save(self, path: Path = _MODEL_PATH, *, allow_shrink: bool = False) -> None:
         """Persist the fitted pipeline atomically.
 
         Writes to a sibling `<name>.tmp` and then `os.replace()`s into place.
@@ -626,7 +626,33 @@ class PersonalModel:
         volume), so a Force Quit during the save can't leave a half-written
         pickle that fails to load on next launch. With auto-training writing
         every ~10 decisions in the background, this guard matters.
+
+        Shrink guard: refuse to overwrite an on-disk model that was fit on
+        MORE samples than the one being saved. The durable training_samples
+        table only grows during normal use, so a fit on fewer samples than the
+        last one means something went wrong upstream (a stale corpus snapshot,
+        a partially-cleared table, a left-over bootstrap fit) — and silently
+        clobbering a well-trained model with that is exactly the data-loss
+        incident this guards against (a 1839-sample model once got replaced by
+        a 30-sample fit). The legitimate shrink is a user reset, which calls
+        `reset()` (deletes the pickle directly) and never routes through here;
+        the rare intentional case can still pass allow_shrink=True.
         """
+        if not allow_shrink and path.exists():
+            try:
+                with open(path, "rb") as f:
+                    existing_size = pickle.load(f).get("meta", {}).get("training_size", 0)
+            except Exception:
+                existing_size = 0  # unreadable/old pickle — let the save proceed
+            if self.training_size < existing_size:
+                logger.warning(
+                    "Refusing to overwrite personal model: on-disk fit has %d "
+                    "samples but this save has only %d. Skipping save to avoid "
+                    "clobbering a better model. Pass allow_shrink=True to force.",
+                    existing_size, self.training_size,
+                )
+                return
+
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "wb") as f:

@@ -392,7 +392,7 @@ def _apply_clahe(rgb: np.ndarray) -> np.ndarray:
 
 def _load_image(path: Path) -> np.ndarray:
     """Load JPEG or RAW as an RGB numpy array, with EXIF rotation applied. Raises on failure."""
-    if path.suffix.upper() in ('.RAF', '.NEF'):
+    if path.suffix.upper() in ('.RAF', '.NEF', '.3FR'):
         try:
             with rawpy.imread(str(path)) as raw:
                 return raw.postprocess(use_camera_wb=True, half_size=True, output_bps=8)

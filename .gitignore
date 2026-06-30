@@ -41,3 +41,7 @@ scripts/auto-cull-experiment/
 !kamera_app_icons_complete/**
 !frontend/public/**
 !docs/images/**
+
+# ...but never the macOS folder-metadata cruft, even inside whitelisted dirs.
+.DS_Store
+**/.DS_Store

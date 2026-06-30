@@ -289,10 +289,15 @@ export function GroupLoupe({
   // best_image_id) so opening a new burst always starts clean.
   const loupeSelect = useMultiSelect()
   const [pickTargetMode, setPickTargetMode] = useState(false)
+  // "Finish group" no-keeps guard: when the user triggers Finish with zero
+  // Keeps marked, we don't sweep — instead we surface a confirm affordance.
+  // True = the "Reject whole group?" confirmation is showing.
+  const [finishWarnOpen, setFinishWarnOpen] = useState(false)
   const groupIdForResetKey = group?.best_image_id ?? null
   useEffect(() => {
     loupeSelect.exit()
     setPickTargetMode(false)
+    setFinishWarnOpen(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupIdForResetKey])
 
@@ -555,17 +560,35 @@ export function GroupLoupe({
   }, [group, focusedImage, onSetGroupHero])
   useHotkeys('b', promoteFocusedToBest, { enabled: !!group }, [promoteFocusedToBest, group])
 
-  // U / Cmd+Z — per-photo undo for the currently-focused loupe photo. Silent
-  // no-op when the photo has no decision (matches grid behaviour). Doesn't
-  // auto-advance: undo is reflective, the user is correcting THIS photo.
+  // U / Cmd+Z — undo, selection-aware like decideSelectedOrFocused. Silent
+  // no-op when there's nothing decided to reverse (matches grid behaviour).
+  // Doesn't auto-advance: undo is reflective, the user is correcting these.
+  //
+  // The app-global stack (onUndo) is tried first: a just-applied bulk K/M/R
+  // is a single stack entry that already reverses every photo at once. The
+  // selection-aware branch below is the fallback for when the stack is empty
+  // or exhausted but a multi-selection is still active (e.g. photos decided
+  // in an earlier session) — without it, U would undo only the focused tile
+  // even though the user has several selected.
   const undoFocused = useCallback(async () => {
     if (onUndo) {
       const handled = await onUndo()
       if (handled) return
     }
+    if (loupeSelect.isSelectMode && loupeSelect.size > 0) {
+      // Undo every selected photo that actually has a decision. Selection
+      // persists so the user can act on the same set again (mirrors how bulk
+      // K/M/R leaves the selection in place).
+      const ids = Array.from(loupeSelect.selected).filter(id => {
+        const img = sortedImages.find(i => i.id === id)
+        return img && img.decision
+      })
+      await Promise.all(ids.map(id => onUndoImage?.(id)))
+      return
+    }
     if (!focusedImage || !focusedImage.decision) return
     onUndoImage?.(focusedImage.id)
-  }, [focusedImage, onUndo, onUndoImage])
+  }, [focusedImage, onUndo, onUndoImage, loupeSelect, sortedImages])
   useHotkeys('u',      undoFocused, { enabled: !!group }, [undoFocused, group])
   useHotkeys('meta+z', undoFocused, { enabled: !!group }, [undoFocused, group])
 
@@ -617,6 +640,45 @@ export function GroupLoupe({
 
     onAllDecided?.()
   }, [group, nonHero, onBulk, sortedImages, effectiveHeroId, onAllDecided])
+
+  // ── Finish group ─────────────────────────────────────────────────────────
+  // "Respect my Keeps, reject everything else." Unlike runBatch (which forces
+  // a single AI hero), this honours every photo the user manually marked Keep
+  // and rejects the rest — undecided AND Maybe alike. Closes + advances via
+  // onAllDecided once the sweep lands.
+  const keptImages = useMemo(
+    () => sortedImages.filter(img => img.decision === 'keep'),
+    [sortedImages],
+  )
+  const nonKeptIds = useMemo(
+    () => sortedImages.filter(img => img.decision !== 'keep').map(img => img.id),
+    [sortedImages],
+  )
+
+  // Sweep all non-Keep photos to reject. When there are zero Keeps (the
+  // no-keeps confirm path), nonKeptIds is the whole group, so this rejects
+  // everything — which is exactly what "Reject whole group" means.
+  const sweepRejectRest = useCallback(async () => {
+    if (!group) return
+    if (nonKeptIds.length > 0) {
+      await onBulk(nonKeptIds, 'reject')
+    }
+    setFinishWarnOpen(false)
+    onAllDecided?.()
+  }, [group, nonKeptIds, onBulk, onAllDecided])
+
+  const finishGroup = useCallback(() => {
+    if (!group) return
+    // Zero Keeps → don't silently reject the whole group. Surface a confirm.
+    if (keptImages.length === 0) {
+      setFinishWarnOpen(true)
+      return
+    }
+    setFinishWarnOpen(false)
+    sweepRejectRest()
+  }, [group, keptImages, sweepRejectRest])
+
+  useHotkeys('c', finishGroup, { enabled: !!group }, [finishGroup, group])
 
   // ── Pan helpers ──────────────────────────────────────────────────────────
   // Drag: mousedown records start; mousemove translates delta into origin
@@ -1021,6 +1083,39 @@ export function GroupLoupe({
               Keep best · <DecisionWord kind="reject">Reject</DecisionWord> rest
             </button>
           </>
+        )}
+
+        {/* Finish group — honour the user's manual Keeps, reject the rest (C) */}
+        <div className="w-px h-4 bg-[#2a2b2d]" />
+        {finishWarnOpen ? (
+          <span className="inline-flex items-center gap-2 text-xs whitespace-nowrap">
+            <span className="text-[#6a6b6c]">Nothing kept —</span>
+            <button
+              onClick={sweepRejectRest}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[rgba(201,123,123,0.12)] text-[#C97B7B] border border-[rgba(201,123,123,0.30)] hover:opacity-70 transition-opacity"
+              title={`Reject all ${group.size} photos in this group`}
+            >
+              <DecisionWord kind="reject">Reject</DecisionWord> whole group
+            </button>
+            <button
+              onClick={() => setFinishWarnOpen(false)}
+              className="px-2 py-1 rounded-lg text-[#cecece] hover:opacity-70 transition-opacity"
+            >
+              Cancel
+            </button>
+          </span>
+        ) : (
+          <button
+            onClick={finishGroup}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs bg-[rgba(91,184,212,0.12)] text-[#5BB8D4] border border-[rgba(91,184,212,0.30)] hover:opacity-70 transition-opacity whitespace-nowrap"
+            title={
+              keptImages.length > 0
+                ? `Finish group — reject the other ${nonKeptIds.length} photo${nonKeptIds.length === 1 ? '' : 's'} (C)`
+                : 'Finish group (C)'
+            }
+          >
+            <Check size={13} /> Finish group
+          </button>
         )}
       </div>
 

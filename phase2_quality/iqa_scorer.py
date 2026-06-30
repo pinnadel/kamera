@@ -131,7 +131,7 @@ def _load_and_downscale(image_path: str):
     path = Path(image_path)
     suffix = path.suffix.lower()
 
-    if suffix in (".raf", ".nef", ".cr2", ".arw", ".dng"):
+    if suffix in (".raf", ".nef", ".3fr", ".cr2", ".arw", ".dng"):
         import rawpy
         with rawpy.imread(str(path)) as raw:
             rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)

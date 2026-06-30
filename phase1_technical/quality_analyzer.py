@@ -215,7 +215,7 @@ def analyze_photo_quality(
             raise StopRequested()
 
     path = Path(image_path)
-    if path.suffix.lower() in (".raf", ".nef", ".cr2", ".arw", ".dng"):
+    if path.suffix.lower() in (".raf", ".nef", ".3fr", ".cr2", ".arw", ".dng"):
         import rawpy
         import numpy as _np
         from PIL import Image as _PILImage
