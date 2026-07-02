@@ -1,23 +1,26 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Camera, ChevronRight, Filter, X } from 'lucide-react'
+import { Camera, Check, ChevronRight, Filter } from 'lucide-react'
 import { DayPicker } from 'react-day-picker'
 import 'react-day-picker/style.css'
 import {
-  getActiveFilterLabel,
+  EMPTY_FILTER,
   getNewestShotDate,
   getUniqueCameras,
+  isFilterEmpty,
   toLocalDateKey,
 } from '../filterUtils'
+import { ACTIVE_PILL } from './buttons'
 
-// Bottom-pill Filter control. Icon-only when no filter is set; expands to
-// `[icon] active-label [×]` once a filter is active. Filters are mutually
-// exclusive and live in App state (no localStorage persistence).
+// Bottom-pill Filter control. The trigger is an icon-only funnel that opens the
+// menu; active filters render as removable chips in the bottom bar (see App),
+// NOT on the pill itself. Multiple categories can be active at once and combine
+// with AND: Camera (OR across cameras) · Date range · one composition type.
 //
 // Submenus (Date, Camera) flip placement to `right-full` when there isn't
 // room on the right of L1 — same viewport-aware logic as SortPill.
 export function FilterPill({
-  filter,
-  setFilter,
+  filters,
+  setFilters,
   images,
   open,
   onOpen,    // () => void — also closes other pills
@@ -34,12 +37,30 @@ export function FilterPill({
   const newestDate = useMemo(() => getNewestShotDate(images), [images])
   const cameras    = useMemo(() => getUniqueCameras(images), [images])
 
+  const f = filters ?? EMPTY_FILTER
+  const hasFilters = !isFilterEmpty(f)
+
   const closeAll = () => { setSubmenu(null); onClose() }
 
-  const apply = (next) => { setFilter(next); closeAll() }
-  const clear = () => setFilter(null)
+  // Toggle a single camera in/out of the OR-set. Menu stays open so several
+  // can be stacked in one visit.
+  const toggleCamera = (cam) => {
+    const on = f.cameras?.includes(cam)
+    setFilters({
+      ...f,
+      cameras: on ? f.cameras.filter(c => c !== cam) : [...(f.cameras ?? []), cam],
+    })
+  }
 
-  const activeLabel = getActiveFilterLabel(filter)
+  // Composition types are mutually exclusive: picking one replaces any other,
+  // re-picking the active one clears it. Menu stays open.
+  const setComposition = (kind) => {
+    setFilters({ ...f, composition: f.composition === kind ? null : kind })
+    setSubmenu(null)
+  }
+
+  const applyDate = (date) => { setFilters({ ...f, date }); closeAll() }
+  const clearDate = () => setFilters({ ...f, date: null })
 
   // Measure available room when a submenu opens. If the trigger's right edge
   // plus submenu width would overflow, flip to left placement.
@@ -54,44 +75,40 @@ export function FilterPill({
 
   // Seed the date draft when the submenu opens.
   const openDateSubmenu = () => {
-    if (filter?.type === 'date') {
-      const f = parseISODay(filter.from)
-      const t = parseISODay(filter.to ?? filter.from)
-      setDateDraft({ from: f, to: t })
+    if (f.date) {
+      const from = parseISODay(f.date.from)
+      const to   = parseISODay(f.date.to ?? f.date.from)
+      setDateDraft({ from, to })
     } else {
       setDateDraft(newestDate ? { from: newestDate, to: newestDate } : undefined)
     }
     setSubmenu('date')
   }
 
-  // Pill button styling mirrors SortPill so the active background spans the
-  // whole rounded container.
-  const containerActive = open || filter
-    ? 'bg-[#1a1b1d] border-[#2a2b2d]'
-    : 'border-transparent hover:bg-[rgba(255,255,255,0.06)]'
+  // The pill signals "filters are active" via the shared LOUD `ACTIVE_PILL`
+  // treatment (cyan container + border); which filters are active is shown by
+  // the chips in the bar. Open-without-filter falls back to neutral.
+  const containerActive = hasFilters
+    ? ACTIVE_PILL
+    : open
+      ? 'bg-[#1a1b1d] border-[#2a2b2d]'
+      : 'border-transparent hover:bg-[rgba(255,255,255,0.06)]'
+
+  const triggerText = hasFilters
+    ? ''
+    : open ? 'text-[#f0f0f0]' : 'text-[#cecece]'
 
   return (
     <div className="relative" data-dropdown="true">
       <div className={`inline-flex items-center rounded-lg border whitespace-nowrap transition-colors ${containerActive}`}>
         <button
           onClick={() => (open ? closeAll() : onOpen())}
-          title={filter ? `Filter: ${activeLabel}` : 'Filter'}
-          aria-label={filter ? `Filter: ${activeLabel}` : 'Filter'}
-          className={`px-2 py-1 text-xs inline-flex items-center gap-1.5 ${open || filter ? 'text-[#f0f0f0]' : 'text-[#cecece]'}`}
+          title="Filter"
+          aria-label="Filter"
+          className={`px-2 py-1 text-xs inline-flex items-center gap-1.5 ${triggerText}`}
         >
-          <Filter size={15} />
-          {activeLabel && <span>{activeLabel}</span>}
+          <Filter size={15} strokeWidth={hasFilters ? 2.5 : 2} />
         </button>
-        {filter && (
-          <button
-            onClick={(e) => { e.stopPropagation(); clear() }}
-            title="Clear filter"
-            aria-label="Clear filter"
-            className="mr-1 my-0.5 px-1 py-0.5 rounded-md inline-flex items-center text-[#9c9c9d] hover:text-[#f0f0f0] hover:bg-[rgba(255,255,255,0.06)] transition-colors"
-          >
-            <X size={13} />
-          </button>
-        )}
       </div>
 
       {open && (
@@ -102,7 +119,7 @@ export function FilterPill({
               onClick={() => (submenu === 'date' ? setSubmenu(null) : openDateSubmenu())}
               onMouseEnter={openDateSubmenu}
               className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between transition-opacity ${
-                filter?.type === 'date' ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                f.date ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
               }`}
             >
               <span>Date</span>
@@ -112,20 +129,20 @@ export function FilterPill({
 
           <FilterRow
             label="Portraits"
-            active={filter?.type === 'portraits'}
-            onSelect={() => apply({ type: 'portraits' })}
+            active={f.composition === 'portraits'}
+            onSelect={() => setComposition('portraits')}
             onMouseEnter={() => setSubmenu(null)}
           />
           <FilterRow
             label="Landscape"
-            active={filter?.type === 'landscape'}
-            onSelect={() => apply({ type: 'landscape' })}
+            active={f.composition === 'landscape'}
+            onSelect={() => setComposition('landscape')}
             onMouseEnter={() => setSubmenu(null)}
           />
           <FilterRow
             label="Group photos"
-            active={filter?.type === 'group'}
-            onSelect={() => apply({ type: 'group' })}
+            active={f.composition === 'group'}
+            onSelect={() => setComposition('group')}
             onMouseEnter={() => setSubmenu(null)}
           />
 
@@ -137,11 +154,14 @@ export function FilterPill({
                   onClick={() => setSubmenu(s => s === 'camera' ? null : 'camera')}
                   onMouseEnter={() => setSubmenu('camera')}
                   className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between transition-opacity ${
-                    filter?.type === 'camera' ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                    f.cameras?.length ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
                   }`}
                 >
                   <span className="inline-flex items-center gap-1.5">
                     <Camera size={12} /> Camera
+                    {f.cameras?.length > 0 && (
+                      <span className="text-[10px] text-[#5BB8D4] font-semibold">{f.cameras.length}</span>
+                    )}
                   </span>
                   <ChevronRight size={12} />
                 </button>
@@ -190,9 +210,9 @@ export function FilterPill({
                 weekStartsOn={1}
               />
               <div className="flex items-center justify-end gap-2 pt-2 mt-1 border-t border-[#2a2b2d]">
-                {filter?.type === 'date' && (
+                {f.date && (
                   <button
-                    onClick={() => { clear(); closeAll() }}
+                    onClick={() => { clearDate(); closeAll() }}
                     className="px-2 py-1 rounded text-[11px] text-[#9c9c9d] hover:text-[#f0f0f0] transition-colors"
                   >
                     Clear
@@ -203,7 +223,7 @@ export function FilterPill({
                     if (!dateDraft?.from) return
                     const from = toLocalDateKey(dateDraft.from)
                     const to   = toLocalDateKey(dateDraft.to ?? dateDraft.from)
-                    apply({ type: 'date', from, to })
+                    applyDate({ from, to })
                   }}
                   disabled={!dateDraft?.from}
                   className="px-3 py-1 rounded text-[11px] font-medium bg-[rgba(91,184,212,0.15)] border border-[rgba(91,184,212,0.30)] text-[#5BB8D4] hover:bg-[rgba(91,184,212,0.25)] disabled:opacity-40 transition-colors"
@@ -214,26 +234,28 @@ export function FilterPill({
             </div>
           )}
 
-          {/* ── Camera submenu ─────────────────────────────────────────── */}
+          {/* ── Camera submenu — multi-select (OR across cameras) ────────── */}
           {submenu === 'camera' && cameras.length > 1 && (
             <div
               className={`absolute bottom-0 ${
                 placement === 'right' ? 'left-full ml-1' : 'right-full mr-1'
               } z-[71] bg-[#111214] border border-[#2a2b2d] rounded-lg py-1 min-w-[180px] max-w-[calc(100vw-16px)] shadow-lg`}
             >
-              {cameras.map(cam => (
-                <button
-                  key={cam}
-                  onClick={() => apply({ type: 'camera', value: cam })}
-                  className={`w-full text-left px-3 py-1.5 text-xs transition-opacity ${
-                    filter?.type === 'camera' && filter.value === cam
-                      ? 'text-[#f9f9f9]'
-                      : 'text-[#6a6b6c] hover:opacity-70'
-                  }`}
-                >
-                  {cam}
-                </button>
-              ))}
+              {cameras.map(cam => {
+                const on = f.cameras?.includes(cam)
+                return (
+                  <button
+                    key={cam}
+                    onClick={() => toggleCamera(cam)}
+                    className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-2 transition-opacity ${
+                      on ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                    }`}
+                  >
+                    <span>{cam}</span>
+                    {on && <Check size={13} className="text-[#5BB8D4] shrink-0" />}
+                  </button>
+                )
+              })}
             </div>
           )}
         </div>
@@ -247,11 +269,12 @@ function FilterRow({ label, active, onSelect, onMouseEnter }) {
     <button
       onClick={onSelect}
       onMouseEnter={onMouseEnter}
-      className={`w-full text-left px-3 py-1.5 text-xs transition-opacity ${
+      className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-2 transition-opacity ${
         active ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
       }`}
     >
-      {label}
+      <span>{label}</span>
+      {active && <Check size={13} className="text-[#5BB8D4] shrink-0" />}
     </button>
   )
 }

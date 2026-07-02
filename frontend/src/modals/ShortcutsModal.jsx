@@ -65,6 +65,10 @@ export function ShortcutsModal({ onClose }) {
       { key: 'O',         desc: 'In detail view on a group, open it in the loupe (double-click the photo also works)' },
       { key: 'Esc',       desc: 'Close layers (compare → loupe → detail)' },
     ]},
+    { group: 'View', keys: [
+      { key: '+ −',       desc: 'Smaller / larger thumbnails' },
+      { key: 'F',         desc: 'Show / hide filenames under thumbnails' },
+    ]},
   ]
 
   const TAB_ACTIVE   = 'text-[#f9f9f9] border-b border-[#5BB8D4]'

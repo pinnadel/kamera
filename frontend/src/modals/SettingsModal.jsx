@@ -19,7 +19,7 @@ import {
 } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY } from '../ui/buttons'
-import { Toggle, InfoTooltip, DecisionWord } from '../ui/primitives'
+import { Toggle, InfoTooltip, HoverPopover, DecisionWord } from '../ui/primitives'
 import { ConfirmModal } from './ConfirmModal'
 import { PersonalModelBanner } from '../views/PersonalModelBanner'
 import { ALL_METRICS, SCORE_GROUPS } from '../sortMetrics'
@@ -105,7 +105,7 @@ const DECISION_DEFAULTS = {
   uncertainty_threshold:        8.0,
 }
 
-export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, advanceDir, onAdvanceDirChange,
+export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
   // Grouping sliders (Model tab). Live-updating — change triggers an
   // immediate /similarity-groups refetch via useGroups in the parent.
   // They aren't part of the Apply/draft flow because they aren't
@@ -326,11 +326,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-start justify-center pt-[5vh]" onClick={handleClose} onWheel={e => e.stopPropagation()}>
       <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
+        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
         onClick={e => e.stopPropagation()}
       >
         {/* Upper section — darker band, matches DetailView header */}
-        <div className="bg-[#161718] border-b border-[#2f3031] px-6 pt-5 pb-0 rounded-t-xl">
+        <div className="bg-[#161718] border-b border-[#2f3031] px-6 pt-5 pb-0 rounded-t-xl flex-shrink-0">
           {/* Header */}
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-semibold text-[#f9f9f9]">Settings</h2>
@@ -378,42 +378,53 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               }) ?? null
 
               const pills = [
-                { key: 'conservative', label: 'Conservative', Icon: Shield },
-                { key: 'balanced',     label: 'Balanced',     Icon: Scale  },
-                { key: 'review_heavy', label: 'Review-heavy', Icon: Filter },
-                { key: 'aggressive',   label: 'Aggressive',   Icon: Zap    },
+                { key: 'conservative', label: 'Conservative', Icon: Shield, desc: 'Fewer keeps, stricter rules.' },
+                { key: 'balanced',     label: 'Balanced',     Icon: Scale,  desc: 'The defaults.' },
+                { key: 'review_heavy', label: 'Review-heavy', Icon: Filter, desc: 'Wider Maybe band so fewer borderline keeps slip through; pairs with manual Maybe review.' },
+                { key: 'aggressive',   label: 'Aggressive',   Icon: Zap,    desc: 'More keeps, looser rules.' },
               ]
 
               return (
                 <div>
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-2">
                     <span className="text-xs text-[#9c9c9d]">Presets</span>
-                    <div className="flex items-center gap-1.5">
-                      {pills.map(({ key, label, Icon }) => {
-                        const isActive = activePreset === key
-                        return (
+                    {activePreset === null && (
+                      <span className="text-[10px] text-[#9c9c9d]">· Custom settings</span>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {pills.map(({ key, label, Icon, desc }) => {
+                      const isActive = activePreset === key
+                      return (
+                        <HoverPopover key={key} content={desc}>
                           <button
-                            key={key}
                             onClick={() => {
                               setDecision({ ...PRESETS[key] })
                               setShowValidationHint(false)
                             }}
                             className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border text-xs transition-opacity ${
                               isActive
-                                ? 'border-[#5BB8D4] text-[#5BB8D4]'
+                                ? 'border-[#5BB8D4] text-[#5BB8D4] bg-[rgba(91,184,212,0.10)]'
                                 : 'border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70'
                             }`}
                           >
                             <Icon size={14} />
                             {label}
                           </button>
-                        )
-                      })}
-                    </div>
+                        </HoverPopover>
+                      )
+                    })}
                   </div>
-                  <p className="text-[11px] text-[#6a6b6c] mt-1 leading-relaxed">
-                    <span className="text-[#9c9c9d]">Conservative</span> — fewer keeps, stricter rules. <span className="text-[#9c9c9d]">Balanced</span> — defaults. <span className="text-[#9c9c9d]">Review-heavy</span> — wider Maybe band so fewer borderline keeps slip through; pairs with manual Maybe review. <span className="text-[#9c9c9d]">Aggressive</span> — more keeps, looser rules.
-                  </p>
+                  {activePreset === null ? (
+                    <p className="text-[11px] text-[#6a6b6c] mt-2 leading-relaxed">
+                      Your thresholds below don't match any preset — that's fine, they're yours.
+                      Presets are just starting points; pick one to reset everything to it.
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-[#6a6b6c] mt-2 leading-relaxed">
+                      A preset is selected. Adjusting any threshold below makes it custom.
+                    </p>
+                  )}
                 </div>
               )
             })()}
@@ -1048,6 +1059,30 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               <p className="text-[11px] text-[#6a6b6c] mt-2">
                 Takes effect immediately. Saved across sessions.
               </p>
+            </div>
+
+            <div className="border-t border-[rgba(255,255,255,0.05)]" />
+
+            {/* ── Grid filenames ── */}
+            <div>
+              <p className="label mb-1">Grid filenames</p>
+              <div className="flex items-start justify-between gap-4 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs text-[#f0f0f0]">Show filenames under thumbnails</p>
+                  <p className="text-xs text-[#9c9c9d] leading-relaxed mt-1">
+                    Displays the filename row beneath every grid tile. Turn it
+                    off for a cleaner, image-first grid — the status chips and
+                    group summary stay. Toggle anytime with{' '}
+                    <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[10px] text-[#9c9c9d]">F</kbd>.
+                  </p>
+                </div>
+                <div className="pt-0.5">
+                  <Toggle
+                    enabled={showFilenames}
+                    onChange={() => onToggleFilenames?.()}
+                  />
+                </div>
+              </div>
             </div>
 
             <div className="border-t border-[rgba(255,255,255,0.05)]" />

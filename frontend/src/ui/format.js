@@ -25,6 +25,22 @@ export function formatDuration(seconds) {
   return `${h}h ${m}m ${s}s`
 }
 
+// middleTruncate — shorten a string from the middle so both the beginning
+// and the end stay visible (e.g. "2026-05-09_16-31-07_X100VI_DSCF0761.RAF"
+// → "2026-05-09_16-3…_DSCF0761.RAF"). Tile filenames share a common date
+// prefix and the distinguishing part is the trailing frame number + ext, so
+// CSS `truncate` (which always cuts the tail) hides exactly the part the
+// user scans for. `head`/`tail` are character budgets; total visible length
+// is head + 1 (ellipsis) + tail. Returns the string untouched when it
+// already fits. Width-based truncation isn't possible here (we don't measure
+// the rendered glyphs), so this is a generous character cap — the row still
+// applies overflow-hidden as a hard backstop on very narrow tiles.
+export function middleTruncate(str, head = 16, tail = 13) {
+  const s = str ?? ''
+  if (s.length <= head + tail + 1) return s
+  return `${s.slice(0, head)}…${s.slice(-tail)}`
+}
+
 export function formatShutter(seconds) {
   if (seconds == null) return null
   if (seconds >= 1) return `${Math.round(seconds)}s`

@@ -32,6 +32,7 @@ from phase2_quality.llm_explainer import (
     _OLLAMA_NATIVE,
     _TIMEOUT,
     _VISION_PREFIXES,
+    _recover_wedged_runner,
     list_models,
 )
 
@@ -778,11 +779,22 @@ def _leader_compute_rank(h, evaluated_ids, filtered_from, conn, merged_map=None)
             "burst_ranker: calling /api/chat model=%s n=%d num_ctx=8192",
             model_id, actual_n,
         )
-        r = _httpx.post(
-            f"{_OLLAMA_NATIVE}/api/chat",
-            json=payload,
-            timeout=_TIMEOUT,
-        )
+        def _post():
+            return _httpx.post(
+                f"{_OLLAMA_NATIVE}/api/chat",
+                json=payload,
+                timeout=_TIMEOUT,
+            )
+        try:
+            r = _post()
+        except _httpx.ReadTimeout:
+            # Wedged-runner signature (see llm_explainer._recover_wedged_runner):
+            # daemon reachable but the model never emits a token. Unload the
+            # stuck runner once and retry on a fresh one.
+            logger.warning("Ollama burst-rank timed out — attempting wedged-runner recovery")
+            if not _recover_wedged_runner(model_id):
+                raise
+            r = _post()
         if r.status_code != 200:
             logger.error("Ollama /api/chat returned HTTP %d: %s", r.status_code, r.text[:200])
             return _result(

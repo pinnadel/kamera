@@ -241,6 +241,20 @@ Reject) and contextual buttons (Analyze, Stop, Settings).
 - Same chrome, but text uses Reject Coral (`#C97B7B`) for "Stop Analysis"
 - Hover: opacity 0.7
 
+**Active-control emphasis (Cool Cyan "this is ON / narrowing what you see"):**
+
+Cyan is the single signal for *"this control is currently active and changing what you see, and you can turn it off."* One vocabulary, two intensities — defined once in [`ui/buttons.js`](../frontend/src/ui/buttons.js) as `ACTIVE_PILL` / `ACTIVE_TOGGLE` so nothing drifts:
+
+| Tier | Token | Treatment | Used by |
+|---|---|---|---|
+| **Loud** (full pill) | `ACTIVE_PILL` | cyan-tinted container `rgba(91,184,212,0.12)` + border `rgba(91,184,212,0.30)` + **bold** cyan text + icon stroke `2.5` | **Filter** pill (active), active-filter **chips** in the bar, filename **search input** with a query |
+| **Lighter** (text/icon) | `ACTIVE_TOGGLE` | **bold** cyan text + cyan icon, **no** container fill | **Select** mode ON, **search magnifier** with a query, **group-mode** active segment |
+
+**The discipline that makes it consistent is the *rule*, not painting every pill cyan:**
+- **Always-has-a-value controls stay neutral** — Sort and View/size never get the emphasis; they'd read as active 100% of the time and dilute the signal. A bar where *only the deviations-from-default* are cyan makes active state instantly legible.
+- **The full `ACTIVE_PILL` is reserved for Filter** (and its chips / filename-search input) — the controls that mean "you're viewing a narrowed subset." Mode toggles get the quieter `ACTIVE_TOGGLE` so Filter stays the loudest narrowing signal.
+- **Two protected vocabularies are never overwritten:** the **AI rainbow border** (`ai-border-sm`, semantic-search active — its own signal, no cyan layered on top) and the **decision colors** (K/M/R green/amber/coral). Settings **toggle switches** keep their own on-state (cyan switch); their labels are *not* additionally bolded (would double-signal against the switch).
+
 ### 4.2 Thumbnail Card (Contact-Sheet Grid item — adapted from Raycast List Item)
 
 Thumbnails are the workhorse of the grid view. Treat them like contact-sheet prints

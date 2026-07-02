@@ -67,7 +67,7 @@ import {
 } from 'lucide-react'
 import { MoveIntoGroupModal } from './modals/MoveIntoGroupModal'
 import { API } from './api'
-import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY } from './ui/buttons'
+import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, ACTIVE_TOGGLE } from './ui/buttons'
 import { formatEta, formatDuration } from './ui/format'
 import { Spinner, DecisionWord, Toggle } from './ui/primitives'
 import { DownloadToast, ToastStack } from './ui/toasts'
@@ -108,7 +108,7 @@ import { ViewPill, GRID_SIZE_OPTIONS } from './ui/ViewPill'
 // surface, so the layout picker would just be a one-row no-op without this.
 const GRID_ONLY_LAYOUT_OPTIONS = [{ id: 'grid', label: 'Grid', Icon: Grid2x2 }]
 import { FILMSTRIP_CHROME_WITH_BADGES, pillBottomAboveStrip, stripHeight } from './ui/filmstripMetrics'
-import { filterPredicate, getActiveFilterLabel } from './filterUtils'
+import { EMPTY_FILTER, filterPredicate, getActiveFilterChips, isFilterEmpty } from './filterUtils'
 import { ViewModePill } from './ViewModePill'
 
 export default function App() {
@@ -126,6 +126,17 @@ export default function App() {
     document.documentElement.dataset.uiScale = uiScale
     localStorage.setItem('pca.uiScale', uiScale)
   }, [uiScale])
+  // Grid filename visibility. When OFF, the filename row under each tile is
+  // hidden (the chip row + group summary stay). Pure display preference,
+  // toggled in Settings → Display or with the F key. Default ON. The footer
+  // reserves its text-row height either way, so toggling never reflows the
+  // grid — it only shows/hides the text.
+  const [showFilenames, setShowFilenames] = useState(
+    () => localStorage.getItem('pca.showFilenames') !== '0'
+  )
+  useEffect(() => {
+    localStorage.setItem('pca.showFilenames', showFilenames ? '1' : '0')
+  }, [showFilenames])
   // When ON, the header `+` button auto-opens the OS folder picker. When OFF
   // (default), `+` just navigates to the empty New-analysis page where the
   // user can click "Open folder" themselves.
@@ -169,10 +180,11 @@ export default function App() {
   const [sortOpen,  setSortOpen]            = useState(false)
   const [filterOpen, setFilterOpen]         = useState(false)
   const [tabSettingsOpen, setTabSettingsOpen] = useState(false)
-  // `filter` is a discriminated-union object (see filterUtils.js): null,
-  // {type:'date', from, to}, {type:'portraits'|'landscape'|'group'}, or
-  // {type:'camera', value}. In-memory only — no persistence.
-  const [filter, setFilter] = useState(null)
+  // `filters` is a multi-filter object (see filterUtils.js):
+  // { cameras: string[], date: {from,to}|null, composition: 'portraits'|
+  // 'landscape'|'group'|null }. Categories combine with AND; cameras OR within
+  // the camera category. In-memory only — no persistence.
+  const [filters, setFilters] = useState(EMPTY_FILTER)
   // Search starts collapsed (icon-only). Click search icon → expand inline
   // with a width transition. Stays open while typed content remains; collapses
   // on outside-click only when the input is empty.
@@ -804,22 +816,83 @@ export default function App() {
   }, [images, sortField, sortDir])
 
   // ── Grid items ────────────────────────────────────────────────────────────
+  // A group tile represents ONLY the still-undecided remainder of a burst. The
+  // moment a member is decided (K/M/R), it leaves the group tile and renders as
+  // an individual card in its decision's filter view — exactly like a photo that
+  // was never grouped. So:
+  //   • a group with ≥2 undecided members → one group tile (carrying an
+  //     `undecidedImages` view of just those members; the full `group` object is
+  //     preserved untouched for the loupe / ranking / batch actions).
+  //   • a group with exactly 1 undecided member → that lone member as an
+  //     individual (a "group of one" isn't a group).
+  //   • a group with 0 undecided members → no group tile at all.
+  // Un-deciding a photo returns it to undecided, so it re-enters its group's
+  // undecided set on the next render — the split is a live view, never a
+  // mutation of group membership (which stays keyed to similarity clustering).
+  const isUndecided = (img) => !img.decision && img.analysis_status === 'done'
   const gridItems = useMemo(() => {
     const groupByImageId = new Map()
     enrichedGroups.forEach(group => group.images.forEach(img => groupByImageId.set(img.id, group)))
+    // Precompute each group's undecided members (in the group's own member order
+    // so the hero stays first when present). Keyed by best_image_id.
+    const undecidedByGroup = new Map()
+    enrichedGroups.forEach(group => {
+      undecidedByGroup.set(group.best_image_id, group.images.filter(isUndecided))
+    })
     const seen = new Set()
     const items = []
     for (const image of sortedImages) {
       const group = groupByImageId.get(image.id)
-      if (!group) {
+      // No group, or this member is already decided → individual card. A decided
+      // ex-member is just a normal photo in its decision colour.
+      if (!group || !isUndecided(image)) {
         items.push({ type: 'image', image })
-      } else if (!seen.has(group.best_image_id)) {
-        seen.add(group.best_image_id)
-        items.push({ type: 'group', group })
+        continue
       }
+      // Undecided group member: emit the group (or its lone member) once, on the
+      // first undecided member encountered in sort order.
+      if (seen.has(group.best_image_id)) continue
+      seen.add(group.best_image_id)
+      const undecided = undecidedByGroup.get(group.best_image_id) || []
+      if (undecided.length >= 2) {
+        items.push({ type: 'group', group, undecidedImages: undecided })
+      } else if (undecided.length === 1) {
+        items.push({ type: 'image', image: undecided[0] })
+      }
+      // length 0 can't happen here (this member is undecided), but harmless.
     }
     return items
   }, [sortedImages, enrichedGroups])
+
+  // ── Group-partner summary ──────────────────────────────────────────────────
+  // For every photo that belongs to a similarity group (size > 1), how were its
+  // *other* group members decided? Drives the partner-count chips + shared
+  // border in the Rejects/Maybes views: reviewing a culled frame, the user
+  // wants to confirm at a glance that at least one groupmate survived (Keep or
+  // Maybe) — that the moment wasn't thrown away wholesale.
+  //
+  // enrichedGroups already has each member's live decision merged in
+  // (useGroups.enrichedGroups), so counts stay current through undo/re-decide
+  // with no extra wiring. Undecided partners contribute to no chip.
+  //
+  // Shape: Map<imageId, { groupId, counts: { keep, maybe, reject } }>. Only
+  // grouped photos get an entry; singletons/ungrouped are absent.
+  const partnerSummaryByImageId = useMemo(() => {
+    const summary = new Map()
+    for (const group of enrichedGroups) {
+      for (const img of group.images) {
+        const counts = { keep: 0, maybe: 0, reject: 0 }
+        for (const other of group.images) {
+          if (other.id === img.id) continue
+          if (other.decision === 'keep' || other.decision === 'maybe' || other.decision === 'reject') {
+            counts[other.decision] += 1
+          }
+        }
+        summary.set(img.id, { groupId: group.best_image_id, counts })
+      }
+    }
+    return summary
+  }, [enrichedGroups])
 
   // Groups ordered to match the grid: a group's rank is its position in
   // gridItems (which already reflects the global sort). Any group not
@@ -852,20 +925,19 @@ export default function App() {
     const q = searchQuery.trim().toLowerCase()
 
     let filtered = gridItems
-    // Combined filter pass: groups are kept as groups when ANY member
-    // matches, annotated with a filterContext so GroupTile can render the
-    // partial-match dim + "X of Y kept" footer + mini-badge. Previously
-    // groups were collapsed to their hero photo, which hid any group whose
-    // hero wasn't the decided/matching photo (the original bug: marking a
-    // non-hero as Maybe/Reject made the group disappear from those filter
-    // views entirely).
+    // Combined filter pass. A group tile now holds ONLY undecided members
+    // (decided ones are already individual items from gridItems), so:
+    //   • Individual cards match the decision + composition predicates directly.
+    //   • A group tile is all-undecided by construction, so it only survives the
+    //     Undecided filter (or no decision filter) — never Keeps/Maybes/Rejects.
+    //     Under a composition filter it survives if any of its undecided members
+    //     matches. No filterContext / partial-match summary anymore.
     const decisionMatches = decisionFilter
       ? (img => decisionFilter === 'undecided'
           ? (!img.decision && img.analysis_status === 'done')
           : img.decision === decisionFilter)
       : null
-    const compositionMatches = filter ? filterPredicate(filter) : null
-    const compositionLabel   = filter ? getActiveFilterLabel(filter) : null
+    const compositionMatches = isFilterEmpty(filters) ? null : filterPredicate(filters)
     if (decisionMatches || compositionMatches) {
       const passesAll = img =>
         (!decisionMatches    || decisionMatches(img)) &&
@@ -874,19 +946,12 @@ export default function App() {
         if (item.type !== 'group') {
           return passesAll(item.image) ? [item] : []
         }
-        const matchingCount = item.group.images.reduce(
-          (n, img) => n + (passesAll(img) ? 1 : 0), 0,
-        )
-        if (matchingCount === 0) return []
-        return [{
-          ...item,
-          filterContext: {
-            decision: decisionFilter || null,
-            label: compositionLabel,
-            matchingCount,
-            total: item.group.size,
-          },
-        }]
+        // Group tile: excluded by any decision filter other than Undecided.
+        if (decisionFilter && decisionFilter !== 'undecided') return []
+        // Composition filter (if any) tests the undecided members only.
+        if (compositionMatches &&
+            !item.undecidedImages.some(compositionMatches)) return []
+        return [item]
       })
     }
     if (searchMode === 'semantic' && semanticResults !== null) {
@@ -919,8 +984,74 @@ export default function App() {
         return item.group.images.some(img => (img.filename || '').toLowerCase().includes(q))
       })
     }
+
+    // ── Cluster + annotate group members (Rejects/Maybes only) ────────────────
+    // In these views every item is an individual `image` (group tiles only ever
+    // survive the Undecided filter), and members of the same original burst are
+    // scattered by the active sort. Reorder so groupmates sit adjacent so a
+    // group can be wrapped in one shared border, and attach the "survivor" chip.
+    //
+    // Chip semantics: a photo *survives* culling if it's a Keep or Maybe. The
+    // chip answers "did any groupmate survive, and how" — so we show the
+    // SURVIVOR buckets (keep, maybe) MINUS the bucket we're currently viewing
+    // (that count is trivially "the tiles around you"):
+    //   • Rejects view → K + M partner counts (did the moment survive elsewhere)
+    //   • Maybes  view → K partner counts only (a better survivor exists)
+    // Reject partner counts are never shown (a reject isn't a survivor).
+    // A group with no such partners keeps its border but shows no chip.
+    // Gated to reject/maybe so All/Undecided/Keeps stay untouched.
+    if (decisionFilter === 'reject' || decisionFilter === 'maybe') {
+      // Which survivor buckets to surface, given the current view.
+      const chipKinds = decisionFilter === 'maybe' ? ['keep'] : ['keep', 'maybe']
+      const survivorCounts = (counts) => {
+        if (!counts) return null
+        const out = {}
+        let any = false
+        for (const kind of chipKinds) {
+          const n = counts[kind] || 0
+          out[kind] = n
+          if (n > 0) any = true
+        }
+        return any ? out : null
+      }
+      // Bucket by groupId, preserving each group's first-appearance order (so
+      // the existing sort still drives the overall sequence). Ungrouped photos
+      // are singletons that stay in place by first appearance.
+      const order = []              // ordered list of bucket keys
+      const buckets = new Map()     // key -> [items]
+      for (const item of filtered) {
+        if (item.type !== 'image') { // defensive; shouldn't occur under K/M/R
+          const k = `__nogroup_${order.length}`
+          order.push(k); buckets.set(k, [item])
+          continue
+        }
+        const summary = partnerSummaryByImageId.get(item.image.id)
+        const key = summary ? `g_${summary.groupId}` : `s_${item.image.id}`
+        if (!buckets.has(key)) { order.push(key); buckets.set(key, []) }
+        buckets.get(key).push({ ...item, partnerCounts: survivorCounts(summary && summary.counts) })
+      }
+      const clustered = []
+      for (const key of order) {
+        const run = buckets.get(key)
+        // A run of ≥2 present members reads as one enclosure; a lone member
+        // (its groupmates live in other decision views) shows its chip but no
+        // border, so it renders like any ungrouped photo.
+        const drawBorder = key.startsWith('g_') && run.length >= 2
+        run.forEach((it, i) => {
+          const position = !drawBorder
+            ? 'solo'
+            : i === 0 ? 'start'
+            : i === run.length - 1 ? 'end'
+            : 'middle'
+          // runId lets the render layer group adjacent members; runLen +
+          // index drive the spanning-border edges (see ImageCard).
+          clustered.push({ ...it, groupRun: { id: key, position, index: i, length: run.length } })
+        })
+      }
+      return clustered
+    }
     return filtered
-  }, [gridItems, decisionFilter, filter, searchQuery, searchMode, semanticResults])
+  }, [gridItems, decisionFilter, filters, searchQuery, searchMode, semanticResults, partnerSummaryByImageId])
 
   // Index of the currently-focused grid cell — drives scrollIntoView and the
   // GroupTile's selection ring. Computed against the filtered/visible list so
@@ -1711,6 +1842,9 @@ export default function App() {
     runUndo,
     amendLastDecision,
     registerDecisionIntent,
+    // F toggles grid filename visibility (mirrors the Settings → Display
+    // switch). Grid-only; gated inside the hook like the other view hotkeys.
+    toggleFilenames: () => setShowFilenames(v => !v),
   })
 
   // ── Render: loading ───────────────────────────────────────────────────────
@@ -1835,6 +1969,8 @@ export default function App() {
           }}
           uiScale={uiScale}
           onUiScaleChange={setUiScale}
+          showFilenames={showFilenames}
+          onToggleFilenames={() => setShowFilenames(v => !v)}
           advanceDir={advanceDir}
           onAdvanceDirChange={setAdvanceDir}
           groupThreshold={threshold}
@@ -2618,7 +2754,7 @@ export default function App() {
             ) : (
               <button onClick={() => setBulkConfirm('trash-rejects')}
                 className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.12)] border border-[rgba(201,123,123,0.30)] text-[#C97B7B] hover:opacity-70 transition-opacity">
-                <Trash2 size={14} /> Move to Trash
+                <Trash2 size={14} /> Move to system trash
               </button>
             )}
           </div>
@@ -2921,8 +3057,11 @@ export default function App() {
                 >
                   <GroupTile
                     group={item.group}
+                    undecidedImages={item.undecidedImages}
                     isSelected={selectedGroupId === item.group.best_image_id}
                     isSelectMode={gridMultiSelect.isSelectMode}
+                    showFilename={showFilenames}
+                    isAllView={decisionFilter === null}
                     isDropHover={dropHoverGroupId === item.group.best_image_id}
                     onSelect={() => {
                       setSelectedGroupId(item.group.best_image_id)
@@ -2931,22 +3070,6 @@ export default function App() {
                       setSelectedGroupId(item.group.best_image_id)
                       enterLoupe(item.group.best_image_id)
                     }}
-                    filterContext={item.filterContext}
-                    quickDecide={
-                      // Enable on the Maybe filter only. Resolves to the
-                      // subset of members currently holding 'maybe', so
-                      // already-decided members in the same burst are not
-                      // re-decided. Skip in select mode (multi-select owns
-                      // batch operations there).
-                      decisionFilter === 'maybe' && !gridMultiSelect.isSelectMode
-                        ? (decision) => {
-                            const ids = item.group.images
-                              .filter(img => img.decision === 'maybe')
-                              .map(img => img.id)
-                            if (ids.length > 0) bulkDecide(ids, decision)
-                          }
-                        : null
-                    }
                     onDragOver={(e) => {
                       // Accept any drag carrying a photo payload. We don't
                       // inspect the payload here to keep the visual fast;
@@ -2986,7 +3109,7 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className="outline-none"
+                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative' : ''}`}
                   onFocus={() => {
                     const i = images.findIndex(img => img.id === item.image.id)
                     if (selectedGroupId == null && selectedIdx === i) return
@@ -3108,6 +3231,27 @@ export default function App() {
                     } catch { /* silently ignore malformed payloads */ }
                   }}
                 >
+                  {/* Shared group-run border (Rejects/Maybes). One amber
+                      enclosure around a run of adjacent same-group tiles: a
+                      non-interactive overlay that bleeds ±7px into the 12px
+                      grid gutters so the top/bottom lines are continuous across
+                      members and the interior vertical seams disappear. Kept as
+                      an absolute overlay (not a spanning cell) so the grid
+                      rhythm and the 1:1 data-grid-idx ↔ cell mapping that
+                      keyboard nav relies on stay intact; a run that wraps a row
+                      simply splits into two aligned amber strips. */}
+                  {item.groupRun && item.groupRun.position !== 'solo' && (
+                    <div
+                      aria-hidden="true"
+                      className={`pointer-events-none absolute inset-y-0 z-10 border-y-2 border-[#E8B84A] ${
+                        item.groupRun.position === 'start'
+                          ? 'left-0 -right-[7px] border-l-2 rounded-l-lg'
+                          : item.groupRun.position === 'end'
+                          ? '-left-[7px] right-0 border-r-2 rounded-r-lg'
+                          : '-left-[7px] -right-[7px]'
+                      }`}
+                    />
+                  )}
                   <ImageCard
                     image={item.image}
                     isSelected={!gridMultiSelect.isSelectMode && selectedGroupId == null && item.image.id === images[selectedIdx]?.id}
@@ -3115,15 +3259,9 @@ export default function App() {
                     isSelectMode={gridMultiSelect.isSelectMode}
                     isDropHover={dropHoverPhotoId === item.image.id}
                     searchQuery={searchQuery}
-                    modelInfo={modelInfo}
-                    quickDecide={
-                      // Solo-tile Maybe quick-decide: same gating as the
-                      // GroupTile path. bulkDecide handles undo + refresh +
-                      // toast, so we wrap the single id in an array.
-                      decisionFilter === 'maybe' && !gridMultiSelect.isSelectMode
-                        ? (decision) => bulkDecide([item.image.id], decision)
-                        : null
-                    }
+                    showFilename={showFilenames}
+                    isAllView={decisionFilter === null}
+                    partnerCounts={item.partnerCounts ?? null}
                     draggable
                     onDragStart={(e) => {
                       // Payload carries the entire current selection when
@@ -3176,7 +3314,7 @@ export default function App() {
         const inToolbar = detailOpen && bottomToolbarSlot
         const wrapperClass = inToolbar
           ? 'ml-auto flex items-center gap-1'
-          : 'fixed left-1/2 -translate-x-1/2 z-[60] flex items-center gap-1 px-2 py-1.5 bg-[#111214] border border-[#2a2b2d] rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.6)]'
+          : 'fixed left-1/2 -translate-x-1/2 z-40 flex items-center gap-1 px-2 py-1.5 bg-[#111214] border border-[#2a2b2d] rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.6)]'
         const wrapperStyle = inToolbar ? {} : { bottom: '8px' }
         const tree = (
         <div style={wrapperStyle} className={wrapperClass}>
@@ -3202,17 +3340,54 @@ export default function App() {
           {activeView === 'grid' && <div className="w-px h-4 bg-[#2a2b2d] mx-1" />}
 
           {/* Filter pill — date / portraits / landscape / group / camera.
-              In-memory state on App; predicate composed into displayGridItems. */}
+              Multiple categories combine with AND; active filters render as
+              removable chips (below). In-memory state on App; predicate composed
+              into displayGridItems. */}
           {activeView === 'grid' && (
             <FilterPill
-              filter={filter}
-              setFilter={setFilter}
+              filters={filters}
+              setFilters={setFilters}
               images={images}
               open={filterOpen}
               onOpen={() => { setSortOpen(false); setViewOpen(false); setTabSettingsOpen(false); setFilterOpen(true) }}
               onClose={() => setFilterOpen(false)}
             />
           )}
+
+          {/* Active-filter chips — one removable chip per active filter, plus a
+              "Clear all" once 2+ are active. Sits between the funnel and the
+              next divider so it grows the pill row rather than the pill itself. */}
+          {activeView === 'grid' && !isFilterEmpty(filters) && (() => {
+            const chips = getActiveFilterChips(filters)
+            return (
+              <div className="flex items-center gap-1">
+                {chips.map(chip => (
+                  <span
+                    key={chip.key}
+                    className="inline-flex items-center gap-1 h-[22px] pl-2 pr-1 rounded-md text-[11px] whitespace-nowrap bg-[rgba(91,184,212,0.12)] border border-[rgba(91,184,212,0.30)] text-[#5BB8D4]"
+                  >
+                    <span className="font-medium">{chip.label}</span>
+                    <button
+                      onClick={() => setFilters(chip.next)}
+                      title={`Remove ${chip.label} filter`}
+                      aria-label={`Remove ${chip.label} filter`}
+                      className="inline-flex items-center rounded p-0.5 text-[rgba(91,184,212,0.7)] hover:text-[#5BB8D4] hover:bg-[rgba(91,184,212,0.18)] transition-colors"
+                    >
+                      <X size={12} />
+                    </button>
+                  </span>
+                ))}
+                {chips.length > 1 && (
+                  <button
+                    onClick={() => setFilters(EMPTY_FILTER)}
+                    className="px-1.5 h-[22px] rounded-md text-[11px] text-[#9c9c9d] hover:text-[#f0f0f0] hover:bg-[rgba(255,255,255,0.05)] transition-colors"
+                  >
+                    Clear all
+                  </button>
+                )}
+              </div>
+            )
+          })()}
 
           {/* Divider between Filter and the next group. Shown in both grid and
               DetailView (in DetailView there's no View pill, so this divider
@@ -3247,11 +3422,11 @@ export default function App() {
             <>
               <button
                 onClick={() => gridMultiSelect.isSelectMode ? gridMultiSelect.exit() : gridMultiSelect.enter()}
-                className={`px-2 py-1 rounded-lg text-xs transition-opacity border whitespace-nowrap inline-flex items-center gap-1.5 ${gridMultiSelect.isSelectMode ? 'bg-[#1a1b1d] text-[#5BB8D4] border-[rgba(91,184,212,0.30)]' : 'text-[#cecece] border-transparent hover:opacity-70'}`}
+                className={`px-2 py-1 rounded-lg text-xs transition-colors border border-transparent whitespace-nowrap inline-flex items-center gap-1.5 ${gridMultiSelect.isSelectMode ? ACTIVE_TOGGLE : 'text-[#cecece] hover:opacity-70'}`}
                 title="Multi-select photos to act on as a batch"
                 aria-label="Select"
               >
-                <MousePointerSquareDashed size={13} />
+                <MousePointerSquareDashed size={13} strokeWidth={gridMultiSelect.isSelectMode ? 2.5 : 2} />
                 Select
               </button>
               <div className="w-px h-4 bg-[#2a2b2d] mx-1" />
@@ -3350,7 +3525,7 @@ export default function App() {
                   {/* ── Groups ── */}
                   {enrichedGroups.length > 0 && (
                     <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
-                      <p className="label mb-1">Groups</p>
+                      <p className="label mb-1">Group formation by</p>
                       <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
                         Cluster by visual content (Bursts) or by who's in them (People). Open a group to fine-tune the clustering live.
                       </p>
@@ -3361,9 +3536,9 @@ export default function App() {
                           <button
                             key={mode}
                             onClick={() => setGroupMode(mode)}
-                            className={`px-3 py-1 rounded-md border text-xs transition-opacity capitalize ${
+                            className={`px-3 py-1 rounded-md border text-xs transition-colors capitalize ${
                               groupMode === mode
-                                ? 'border-[#5BB8D4] text-[#5BB8D4]'
+                                ? 'border-[rgba(91,184,212,0.30)] text-[#5BB8D4] font-bold'
                                 : 'border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70'
                             }`}
                           >{mode}</button>
@@ -3413,10 +3588,14 @@ export default function App() {
                 aria-label={searchExpanded ? 'Hide search' : 'Search'}
                 aria-expanded={searchExpanded}
                 className={`w-8 h-8 flex-shrink-0 rounded-lg inline-flex items-center justify-center transition-colors ${
-                  searchExpanded || searchInput ? 'text-[#f0f0f0]' : 'text-[#cecece] hover:bg-[rgba(255,255,255,0.06)] hover:text-[#f0f0f0]'
+                  searchInput
+                    ? ACTIVE_TOGGLE
+                    : searchExpanded
+                      ? 'text-[#f0f0f0]'
+                      : 'text-[#cecece] hover:bg-[rgba(255,255,255,0.06)] hover:text-[#f0f0f0]'
                 }`}
               >
-                {semanticLoading ? <Spinner size={12} /> : <Search size={15} strokeWidth={1.75} />}
+                {semanticLoading ? <Spinner size={12} /> : <Search size={15} strokeWidth={searchInput ? 2.5 : 1.75} />}
               </button>
 
               {/* Input + AI toggle. Always rendered so the width transition
@@ -3427,46 +3606,32 @@ export default function App() {
                   searchExpanded ? 'opacity-100 delay-75' : 'opacity-0 pointer-events-none'
                 }`}
               >
-                <div className={`relative flex-1 min-w-0 ${searchMode === 'semantic' ? 'ai-border-sm' : ''}`}>
+                {/* AI/semantic search hidden — filename search only. */}
+                <div className="relative flex-1 min-w-0">
                   <input
                     ref={searchInputRef}
                     type="text"
                     value={searchInput}
                     onChange={e => setSearchInput(e.target.value)}
                     tabIndex={searchExpanded ? 0 : -1}
-                    placeholder={searchMode === 'semantic' ? 'Describe a scene…' : 'Search filenames…'}
-                    className="w-full pl-2 pr-7 py-1 rounded text-xs bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] text-[#cecece] placeholder:text-[#4a4a4a] focus:outline-none focus:border-[rgba(91,184,212,0.40)] transition-colors"
-                    style={searchMode === 'semantic' ? { borderColor: 'transparent' } : {}}
+                    placeholder="Search filenames…"
+                    className={`w-full pl-2 pr-7 py-1 rounded text-xs placeholder:text-[#4a4a4a] focus:outline-none transition-colors ${
+                      // A query is an active filter — the input adopts the same
+                      // cyan chip vocabulary as the bar's filter chips.
+                      searchInput
+                        ? 'bg-[rgba(91,184,212,0.10)] border border-[rgba(91,184,212,0.40)] text-[#5BB8D4] font-medium'
+                        : 'bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] text-[#cecece] focus:border-[rgba(91,184,212,0.40)]'
+                    }`}
                   />
                   {searchInput && (
                     <button
                       onClick={() => { setSearchInput(''); setSearchQuery(''); setSemanticResults(null) }}
-                      className="absolute right-1.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded flex items-center justify-center text-[#6a6b6c] hover:text-[#cecece] hover:bg-[rgba(255,255,255,0.06)] transition-colors"
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded flex items-center justify-center transition-colors text-[rgba(91,184,212,0.7)] hover:text-[#5BB8D4] hover:bg-[rgba(91,184,212,0.18)]"
                       title="Clear search"
                       aria-label="Clear search"
                     ><X size={12} /></button>
                   )}
                 </div>
-                <button
-                  onClick={() => {
-                    const next = searchMode === 'filename' ? 'semantic' : 'filename'
-                    setSearchMode(next)
-                    setSemanticResults(null)
-                  }}
-                  tabIndex={searchExpanded ? 0 : -1}
-                  title={searchMode === 'semantic' ? 'AI search active — click for filename search' : 'Switch to AI semantic search'}
-                  className="ml-1 inline-flex items-center gap-1 px-1.5 py-1 rounded text-[10px] font-medium transition-colors"
-                  style={searchMode === 'semantic'
-                    ? { background: 'rgba(91,184,212,0.08)', border: '1px solid rgba(91,184,212,0.20)' }
-                    : { color: '#6a6b6c', background: 'transparent', border: '1px solid transparent' }
-                  }
-                >
-                  <Sparkles size={13} />
-                  {searchMode === 'semantic'
-                    ? <span className="ai-text-rainbow">AI</span>
-                    : 'AI'
-                  }
-                </button>
               </div>
             </div>
           </div>

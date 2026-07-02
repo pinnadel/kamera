@@ -1,33 +1,67 @@
 // Single source of truth for the bottom-pill Filter. Keeps predicate +
-// label formatting + helper data extraction in one place so App and
+// chip formatting + helper data extraction in one place so App and
 // FilterPill never disagree.
+//
+// The filter is a *multi-filter* object — several categories can be active at
+// once and combine with AND (they narrow the set):
+//
+//   { cameras: string[], date: {from,to} | null, composition: 'portraits' |
+//     'landscape' | 'group' | null }
+//
+// Within the Camera category the selected cameras OR together (a photo passes
+// if it was shot on ANY selected camera). Across categories it's AND. The
+// composition types are mutually contradictory (Portraits = ≥1 face, Landscape
+// = 0 faces, Group = >1 face) so only one is selectable at a time.
 
-// Returns true when the image passes the active filter. When `filter` is
-// null/undefined every image passes (identity predicate).
-export function filterPredicate(filter) {
-  if (!filter) return () => true
-  switch (filter.type) {
-    case 'date': {
-      // from/to are 'YYYY-MM-DD' local-day strings. We compare on the day
-      // portion of `shot_at` (ISO timestamp) to avoid timezone-shift bugs.
-      const from = filter.from
-      const to   = filter.to ?? filter.from
-      return (img) => {
-        if (!img.shot_at) return false
-        const day = String(img.shot_at).slice(0, 10)
-        return day >= from && day <= to
-      }
+export const EMPTY_FILTER = { cameras: [], date: null, composition: null }
+
+// True when no category is active — the identity filter (everything passes).
+export function isFilterEmpty(filters) {
+  if (!filters) return true
+  return (
+    (!filters.cameras || filters.cameras.length === 0) &&
+    !filters.date &&
+    !filters.composition
+  )
+}
+
+// Predicate for a single composition type. Extracted so both the predicate and
+// any future summary can share it.
+function compositionPredicate(kind) {
+  switch (kind) {
+    case 'portraits': return (img) => (img.face_count ?? 0) >= 1
+    case 'landscape': return (img) => (img.face_count ?? 0) === 0
+    case 'group':     return (img) => (img.face_count ?? 0) > 1
+    default:          return () => true
+  }
+}
+
+// Returns true when the image passes ALL active filter categories. When the
+// filter is empty every image passes (identity predicate).
+export function filterPredicate(filters) {
+  if (isFilterEmpty(filters)) return () => true
+
+  const cameras = filters.cameras && filters.cameras.length
+    ? new Set(filters.cameras)
+    : null
+  const date = filters.date
+  const from = date?.from
+  const to   = date ? (date.to ?? date.from) : null
+  const comp = filters.composition ? compositionPredicate(filters.composition) : null
+
+  return (img) => {
+    // Camera: OR across the selected cameras.
+    if (cameras && !cameras.has(img.camera)) return false
+    // Date: from/to are 'YYYY-MM-DD' local-day strings, compared on the day
+    // portion of `shot_at` (ISO timestamp) to avoid timezone-shift bugs.
+    if (date) {
+      if (!img.shot_at) return false
+      const day = String(img.shot_at).slice(0, 10)
+      if (day < from || day > to) return false
     }
-    case 'portraits':
-      return (img) => (img.face_count ?? 0) >= 1
-    case 'landscape':
-      return (img) => (img.face_count ?? 0) === 0
-    case 'group':
-      return (img) => (img.face_count ?? 0) > 1
-    case 'camera':
-      return (img) => img.camera === filter.value
-    default:
-      return () => true
+    // Composition: AND with the rest.
+    if (comp && !comp(img)) return false
+    return true
   }
 }
 
@@ -37,35 +71,64 @@ export function filterPredicate(filter) {
 const MONTH_DAY = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
 const MONTH_DAY_YEAR = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 
-export function getActiveFilterLabel(filter) {
-  if (!filter) return null
-  switch (filter.type) {
-    case 'date': {
-      const from = parseLocalDate(filter.from)
-      const to   = parseLocalDate(filter.to ?? filter.from)
-      if (!from || !to) return 'Date'
-      const sameDay  = filter.from === (filter.to ?? filter.from)
-      const sameYear = from.getFullYear() === to.getFullYear()
-      if (sameDay) {
-        return from.getFullYear() === new Date().getFullYear()
-          ? MONTH_DAY.format(from)
-          : MONTH_DAY_YEAR.format(from)
-      }
-      if (!sameYear) {
-        return `${MONTH_DAY_YEAR.format(from)} – ${MONTH_DAY_YEAR.format(to)}`
-      }
-      // Same year: "Aug 5 – 7" if same month, else "Aug 28 – Sep 2".
-      const sameMonth = from.getMonth() === to.getMonth()
-      return sameMonth
-        ? `${MONTH_DAY.format(from)} – ${to.getDate()}`
-        : `${MONTH_DAY.format(from)} – ${MONTH_DAY.format(to)}`
-    }
-    case 'portraits': return 'Portraits'
-    case 'landscape': return 'Landscape'
-    case 'group':     return 'Group photos'
-    case 'camera':    return filter.value
-    default:          return null
+function dateLabel(date) {
+  const from = parseLocalDate(date.from)
+  const to   = parseLocalDate(date.to ?? date.from)
+  if (!from || !to) return 'Date'
+  const sameDay  = date.from === (date.to ?? date.from)
+  const sameYear = from.getFullYear() === to.getFullYear()
+  if (sameDay) {
+    return from.getFullYear() === new Date().getFullYear()
+      ? MONTH_DAY.format(from)
+      : MONTH_DAY_YEAR.format(from)
   }
+  if (!sameYear) {
+    return `${MONTH_DAY_YEAR.format(from)} – ${MONTH_DAY_YEAR.format(to)}`
+  }
+  // Same year: "Aug 5 – 7" if same month, else "Aug 28 – Sep 2".
+  const sameMonth = from.getMonth() === to.getMonth()
+  return sameMonth
+    ? `${MONTH_DAY.format(from)} – ${to.getDate()}`
+    : `${MONTH_DAY.format(from)} – ${MONTH_DAY.format(to)}`
+}
+
+const COMPOSITION_LABEL = {
+  portraits: 'Portraits',
+  landscape: 'Landscape',
+  group: 'Group photos',
+}
+
+// One descriptor per active filter, for the removable chips in the bottom bar.
+// Each chip carries a stable `key`, its display `label`, and a `next` filter
+// object with that chip removed (so App can wire the × button without knowing
+// the model internals). Cameras yield one chip each so they can be dropped
+// individually.
+export function getActiveFilterChips(filters) {
+  if (isFilterEmpty(filters)) return []
+  const chips = []
+
+  for (const cam of filters.cameras ?? []) {
+    chips.push({
+      key: `camera:${cam}`,
+      label: cam,
+      next: { ...filters, cameras: filters.cameras.filter(c => c !== cam) },
+    })
+  }
+  if (filters.composition) {
+    chips.push({
+      key: `composition:${filters.composition}`,
+      label: COMPOSITION_LABEL[filters.composition] ?? filters.composition,
+      next: { ...filters, composition: null },
+    })
+  }
+  if (filters.date) {
+    chips.push({
+      key: 'date',
+      label: dateLabel(filters.date),
+      next: { ...filters, date: null },
+    })
+  }
+  return chips
 }
 
 // Newest `shot_at` across the supplied images, returned as a Date in local

@@ -47,6 +47,7 @@ export function useKeyboard({
   runUndo,
   amendLastDecision,
   registerDecisionIntent,
+  toggleFilenames,
 }) {
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -248,4 +249,14 @@ export function useKeyboard({
     e.preventDefault()
     setUserCols(c => Math.min(8, (c ?? 6) + 1))
   }, [loupeOpen, activeView])
+
+  // ── Filename visibility (F) ──────────────────────────────────────────────
+  // Toggles the filename row under every grid tile. Grid-only, like the
+  // thumbnail-size keys. Not gated on grid focus: it's a view preference the
+  // user expects to flip from anywhere in the grid view, same as = / -.
+  useHotkeys('f', (e) => {
+    if (loupeOpen || activeView !== 'grid') return
+    e.preventDefault()
+    toggleFilenames?.()
+  }, [loupeOpen, activeView, toggleFilenames])
 }

@@ -240,6 +240,40 @@ def shutdown_daemon() -> None:
             proc.kill()
 
 
+def _recover_wedged_runner(model_id: str) -> bool:
+    """Clear a wedged Ollama model runner so the next chat call gets a fresh one.
+
+    Failure mode this fixes: the daemon stays reachable (`/api/tags` returns 200
+    instantly) but its model *runner* subprocess hangs — `ollama ps` shows it
+    stuck in "Stopping…" — so every `/api/chat` blocks until the full timeout.
+    Seen after a hardware/OS change (model pulled on an old machine, Metal
+    runner wedges on first load on the new one).
+
+    The fix is an unload request (`keep_alive: 0`): the daemon drops the stuck
+    runner and spawns a clean one on the next request. This is a soft recovery
+    — it never kills the daemon (which the app owns; see ensure_daemon_running),
+    only the per-model runner. Returns True if the unload call was accepted.
+    """
+    if not _is_daemon_reachable():
+        return False
+    try:
+        # Short timeout: a healthy unload returns near-instantly. If THIS hangs
+        # too, the daemon itself is wedged (not just the runner) and a retry
+        # wouldn't help anyway — let it fail and fall through to graceful None.
+        r = httpx.post(
+            f"{_OLLAMA_NATIVE}/api/generate",
+            json={"model": model_id, "keep_alive": 0},
+            timeout=15,
+        )
+        ok = r.status_code == 200
+        if ok:
+            logger.info("Recovered wedged Ollama runner for %s (unloaded)", model_id)
+        return ok
+    except Exception:
+        logger.warning("Could not unload wedged Ollama runner for %s", model_id, exc_info=True)
+        return False
+
+
 def get_loaded_model() -> str | None:
     """Return the chosen Ollama model name (vision-preferred), or None if not ready."""
     s = get_status()
@@ -458,15 +492,25 @@ def generate_explanation(image_data: dict[str, Any], preview_path: str | None = 
             },
         }
 
-        r = httpx.post(f"{_OLLAMA_NATIVE}/api/chat", json=payload, timeout=_TIMEOUT)
-        if r.status_code != 200:
-            logger.warning("Ollama /api/chat returned HTTP %d: %s", r.status_code, r.text[:300])
+        def _chat() -> str | None:
+            r = httpx.post(f"{_OLLAMA_NATIVE}/api/chat", json=payload, timeout=_TIMEOUT)
+            if r.status_code != 200:
+                logger.warning("Ollama /api/chat returned HTTP %d: %s", r.status_code, r.text[:300])
+                return None
+            text = (r.json().get("message") or {}).get("content")
+            return text.strip() if text else None
+
+        try:
+            return _chat()
+        except httpx.ReadTimeout:
+            # A timeout (not an HTTP error) is the signature of a wedged runner:
+            # the daemon answered the connect but the model never produced a
+            # token. Unload the stuck runner once and retry on a fresh one
+            # rather than surfacing "unavailable" the user can't act on.
+            logger.warning("Ollama chat timed out — attempting wedged-runner recovery")
+            if _recover_wedged_runner(model_id):
+                return _chat()  # one clean retry; if it times out too, the outer except returns None
             return None
-        data = r.json()
-        text = (data.get("message") or {}).get("content")
-        if text:
-            return text.strip()
-        return None
 
     except Exception:
         logger.warning("Ollama explanation failed", exc_info=True)
