@@ -37,6 +37,9 @@ class SettingsRequest(BaseModel):
     reject_reciprocal_rule:     bool  | None = None
     reject_above_iso_ceiling:   bool  | None = None
     iso_ceiling:                float | None = None
+    # PR3 boundary routing — high-variance near-boundary photos route to Maybe.
+    auto_cull_uncertain_to_maybe: bool  | None = None
+    uncertainty_threshold:        float | None = None
 
 
 class FolderSettingsRequest(BaseModel):
@@ -72,6 +75,8 @@ def _init_setting_specs() -> None:
         DEFAULT_ISO_CEILING,
         DEFAULT_BACKGROUND_DISTRACTION_CEILING,
         DEFAULT_REJECT_HIGH_BACKGROUND_DISTRACTION,
+        DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE,
+        DEFAULT_UNCERTAINTY_THRESHOLD,
     )
     _NUMERIC_SETTINGS.update({
         "sharpness_weight":         (DEFAULT_SHARPNESS_WEIGHT,         0.0, 1.0),
@@ -85,6 +90,10 @@ def _init_setting_specs() -> None:
         # SigLIP zero-shot content axis ceiling (0.0–1.0). Fires only when the
         # toggle below is on AND the photo has a detected face.
         "background_distraction_ceiling": (DEFAULT_BACKGROUND_DISTRACTION_CEILING, 0.5, 0.99),
+        # PR3 boundary routing — ensemble std_dev (in personal_score points)
+        # above which a near-boundary photo is routed to Maybe. Range matches
+        # get_thresholds()'s _read_float bounds in quality_analyzer.
+        "uncertainty_threshold":    (DEFAULT_UNCERTAINTY_THRESHOLD,    0.0, 50.0),
     })
     _BOOL_SETTINGS.update({
         "reject_soft_face":       DEFAULT_REJECT_SOFT_FACE,
@@ -101,10 +110,25 @@ def _init_setting_specs() -> None:
         # SigLIP content axis: only fires when a face is detected AND
         # background_distraction_score >= background_distraction_ceiling.
         "reject_high_background_distraction": DEFAULT_REJECT_HIGH_BACKGROUND_DISTRACTION,
+        # PR3 boundary routing — master toggle for routing uncertain
+        # near-boundary photos to Maybe instead of a hard auto-decision.
+        "auto_cull_uncertain_to_maybe": DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE,
     })
 
 
 _init_setting_specs()
+
+
+def tunable_setting_keys() -> tuple[str, ...]:
+    """All user-tunable setting keys (numeric + bool).
+
+    Single source of truth for the taste-model backup export/import — the
+    registries above are the superset that GET /settings resolves against.
+    `SettingsRequest` is NOT authoritative (it omits background_distraction_ceiling
+    and reject_high_background_distraction), so callers that need the full set
+    of keys must go through here, not the Pydantic model.
+    """
+    return tuple(_NUMERIC_SETTINGS.keys()) + tuple(_BOOL_SETTINGS.keys())
 
 
 # ---------------------------------------------------------------------------

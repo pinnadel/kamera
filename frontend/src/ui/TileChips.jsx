@@ -11,38 +11,44 @@
 
 import { Layers } from 'lucide-react'
 
-// PartnerCountChips — how the *other* members of this photo's original burst
-// were decided. Shown on individual cards in the Rejects/Maybes views so the
-// user can confirm a groupmate survived (Keep/Maybe) before trusting a cull.
-// One compact pill per non-zero decision, e.g. `1K` `2M` `3R`. Undecided
-// partners aren't surfaced (they're still in a group tile on All/Undecided).
-// Renders nothing when there are no decided partners. Colors mirror the
-// canonical decision palette used by DecisionBadge.
+// PartnerCountChips — how the surviving members of this photo's original burst
+// were decided. Shown ONCE per group (on the run's first tile) at the border's
+// lower-left in the Rejects/Maybes views, so the user can confirm a groupmate
+// survived before trusting a cull. One worded pill per non-zero survivor bucket,
+// e.g. "2 Keeps", "1 Maybe" — pluralized. The whole cluster is a button that
+// opens the group-partners overlay (which lists the differently-culled photos
+// and lets the user re-cull). Colors mirror the canonical decision palette.
 const PARTNER_CHIP_STYLES = {
-  keep:   { bg: 'rgba(125,184,154,0.20)', fg: '#7DB89A', letter: 'K' },
-  maybe:  { bg: 'rgba(232,184,74,0.20)',  fg: '#E8B84A', letter: 'M' },
-  reject: { bg: 'rgba(201,123,123,0.20)', fg: '#C97B7B', letter: 'R' },
+  keep:   { bg: 'rgba(125,184,154,0.22)', fg: '#7DB89A', singular: 'Keep',  plural: 'Keeps' },
+  maybe:  { bg: 'rgba(232,184,74,0.22)',  fg: '#E8B84A', singular: 'Maybe', plural: 'Maybes' },
+  reject: { bg: 'rgba(201,123,123,0.22)', fg: '#C97B7B', singular: 'Reject', plural: 'Rejects' },
 }
 
-export function PartnerCountChips({ counts }) {
+export function PartnerCountChips({ counts, onOpen }) {
   if (!counts) return null
-  const chips = ['keep', 'maybe', 'reject'].filter(kind => counts[kind] > 0)
+  const chips = ['keep', 'maybe', 'reject'].filter(kind => (counts[kind] || 0) > 0)
   if (chips.length === 0) return null
   return (
-    <div className="flex items-center gap-1" title="How the rest of this photo's group was decided">
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onOpen?.() }}
+      className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity"
+      title="See which group members were culled differently — click to review or re-cull"
+    >
       {chips.map(kind => {
         const s = PARTNER_CHIP_STYLES[kind]
+        const n = counts[kind]
         return (
           <span
             key={kind}
-            className="inline-flex items-center h-[18px] px-1.5 rounded text-[10px] font-bold leading-none tabular-nums"
-            style={{ backgroundColor: s.bg, color: s.fg }}
+            className="inline-flex items-center h-[18px] px-1.5 rounded bg-[rgba(7,8,10,0.55)] backdrop-blur-sm text-[10px] font-semibold leading-none tabular-nums"
+            style={{ color: s.fg, boxShadow: `inset 0 0 0 1px ${s.bg}` }}
           >
-            {counts[kind]}{s.letter}
+            {n} {n === 1 ? s.singular : s.plural}
           </span>
         )
       })}
-    </div>
+    </button>
   )
 }
 

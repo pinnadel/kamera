@@ -80,6 +80,14 @@ html[data-ui-scale="S"] { zoom: 1.0; }
 html[data-ui-scale="M"] { zoom: 1.15; }
 html[data-ui-scale="L"] { zoom: 1.30; }
 
+/* zoom multiplies vh-based heights against the real viewport, so a modal
+   capped at max-h-[90vh] (+ 5vh top offset) visually consumes 95vh × zoom —
+   overflowing the screen at M/L and clipping the sticky footer (Apply/Save)
+   off the bottom. Rein the cap in per scale so the footer stays on-screen.
+   Budget ≈ (95 / zoom) − 5vh top pad, with a little clearance to spare. */
+html[data-ui-scale="M"] .settings-modal { max-height: 76vh; }
+html[data-ui-scale="L"] .settings-modal { max-height: 67vh; }
+
 .font-mono {
   font-feature-settings: "tnum" 1;
 }

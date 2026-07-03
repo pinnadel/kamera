@@ -76,6 +76,8 @@ import { FEEDBACK_URL } from './version'
 import { ConfirmModal } from './modals/ConfirmModal'
 import { AutoCullModal } from './modals/AutoCullModal'
 import { SettingsModal } from './modals/SettingsModal'
+import { GroupPartnersOverlay } from './modals/GroupPartnersOverlay'
+import { PartnerCountChips } from './ui/TileChips'
 import { ImageCard } from './views/ImageCard'
 import { DetailView } from './views/DetailView'
 import { GroupTile } from './views/GroupTile'
@@ -492,6 +494,9 @@ export default function App() {
     loadModelInfo,
     trainModel,
     trainingModel,
+    exportTasteModel,
+    importTasteModel,
+    importingModel,
     autoGenerate,
     setAutoGenerate,
   } = useSettings({ addToast, loadImages })
@@ -875,8 +880,11 @@ export default function App() {
   // (useGroups.enrichedGroups), so counts stay current through undo/re-decide
   // with no extra wiring. Undecided partners contribute to no chip.
   //
-  // Shape: Map<imageId, { groupId, counts: { keep, maybe, reject } }>. Only
-  // grouped photos get an entry; singletons/ungrouped are absent.
+  // Shape: Map<imageId, { groupId, counts: {keep,maybe,reject}, members: [...] }>.
+  // `counts` tallies the OTHER members by decision; `members` is the group's full
+  // live member list (used by the chip overlay to show the differently-culled
+  // photos and the current one, sectioned by decision, with per-photo re-cull).
+  // Only grouped photos (size > 1) get an entry; singletons/ungrouped are absent.
   const partnerSummaryByImageId = useMemo(() => {
     const summary = new Map()
     for (const group of enrichedGroups) {
@@ -888,7 +896,7 @@ export default function App() {
             counts[other.decision] += 1
           }
         }
-        summary.set(img.id, { groupId: group.best_image_id, counts })
+        summary.set(img.id, { groupId: group.best_image_id, counts, members: group.images })
       }
     }
     return summary
@@ -989,16 +997,18 @@ export default function App() {
     // In these views every item is an individual `image` (group tiles only ever
     // survive the Undecided filter), and members of the same original burst are
     // scattered by the active sort. Reorder so groupmates sit adjacent so a
-    // group can be wrapped in one shared border, and attach the "survivor" chip.
+    // group can be wrapped in one shared border, and attach ONE survivor chip
+    // to the run's first tile.
     //
     // Chip semantics: a photo *survives* culling if it's a Keep or Maybe. The
     // chip answers "did any groupmate survive, and how" — so we show the
-    // SURVIVOR buckets (keep, maybe) MINUS the bucket we're currently viewing
-    // (that count is trivially "the tiles around you"):
-    //   • Rejects view → K + M partner counts (did the moment survive elsewhere)
-    //   • Maybes  view → K partner counts only (a better survivor exists)
-    // Reject partner counts are never shown (a reject isn't a survivor).
-    // A group with no such partners keeps its border but shows no chip.
+    // SURVIVOR buckets (keep, maybe) MINUS the bucket we're currently viewing:
+    //   • Rejects view → "N Keeps" + "N Maybe" chips (survived elsewhere)
+    //   • Maybes  view → "N Keeps" chip only (a better survivor exists)
+    // A group with no such partners keeps its border but shows no chip. The chip
+    // is clickable → opens an overlay listing the differently-culled members
+    // (and the current bucket) with per-photo re-cull; that overlay needs the
+    // group's full member list, carried on `groupChip.members`.
     // Gated to reject/maybe so All/Undecided/Keeps stay untouched.
     if (decisionFilter === 'reject' || decisionFilter === 'maybe') {
       // Which survivor buckets to surface, given the current view.
@@ -1009,8 +1019,7 @@ export default function App() {
         let any = false
         for (const kind of chipKinds) {
           const n = counts[kind] || 0
-          out[kind] = n
-          if (n > 0) any = true
+          if (n > 0) { out[kind] = n; any = true }
         }
         return any ? out : null
       }
@@ -1028,15 +1037,25 @@ export default function App() {
         const summary = partnerSummaryByImageId.get(item.image.id)
         const key = summary ? `g_${summary.groupId}` : `s_${item.image.id}`
         if (!buckets.has(key)) { order.push(key); buckets.set(key, []) }
-        buckets.get(key).push({ ...item, partnerCounts: survivorCounts(summary && summary.counts) })
+        buckets.get(key).push(item)
       }
       const clustered = []
       for (const key of order) {
         const run = buckets.get(key)
         // A run of ≥2 present members reads as one enclosure; a lone member
-        // (its groupmates live in other decision views) shows its chip but no
-        // border, so it renders like any ungrouped photo.
+        // (its groupmates live in other decision views) renders like any
+        // ungrouped photo but still gets a chip on the first (only) tile.
         const drawBorder = key.startsWith('g_') && run.length >= 2
+        // The group's survivor chip + full member list, computed once and hung
+        // on the run's first tile only. `members` comes from partnerSummary
+        // (the same for every member of the run).
+        const firstSummary = run[0].type === 'image'
+          ? partnerSummaryByImageId.get(run[0].image.id)
+          : null
+        const chipCounts = survivorCounts(firstSummary && firstSummary.counts)
+        const groupChip = chipCounts
+          ? { counts: chipCounts, members: firstSummary.members, viewDecision: decisionFilter }
+          : null
         run.forEach((it, i) => {
           const position = !drawBorder
             ? 'solo'
@@ -1044,8 +1063,13 @@ export default function App() {
             : i === run.length - 1 ? 'end'
             : 'middle'
           // runId lets the render layer group adjacent members; runLen +
-          // index drive the spanning-border edges (see ImageCard).
-          clustered.push({ ...it, groupRun: { id: key, position, index: i, length: run.length } })
+          // index drive the spanning-border edges (see App.jsx grid overlay).
+          // groupChip only on the first tile — one chip per group.
+          clustered.push({
+            ...it,
+            groupRun: { id: key, position, index: i, length: run.length },
+            groupChip: i === 0 ? groupChip : null,
+          })
         })
       }
       return clustered
@@ -1450,6 +1474,17 @@ export default function App() {
   // under the cursor only, not the whole selection (matches Finder behaviour).
   const [tileMenu, setTileMenu] = useState(null)
 
+  // Group-partners overlay: { imageId, viewDecision } of the clicked chip, or
+  // null. Members are re-read live from partnerSummaryByImageId each render so
+  // re-culls restructure it. Close it if the decision filter changes out from
+  // under it (the chip only exists in the reject/maybe views).
+  const [partnersOverlay, setPartnersOverlay] = useState(null)
+  useEffect(() => {
+    if (partnersOverlay && decisionFilter !== partnersOverlay.viewDecision) {
+      setPartnersOverlay(null)
+    }
+  }, [decisionFilter, partnersOverlay])
+
   // Photo-onto-photo drop hover. Independent of dropHoverGroupId because a
   // photo can be hovered while a GroupTile is also under the same drag, and
   // the visuals shouldn't fight.
@@ -1793,9 +1828,22 @@ export default function App() {
       const data = await res.json()
       await loadImages()
       setDecisionFilter(null)
-      addToast({ type: 'info', message: `${data.trashed} file${data.trashed !== 1 ? 's' : ''} sent to Trash` })
+      // Report the truth: only `trashed` files verifiably reached the system
+      // Trash. Missing/failed files kept their reject rows (a folder-watching
+      // app may have grabbed them first), so warn instead of claiming success.
+      const trashed = data.trashed ?? 0
+      const notTrashed = (data.skipped_missing ?? 0) + (data.failed ?? 0)
+      if (notTrashed > 0) {
+        addToast({
+          type: 'warning',
+          message: `${trashed} sent to Trash · ${notTrashed} couldn't be trashed (still in your reject list)`,
+        })
+      } else {
+        addToast({ type: 'info', message: `${trashed} file${trashed !== 1 ? 's' : ''} sent to Trash` })
+      }
     } catch (e) {
       console.error('Trash rejects failed:', e)
+      addToast({ type: 'error', message: 'Could not send rejects to Trash — server error' })
     } finally {
       setBulkRunning(false)
       setBulkConfirm(null)
@@ -1897,6 +1945,23 @@ export default function App() {
       {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
       {bannerStatesOpen && <BannerStates onClose={() => setBannerStatesOpen(false)} />}
 
+      {/* Group-partners overlay — opened from a group's survivor chip. Members
+          are read LIVE from partnerSummaryByImageId so a re-cull inside the
+          overlay restructures its sections on the next render. Closes on
+          X / backdrop / ESC and auto-closes when nothing differs anymore. */}
+      {partnersOverlay && (() => {
+        const summary = partnerSummaryByImageId.get(partnersOverlay.imageId)
+        if (!summary) return null   // photo left its group (defensive) → render nothing
+        return (
+          <GroupPartnersOverlay
+            members={summary.members}
+            viewDecision={partnersOverlay.viewDecision}
+            onDecide={sendGroupDecision}
+            onClose={() => setPartnersOverlay(null)}
+          />
+        )
+      })()}
+
       {tileMenu && createPortal(
         <div
           data-dropdown="true"
@@ -1954,6 +2019,9 @@ export default function App() {
           modelInfo={modelInfo}
           onTrain={trainModel}
           training={trainingModel}
+          onExportModel={exportTasteModel}
+          onImportModel={importTasteModel}
+          importingModel={importingModel}
           onStartTraining={enterTrainingMode}
           undecidedCount={undecidedCount}
           bannerDismissed={bannerDismissed}
@@ -3231,19 +3299,22 @@ export default function App() {
                     } catch { /* silently ignore malformed payloads */ }
                   }}
                 >
-                  {/* Shared group-run border (Rejects/Maybes). One amber
-                      enclosure around a run of adjacent same-group tiles: a
-                      non-interactive overlay that bleeds ±7px into the 12px
-                      grid gutters so the top/bottom lines are continuous across
-                      members and the interior vertical seams disappear. Kept as
-                      an absolute overlay (not a spanning cell) so the grid
-                      rhythm and the 1:1 data-grid-idx ↔ cell mapping that
+                  {/* Shared group-run border. One enclosure around a run of
+                      adjacent same-group tiles: a non-interactive overlay that
+                      bleeds ±7px into the 12px grid gutters so the top/bottom
+                      lines are continuous across members and the interior
+                      vertical seams disappear. Coloured to the view's decision
+                      (Rejects → coral, Maybes → amber) so it reads in-context.
+                      Kept as an absolute overlay (not a spanning cell) so the
+                      grid rhythm and the 1:1 data-grid-idx ↔ cell mapping that
                       keyboard nav relies on stay intact; a run that wraps a row
-                      simply splits into two aligned amber strips. */}
+                      simply splits into two aligned strips. */}
                   {item.groupRun && item.groupRun.position !== 'solo' && (
                     <div
                       aria-hidden="true"
-                      className={`pointer-events-none absolute inset-y-0 z-10 border-y-2 border-[#E8B84A] ${
+                      className={`pointer-events-none absolute inset-y-0 z-10 border-y-2 ${
+                        decisionFilter === 'reject' ? 'border-[#C97B7B]' : 'border-[#E8B84A]'
+                      } ${
                         item.groupRun.position === 'start'
                           ? 'left-0 -right-[7px] border-l-2 rounded-l-lg'
                           : item.groupRun.position === 'end'
@@ -3251,6 +3322,19 @@ export default function App() {
                           : '-left-[7px] -right-[7px]'
                       }`}
                     />
+                  )}
+                  {/* Group survivor chip — rendered ONCE per group, at the
+                      lower-left inside the run's first tile. Clicking it opens
+                      the partners overlay (differently-culled members + re-cull).
+                      z-20 floats it above the border overlay; pointer-events
+                      re-enabled just on the chip so the click lands. */}
+                  {item.groupChip && (
+                    <div className="absolute bottom-1.5 left-1.5 z-20">
+                      <PartnerCountChips
+                        counts={item.groupChip.counts}
+                        onOpen={() => setPartnersOverlay({ imageId: item.image.id, viewDecision: item.groupChip.viewDecision })}
+                      />
+                    </div>
                   )}
                   <ImageCard
                     image={item.image}
@@ -3261,7 +3345,7 @@ export default function App() {
                     searchQuery={searchQuery}
                     showFilename={showFilenames}
                     isAllView={decisionFilter === null}
-                    partnerCounts={item.partnerCounts ?? null}
+                    inGroupBorder={!!item.groupRun && item.groupRun.position !== 'solo'}
                     draggable
                     onDragStart={(e) => {
                       // Payload carries the entire current selection when

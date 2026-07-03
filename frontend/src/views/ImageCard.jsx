@@ -2,7 +2,6 @@ import { memo, useState } from 'react'
 import { Check } from 'lucide-react'
 import { API } from '../api'
 import { HighlightedText } from '../ui/primitives'
-import { PartnerCountChips } from '../ui/TileChips'
 import { middleTruncate } from '../ui/format'
 
 // ImageCard — one tile in the grid.
@@ -61,12 +60,12 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   // the supplied dataTransfer payload on dragstart. Source-of-truth lives
   // in the parent (App.jsx for grid, GroupLoupe for loupe).
   draggable = false, onDragStart, onDragEnd,
-  // Group-partner chrome (Rejects/Maybes views only). `partnerCounts` =
-  // survivor tallies ({ keep?, maybe? }) of the OTHER members of this photo's
-  // original burst — rendered as a bottom-right overlay chip. The shared amber
-  // group border is drawn by the run wrapper in App.jsx, not here. Null off
-  // the Rejects/Maybes views.
-  partnerCounts = null,
+  // True when this tile sits inside a shared group-run border (Rejects/Maybes).
+  // The group border is an outer coral/amber frame drawn by App.jsx; a normal
+  // (outset) cyan selection ring would collide with it in the grid gutter, so
+  // when set we draw the interaction ring INSET — it hugs the inside of the
+  // tile and reads as "selected within the group" without fighting the frame.
+  inGroupBorder = false,
 }) {
   // Per-card load state. RAW previews are generated on first /previews/<id>
   // request (1–3s for demosaicing), so a freshly-analyzed card needs its own
@@ -78,13 +77,24 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   // Decision-colored ring so the K/M/R state reads immediately on the tile.
   // Selection / multi-select / drop-hover (interaction feedback) win over the
   // decision ring so the cyan focus signal is never ambiguous.
+  //
+  // Inside a shared group border the per-tile rings would draw vertical lines
+  // in the gutter between members, breaking the single-enclosure read. So when
+  // `inGroupBorder`: (1) the cyan interaction rings are drawn INSET so they hug
+  // the tile instead of clashing with the frame, and (2) the decision ring is
+  // dropped entirely — every run member shares the view's decision, which the
+  // group frame's colour already conveys.
+  const inset = inGroupBorder ? ' ring-inset' : ''
   let border
   if (isDropHover) {
-    border = 'ring-[3px] ring-[#5BB8D4] scale-[1.02]'
+    border = `ring-[3px] ring-[#5BB8D4] scale-[1.02]${inset}`
   } else if (isMultiSelected) {
-    border = 'ring-1 ring-[#5BB8D4]'
+    border = `ring-1 ring-[#5BB8D4]${inset}`
   } else if (isSelected) {
-    border = 'ring-1 ring-[#5BB8D4]'
+    border = `ring-1 ring-[#5BB8D4]${inset}`
+  } else if (inGroupBorder) {
+    // No per-tile decision ring — the group frame is the boundary.
+    border = ''
   } else if (image.decision === 'keep') {
     border = 'ring-1 ring-[rgba(125,184,154,0.40)] hover:ring-[rgba(125,184,154,0.65)]'
   } else if (image.decision === 'maybe') {
@@ -111,12 +121,6 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   const rejectedOpacity = image.decision === 'reject' ? 'opacity-[0.75]' : ''
 
   const sub = subfolderLabel(image)
-
-  // Partner-count chips render only when this photo's group has decided
-  // groupmates. Used both to place chips in the filename footer and to decide
-  // whether the no-filename chip strip appears.
-  const hasPartnerChips = !!partnerCounts &&
-    ((partnerCounts.keep || 0) + (partnerCounts.maybe || 0) + (partnerCounts.reject || 0)) > 0
 
   // Decision-tint for the footer strip. Shared by the filename footer (as its
   // background) and the thin no-filename strip on the All view.
@@ -183,15 +187,6 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
             flash; pointer-events-none lets clicks pass through. */}
         {!loaded && (
           <div className="absolute inset-0 shimmer pointer-events-none" aria-hidden="true" />
-        )}
-        {/* Group-partner chips — bottom-right overlay on the image (like the
-            group Layers chip), so they add NO tile height and group tiles stay
-            the exact same size as regular ones. Only present in Rejects/Maybes
-            when a groupmate survived into another bucket. */}
-        {hasPartnerChips && (
-          <div className="absolute bottom-1.5 right-1.5 pointer-events-none">
-            <PartnerCountChips counts={partnerCounts} />
-          </div>
         )}
       </div>
 

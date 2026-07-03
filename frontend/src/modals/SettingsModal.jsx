@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArrowLeft,
   ArrowRight,
@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Download,
   Filter,
   GraduationCap,
   Monitor,
@@ -14,6 +15,7 @@ import {
   Scale,
   Shield,
   Trash2,
+  Upload,
   X,
   Zap,
 } from 'lucide-react'
@@ -105,7 +107,7 @@ const DECISION_DEFAULTS = {
   uncertainty_threshold:        8.0,
 }
 
-export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
+export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onExportModel, onImportModel, importingModel, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
   // Grouping sliders (Model tab). Live-updating — change triggers an
   // immediate /similarity-groups refetch via useGroups in the parent.
   // They aren't part of the Apply/draft flow because they aren't
@@ -191,6 +193,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   const [resetDashboardConfirm, setResetDashboardConfirm] = useState(false)
   const [resetDashboardRunning, setResetDashboardRunning] = useState(false)
   const [discardConfirm, setDiscardConfirm] = useState(false)
+  // Backup & Restore: the picked file waits here until the user chooses
+  // Merge vs Replace; the ref lets us reset the input so re-picking the same
+  // file re-fires onChange.
+  const importFileRef = useRef(null)
+  const [pendingImportFile, setPendingImportFile] = useState(null)
 
   function openClearConfirm() {
     const a = Math.floor(Math.random() * 9) + 1
@@ -326,7 +333,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-start justify-center pt-[5vh]" onClick={handleClose} onWheel={e => e.stopPropagation()}>
       <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
+        className="settings-modal bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
         onClick={e => e.stopPropagation()}
       >
         {/* Upper section — darker band, matches DetailView header */}
@@ -791,6 +798,99 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     <p className="text-[11px] text-[#6a6b6c] leading-relaxed mt-1.5">
                       Score-blind cull mode for fast taste calibration.
                     </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Backup & Restore — export the durable taste corpus + settings as
+                a portable JSON file, or restore one. The model pickle itself is
+                not included; import rebuilds it by retraining. */}
+            {modelInfo && (
+              <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+                <p className="label mb-3">Backup &amp; Restore</p>
+                <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
+                  Save the progress from your manual culling — every keep, maybe and reject the
+                  model has learned from, plus your decision settings — as a portable file. Restore
+                  it on another computer or after reinstalling.
+                </p>
+
+                {pendingImportFile ? (
+                  <div className="rounded-lg border border-[rgba(255,255,255,0.10)] bg-[#0c0d0d] p-3 space-y-3">
+                    <p className="text-xs text-[#cecece] leading-relaxed">
+                      Restore <span className="text-[#f0f0f0]">{pendingImportFile.name}</span> — how should it be applied?
+                    </p>
+                    <div className="space-y-2">
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="text-[11px] text-[#9c9c9d] leading-relaxed flex-1">
+                          <span className="text-[#cecece]">Merge</span> — add these decisions to your current model. Photos in both update in place; your settings stay unless the backup overrides them.
+                        </p>
+                        <button
+                          onClick={async () => {
+                            const f = pendingImportFile
+                            setPendingImportFile(null)
+                            if (importFileRef.current) importFileRef.current.value = ''
+                            await onImportModel(f, 'merge')
+                          }}
+                          disabled={importingModel}
+                          className={`${BTN_SECONDARY} flex-shrink-0 text-xs disabled:opacity-40 disabled:cursor-not-allowed`}
+                        >
+                          {importingModel ? 'Importing…' : 'Merge'}
+                        </button>
+                      </div>
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="text-[11px] text-[#9c9c9d] leading-relaxed flex-1">
+                          <span className="text-red-400/90">Replace</span> — wipe the current taste model and decision settings, then restore this backup exactly.
+                        </p>
+                        <button
+                          onClick={async () => {
+                            const f = pendingImportFile
+                            setPendingImportFile(null)
+                            if (importFileRef.current) importFileRef.current.value = ''
+                            await onImportModel(f, 'replace')
+                          }}
+                          disabled={importingModel}
+                          className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          {importingModel ? 'Importing…' : 'Replace'}
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setPendingImportFile(null)
+                        if (importFileRef.current) importFileRef.current.value = ''
+                      }}
+                      disabled={importingModel}
+                      className={`${BTN_SECONDARY} text-xs disabled:opacity-40 disabled:cursor-not-allowed`}
+                    >
+                      <X size={14} /> Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={onExportModel}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity border border-[rgba(255,255,255,0.10)] text-[#cecece] hover:opacity-70"
+                    >
+                      <Download size={16} /> Export backup
+                    </button>
+                    <button
+                      onClick={() => importFileRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity border border-[rgba(255,255,255,0.10)] text-[#cecece] hover:opacity-70"
+                    >
+                      <Upload size={16} /> Import backup…
+                    </button>
+                    <input
+                      ref={importFileRef}
+                      type="file"
+                      accept="application/json,.json"
+                      style={{ display: 'none' }}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0]
+                        if (f) setPendingImportFile(f)
+                      }}
+                    />
                   </div>
                 )}
               </div>

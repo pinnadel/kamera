@@ -2,19 +2,24 @@
 Personal model and similarity-group endpoints.
 """
 
+import json
 import logging
+from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from backend.database import get_db, set_setting
 from backend.group_scoring import compute_best_reason
+from backend.routers.settings import tunable_setting_keys
 from backend.state import _personal_model
 from phase2_quality.model_status import snapshot as _model_status_snapshot
 from phase3_learning.auto_trainer import (
     force_train_sync,
     status_snapshot as _auto_train_snapshot,
 )
+from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION
+from phase3_learning.personal_model import MIN_DECISIONS
 from phase2_quality.similarity_scorer import (
     embedding_to_json as _embedding_to_json,
     group_by_similarity as _group_by_similarity,
@@ -248,6 +253,279 @@ def reset_personal_model():
     except Exception as exc:
         logger.exception("Personal model reset failed")
         raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Backup / export / import of the personal taste model
+#
+# The durable source of truth is the training_samples corpus (one row per
+# MANUAL decision, with a name-keyed frozen feature vector) plus
+# pairwise_comparisons and the tunable settings. The trained pickle is a
+# derived artifact — import rebuilds it by retraining. Exporting the corpus as
+# JSON (not the pickle) keeps backups portable across feature-schema versions:
+# features_from_json re-aligns rows by feature name and NaN-pads missing cols.
+# ---------------------------------------------------------------------------
+
+_BACKUP_FORMAT = "kamera-taste-model"
+_BACKUP_FORMAT_VERSION = 1
+_MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB — a 100k-sample corpus is well under this
+
+
+@router.get("/export-taste-model")
+def export_taste_model():
+    """
+    Export the personal taste model's durable state as a portable JSON backup.
+
+    Contents: the full training_samples corpus + pairwise_comparisons + the
+    user-tunable settings (decision thresholds/weights). The trained pickle is
+    intentionally excluded — import rebuilds it via retrain. Returns a
+    downloadable attachment; an empty corpus is a valid (never 404) export.
+    """
+    keys = tunable_setting_keys()
+    placeholders = ",".join("?" * len(keys))
+    with get_db() as conn:
+        samples = [
+            dict(r) for r in conn.execute(
+                "SELECT sample_uuid, decision, features_json, overall_score, "
+                "schema_version, decided_at FROM training_samples"
+            ).fetchall()
+        ]
+        pairwise = [
+            dict(r) for r in conn.execute(
+                "SELECT winner_id, loser_id, source_folder, decided_at "
+                "FROM pairwise_comparisons"
+            ).fetchall()
+        ]
+        setting_rows = conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall()
+
+    payload = {
+        "format":         _BACKUP_FORMAT,
+        "format_version": _BACKUP_FORMAT_VERSION,
+        "exported_at":    datetime.now().isoformat(timespec="seconds"),
+        "app": {
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "min_decisions":          MIN_DECISIONS,
+        },
+        "training_samples":     samples,
+        "pairwise_comparisons": pairwise,
+        "settings":             {r["key"]: r["value"] for r in setting_rows},
+    }
+
+    filename = f"kamera-taste-model-{len(samples)}-samples.json"
+    return Response(
+        content=json.dumps(payload),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/import-taste-model")
+async def import_taste_model(request: Request, mode: str = "merge"):
+    """
+    Restore a personal-taste-model backup produced by /export-taste-model.
+
+    The backup JSON is sent as the raw request body (application/json); `mode`
+    is a query parameter. This keeps the endpoint dependency-free — the browser
+    reads the picked file's text and POSTs it directly, no multipart needed.
+
+    mode="merge"   → upsert samples by sample_uuid (taste evolution wins),
+                     apply settings additively; never clears existing state.
+    mode="replace" → wipe the corpus AND tunable settings first, then restore
+                     the backup exactly (a true snapshot restore).
+
+    After the DB restore, the model is retrained so the on-disk pickle reflects
+    the imported corpus (skipped when the corpus is below MIN_DECISIONS).
+    """
+    if mode not in ("merge", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'merge' or 'replace'")
+
+    raw = await request.body()
+    if len(raw) > _MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="Backup file too large (limit 50 MB)")
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="File is not valid JSON")
+
+    if not isinstance(payload, dict) or payload.get("format") != _BACKUP_FORMAT:
+        raise HTTPException(status_code=400, detail="Not a KaMeRa taste-model backup")
+    fmt_version = payload.get("format_version")
+    if not isinstance(fmt_version, int) or fmt_version > _BACKUP_FORMAT_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported backup version — export was made by a newer app",
+        )
+
+    samples  = payload.get("training_samples", [])
+    pairwise = payload.get("pairwise_comparisons", [])
+    settings = payload.get("settings", {})
+    if not isinstance(samples, list) or not isinstance(pairwise, list) \
+            or not isinstance(settings, dict):
+        raise HTTPException(status_code=400, detail="Backup structure is malformed")
+
+    # Schema-mismatch is a warning, never a blocker: features_from_json re-aligns
+    # rows by name and the SimpleImputer fills any missing columns at retrain.
+    backup_fsv = (payload.get("app") or {}).get("feature_schema_version")
+    schema_warning = None
+    if backup_fsv != FEATURE_SCHEMA_VERSION:
+        schema_warning = (
+            f"Backup was made on feature schema {backup_fsv}; this app is on "
+            f"{FEATURE_SCHEMA_VERSION}. Samples will be re-aligned by name and "
+            f"any missing features filled in when the model retrains."
+        )
+
+    allowed_keys = set(tunable_setting_keys())
+
+    # Pre-filter samples: a row needs a non-empty uuid and a valid decision.
+    valid_samples, skipped = [], 0
+    for s in samples:
+        uuid = s.get("sample_uuid")
+        if not uuid or s.get("decision") not in ("keep", "maybe", "reject"):
+            skipped += 1
+            continue
+        valid_samples.append(s)
+
+    try:
+        with get_db() as conn:
+            if mode == "replace":
+                conn.execute("DELETE FROM training_samples")
+                conn.execute("DELETE FROM pairwise_comparisons")
+                if allowed_keys:
+                    ph = ",".join("?" * len(allowed_keys))
+                    conn.execute(
+                        f"DELETE FROM settings WHERE key IN ({ph})",
+                        tuple(allowed_keys),
+                    )
+
+            # Upsert samples — mirror the live decision path's ON CONFLICT, but
+            # preserve the backup's decided_at so recency weighting stays faithful.
+            conn.executemany(
+                """
+                INSERT INTO training_samples
+                    (sample_uuid, decision, features_json, overall_score,
+                     schema_version, decided_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sample_uuid) DO UPDATE SET
+                    decision       = excluded.decision,
+                    features_json  = excluded.features_json,
+                    overall_score  = excluded.overall_score,
+                    schema_version = excluded.schema_version,
+                    decided_at     = excluded.decided_at
+                """,
+                [
+                    (
+                        s["sample_uuid"],
+                        s["decision"],
+                        s.get("features_json"),
+                        s.get("overall_score"),
+                        s.get("schema_version", FEATURE_SCHEMA_VERSION),
+                        s.get("decided_at"),
+                    )
+                    for s in valid_samples
+                ],
+            )
+
+            # Pairwise has no unique key; in merge mode dedup so repeat imports
+            # stay idempotent. Replace mode already wiped the table.
+            pairwise_imported = 0
+            for p in pairwise:
+                if p.get("winner_id") is None or p.get("loser_id") is None:
+                    continue
+                params = (
+                    p["winner_id"], p["loser_id"],
+                    p.get("source_folder"), p.get("decided_at"),
+                )
+                if mode == "merge":
+                    cur = conn.execute(
+                        """
+                        INSERT INTO pairwise_comparisons
+                            (winner_id, loser_id, source_folder, decided_at)
+                        SELECT ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM pairwise_comparisons
+                            WHERE winner_id = ? AND loser_id = ?
+                              AND IFNULL(decided_at,'') = IFNULL(?,'')
+                        )
+                        """,
+                        params + (p["winner_id"], p["loser_id"], p.get("decided_at")),
+                    )
+                    pairwise_imported += cur.rowcount
+                else:
+                    conn.execute(
+                        "INSERT INTO pairwise_comparisons "
+                        "(winner_id, loser_id, source_folder, decided_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        params,
+                    )
+                    pairwise_imported += 1
+
+            # Settings: only accept known tunable keys (drop unknown/hostile).
+            settings_applied = 0
+            for key, value in settings.items():
+                if key in allowed_keys:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (key, str(value)),
+                    )
+                    settings_applied += 1
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Taste-model import failed during DB restore")
+        raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
+
+    # ── Rebuild the derived pickle from the restored corpus ──────────────────
+    _personal_model.clear_cache()
+    # Replace can shrink the corpus below the on-disk fit; save()'s shrink guard
+    # would then silently refuse the overwrite and leave a stale pickle. reset()
+    # deletes the pickle first so the (possibly smaller) new fit persists cleanly.
+    if mode == "replace":
+        _personal_model.reset()
+
+    retrained = False
+    retrain_deferred = False
+    retrain_skipped_reason = None
+    with get_db() as conn:
+        corpus_size = conn.execute("SELECT COUNT(*) FROM training_samples").fetchone()[0]
+
+    if corpus_size < MIN_DECISIONS:
+        retrain_skipped_reason = "below_min_decisions"
+    else:
+        try:
+            force_train_sync(_personal_model)
+            retrained = True
+        except ValueError:
+            retrain_skipped_reason = "below_min_decisions"
+        except RuntimeError:
+            # An auto-train is mid-flight — don't fail the import; the running
+            # train (or the next one) will pick up the freshly imported corpus.
+            retrain_deferred = True
+        except Exception:
+            logger.exception("Retrain after import failed")
+            retrain_skipped_reason = "retrain_error"
+
+    logger.info(
+        "Taste-model import (%s): %d samples, %d skipped, %d pairwise, %d settings; "
+        "retrained=%s deferred=%s",
+        mode, len(valid_samples), skipped, pairwise_imported, settings_applied,
+        retrained, retrain_deferred,
+    )
+    return {
+        "status":                 "imported",
+        "mode":                   mode,
+        "samples_imported":       len(valid_samples),
+        "samples_skipped":        skipped,
+        "pairwise_imported":      pairwise_imported,
+        "settings_applied":       settings_applied,
+        "retrained":              retrained,
+        "retrain_deferred":       retrain_deferred,
+        "retrain_skipped_reason": retrain_skipped_reason,
+        "schema_warning":         schema_warning,
+    }
 
 
 def _shot_at_to_unix(value) -> float | None:

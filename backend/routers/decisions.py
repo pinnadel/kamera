@@ -489,14 +489,24 @@ def trash_rejects():
     """
     Send all rejected files to the system Trash (recoverable via Trash bin).
 
-    For each image with decision='reject':
-      1. Moves the RAW file to the system Trash via send2trash.
-      2. Deletes the DB row (file is gone from our managed set).
+    For each image with decision='reject', route through file_mover.trash_photo
+    so the send2trash call — and its .HIF sidecar handling — is identical to a
+    single per-photo R press with reject_to_system_trash on. The DB row is
+    deleted ONLY when trash_photo confirms the file reached the Trash.
 
-    Files that are already missing from disk are silently skipped.
+    Failure honesty (data-loss adjacent, so we never lie about success):
+      - A file that trash_photo can't verifiably move to Trash (send2trash
+        raised, permission denied, or the file already vanished from disk —
+        e.g. a folder-watching app like Luminar grabbed it first) is reported
+        as an error and its DB row is KEPT. The photo stays in your reject
+        list so you can see it didn't make it, rather than silently
+        disappearing from the app while still sitting on disk.
+
+    Returns per-outcome counts so the UI can report the truth:
+      - trashed:         verifiably sent to the system Trash
+      - skipped_missing: the file was already gone from disk (row kept)
+      - failed:          send2trash/OS error (row kept)
     """
-    from send2trash import send2trash as _send2trash
-
     with get_db() as conn:
         rows = conn.execute(
             """
@@ -508,19 +518,29 @@ def trash_rejects():
         ).fetchall()
 
     trashed: int = 0
+    skipped_missing: int = 0
     errors: list[dict] = []
     ids_to_delete: list[int] = []
 
     for row in rows:
         file_path = row["file_path"]
         try:
-            if Path(file_path).exists():
-                _send2trash(file_path)
+            trash_photo(file_path)
             ids_to_delete.append(row["id"])
             trashed += 1
+        except FileNotFoundError:
+            # File already gone from disk — do NOT claim we trashed it and do
+            # NOT delete the row. Surfaced so the user can investigate (a
+            # folder-watching app may have moved it out from under us).
+            skipped_missing += 1
+            errors.append({"file": file_path, "error": "file already missing from disk"})
+            logger.warning("trash-rejects: file already missing, keeping row: %s", file_path)
         except Exception as exc:
             errors.append({"file": file_path, "error": str(exc)})
+            logger.warning("trash-rejects: send2trash failed, keeping row: %s (%s)", file_path, exc)
 
+    # Only rows whose file verifiably reached the Trash are removed from the
+    # managed set. Missing/failed rows stay so the app's view matches reality.
     if ids_to_delete:
         placeholders = ",".join("?" * len(ids_to_delete))
         with get_db() as conn:
@@ -533,7 +553,12 @@ def trash_rejects():
                 ids_to_delete,
             )
 
-    return {"trashed": trashed, "errors": errors}
+    return {
+        "trashed": trashed,
+        "skipped_missing": skipped_missing,
+        "failed": len(errors) - skipped_missing,
+        "errors": errors,
+    }
 
 
 @router.get("/auto-cull/preview")

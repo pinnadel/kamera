@@ -9,6 +9,14 @@ export default defineConfig({
     react(),
     tailwindcss(),
     VitePWA({
+      // selfDestroying: the app is a LOCAL desktop tool — its backend is always
+      // on localhost, so offline precaching buys nothing and the service worker
+      // only causes harm: its navigateFallback served a stale index.html for
+      // download navigations (e.g. taste-model export), saving the app shell
+      // HTML instead of the real file. This mode ships a SW whose sole job is to
+      // unregister any previously-installed SW and delete its caches, then never
+      // register again. Keeps the web-manifest (installability) intact.
+      selfDestroying: true,
       registerType: 'autoUpdate',
       injectRegister: 'auto',
       includeAssets: [
@@ -53,6 +61,10 @@ export default defineConfig({
           /^\/sync-mobile/,
           /^\/pick-folder/,
           /^\/mobile\.html/,
+          // Taste-model backup download — a GET that returns a JSON attachment.
+          // Without this the SW's navigateFallback serves index.html instead of
+          // the file. (Import is a POST, which the fallback ignores already.)
+          /^\/export-taste-model/,
         ],
       },
       devOptions: {

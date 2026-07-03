@@ -7,12 +7,9 @@ import { createPortal } from 'react-dom'
 // All visual properties set inline to bypass any cascade interference
 // (parent opacity, Tailwind JIT misses, stacking-context quirks). Rendered
 // via createPortal into document.body so it never inherits ancestor opacity.
-// Position carries either `left` OR `right` (not both) — the trigger
-// computes which side keeps the popover inside the viewport.
-// Popover style — fixed 256px wide pill rendered via portal into document.body
-// so it escapes any ancestor overflow. Position carries `top`/`bottom` AND
-// `left`/`right` (computed by placePopover to keep the popover inside the
-// viewport).
+// Fixed 256px wide pill; escapes any ancestor overflow. Position carries a
+// `left` plus either `top` (below the trigger) or `bottom` (flipped above),
+// computed by placePopover to keep the popover inside the viewport.
 function popoverStyle(pos) {
   const style = {
     position: 'fixed',
@@ -37,20 +34,15 @@ function popoverStyle(pos) {
 }
 
 // placePopover — decide where to position the popover relative to its
-// trigger so it stays inside the viewport. Tries placements in priority
-// order:
+// trigger. One consistent rule so every "i" reads the same everywhere:
 //
-//   1. BELOW the trigger, left-aligned (popover extends right from the
-//      trigger's left edge). Used when the trigger has room to its right.
+//   • Horizontally, the popover always hangs off the trigger's LEFT edge
+//     and extends rightward ("bottom-right of the icon"). When that would
+//     overflow the right margin, it's nudged left only as much as needed
+//     to fit ("bottom-left") — it never detaches to the side of the icon.
 //
-//   2. LEFT of the trigger, vertically aligned (popover's right edge
-//      touches the trigger's left edge, with a small gap). Used when the
-//      trigger is close to the right edge of the viewport.
-//
-//   3. ABOVE the trigger, left-aligned. Used when below doesn't fit
-//      vertically but right does.
-//
-//   4. Clamped below the trigger as a last resort.
+//   • Vertically it sits BELOW the trigger. Only when there's no room
+//     below does it flip ABOVE (top-right / top-left mirror).
 //
 // Width is treated as a hard 256px; we reserve a generous viewport margin
 // so small drift (border, scrollbar, sub-pixel rendering) doesn't push
@@ -64,23 +56,20 @@ function placePopover(r) {
   const vw = document.documentElement.clientWidth  || window.innerWidth
   const vh = document.documentElement.clientHeight || window.innerHeight
 
-  const fitsRightOfLeftEdge       = r.left  + POPOVER_WIDTH  + POPOVER_MARGIN <= vw
-  const fitsBelowTriggerBottom    = r.bottom + POPOVER_GAP + POPOVER_HEIGHT_BUDGET + POPOVER_MARGIN <= vh
-  const fitsLeftOfTriggerLeftEdge = r.left  - POPOVER_WIDTH  - POPOVER_GAP    >= POPOVER_MARGIN
-  const fitsAboveTriggerTop       = r.top   - POPOVER_GAP - POPOVER_HEIGHT_BUDGET >= POPOVER_MARGIN
+  // Horizontal: anchor to the trigger's left edge, clamp into the viewport.
+  // Prefer left-aligned (extends right); shift left only enough to fit.
+  const left = Math.max(
+    POPOVER_MARGIN,
+    Math.min(r.left, vw - POPOVER_WIDTH - POPOVER_MARGIN),
+  )
 
-  if (fitsRightOfLeftEdge && fitsBelowTriggerBottom) {
-    return { left: r.left, top: r.bottom + POPOVER_GAP }
+  // Vertical: below by default; flip above when below doesn't fit but above does.
+  const fitsBelow = r.bottom + POPOVER_GAP + POPOVER_HEIGHT_BUDGET + POPOVER_MARGIN <= vh
+  const fitsAbove = r.top    - POPOVER_GAP - POPOVER_HEIGHT_BUDGET - POPOVER_MARGIN >= 0
+
+  if (!fitsBelow && fitsAbove) {
+    return { left, bottom: vh - r.top + POPOVER_GAP }
   }
-  if (fitsLeftOfTriggerLeftEdge) {
-    const top = Math.max(POPOVER_MARGIN, Math.min(r.top, vh - POPOVER_HEIGHT_BUDGET - POPOVER_MARGIN))
-    return { right: vw - r.left + POPOVER_GAP, top }
-  }
-  if (fitsRightOfLeftEdge && fitsAboveTriggerTop) {
-    return { left: r.left, bottom: vh - r.top + POPOVER_GAP }
-  }
-  // Fallback — clamp horizontally inside the viewport, below the trigger.
-  const left = Math.max(POPOVER_MARGIN, Math.min(r.left, vw - POPOVER_WIDTH - POPOVER_MARGIN))
   return { left, top: r.bottom + POPOVER_GAP }
 }
 
