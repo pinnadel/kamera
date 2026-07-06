@@ -98,6 +98,20 @@ After ~50 decisions, KaMeRa's personal-style model starts predicting which photo
 
 ---
 
+## Remote access (e.g. a NAS on your Tailscale network)
+
+By default KaMeRa only listens on `localhost` — nothing outside the machine it runs on can reach it. If you run KaMeRa on a NAS or home server that's part of your [Tailscale](https://tailscale.com) tailnet, you can reach its UI from your laptop or phone:
+
+```bash
+./start.sh --remote        # macOS / Linux
+# or
+start.cmd --remote         # Windows
+```
+
+This binds the server to all network interfaces and prints the Tailscale address to open from another device, e.g. `http://100.x.y.z:8000`. Only devices that can already reach that interface (your tailnet, or your LAN) can connect — `--remote` doesn't open anything to the public internet, but it does listen on your LAN too, not just the Tailscale interface, so avoid it on untrusted networks.
+
+---
+
 ## Compatibility
 
 | | |

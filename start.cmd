@@ -3,6 +3,7 @@
 ::
 :: Normal use:  start.cmd          -> production mode (pre-built frontend)
 :: Dev use:     start.cmd --dev    -> Vite dev server on :5173 (hot reload)
+:: Remote use:  start.cmd --remote -> bind to all interfaces (Tailscale/LAN access)
 
 setlocal
 set ROOT=%~dp0

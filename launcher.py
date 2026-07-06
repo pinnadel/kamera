@@ -45,6 +45,19 @@ HEALTH_URL   = f"{BACKEND_URL}/health"
 FRONTEND_URL = "http://localhost:5173"
 
 
+def _tailscale_ip() -> str | None:
+    """Best-effort lookup of this machine's Tailscale IPv4 address."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ip = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+        return ip or None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Setup helpers
 # ---------------------------------------------------------------------------
@@ -73,9 +86,9 @@ def _build_frontend():
     subprocess.run([NPM, "run", "build"], cwd=str(FRONTEND), check=True)
 
 
-def _start_backend() -> subprocess.Popen:
+def _start_backend(host: str = "127.0.0.1") -> subprocess.Popen:
     cmd = [str(UVICORN), "backend.main:app",
-           "--port", str(BACKEND_PORT), "--host", "127.0.0.1"]
+           "--port", str(BACKEND_PORT), "--host", host]
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -84,11 +97,14 @@ def _start_backend() -> subprocess.Popen:
                             **kwargs)
 
 
-def _start_vite() -> subprocess.Popen:
+def _start_vite(host: str | None = None) -> subprocess.Popen:
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    return subprocess.Popen([NPM, "run", "dev"], cwd=str(FRONTEND),
+    cmd = [NPM, "run", "dev"]
+    if host:
+        cmd += ["--", "--host", host]
+    return subprocess.Popen(cmd, cwd=str(FRONTEND),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             **kwargs)
 
@@ -223,9 +239,14 @@ def main():
     parser = argparse.ArgumentParser(description="KaMeRa launcher")
     parser.add_argument("--dev", action="store_true",
                         help="Use Vite dev server instead of pre-built frontend")
+    parser.add_argument("--remote", action="store_true",
+                        help="Bind to all network interfaces so devices on your "
+                             "Tailscale network or LAN can reach the UI "
+                             "(default: localhost only)")
     args = parser.parse_args()
 
     processes: list[subprocess.Popen] = []
+    backend_host = "0.0.0.0" if args.remote else "127.0.0.1"
 
     try:
         _ensure_venv()
@@ -233,14 +254,14 @@ def main():
 
         if args.dev:
             app_url = FRONTEND_URL
-            processes.append(_start_vite())
+            processes.append(_start_vite(backend_host if args.remote else None))
         else:
             if not DIST.is_dir():
                 _build_frontend()
             app_url = BACKEND_URL
 
         print("Starting backend…")
-        processes.append(_start_backend())
+        processes.append(_start_backend(backend_host))
 
         print("Waiting for backend…", end="", flush=True)
         if not _wait_for_backend():
@@ -249,6 +270,17 @@ def main():
                 p.terminate()
             sys.exit(1)
         print(" ready.")
+
+        if args.remote:
+            port = BACKEND_PORT if not args.dev else 5173
+            ts_ip = _tailscale_ip()
+            if ts_ip:
+                print(f"Remote access enabled — reachable on your Tailscale "
+                      f"network at: http://{ts_ip}:{port}")
+            else:
+                print(f"Remote access enabled on port {port} for all network "
+                      f"interfaces. Run 'tailscale ip -4' to find this "
+                      f"machine's Tailscale address.")
 
         webbrowser.open(app_url)
         _run_icon(processes, app_url)

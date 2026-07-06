@@ -120,9 +120,13 @@ app = FastAPI(
 )
 
 # CORS: allow the React dev server (port 5173 for Vite, 3000 for CRA) to call us.
+# The regex additionally covers dev access from a LAN or Tailscale address
+# (Tailscale's CGNAT range is 100.64.0.0/10, approximated here as 100.x.x.x)
+# so `--dev --remote` works from another device on the tailnet.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origin_regex=r"http://(100\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}):(3000|5173)",
     allow_methods=["*"],
     allow_headers=["*"],
 )

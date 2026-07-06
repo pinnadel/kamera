@@ -3,6 +3,7 @@
 #
 # Normal use:  ./start.sh          → production mode (pre-built frontend)
 # Dev use:     ./start.sh --dev    → Vite dev server on :5173 (hot reload)
+# Remote use:  ./start.sh --remote → bind to all interfaces (Tailscale/LAN access)
 
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
