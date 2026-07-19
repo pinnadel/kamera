@@ -212,6 +212,23 @@ investigating. `GET /analyze-progress` also exposes a live
 `elapsed_seconds` field that grows in real time while the batch runs and
 freezes at the final wall-clock total once `running` flips to `false`.
 
+### What happens when I drop a whole card into the watched folder at once?
+
+The files queue up and get analyzed **one at a time** by a single worker
+thread — the "analyzing… (N left)" pill counts the backlog down honestly.
+Detected files go onto a `queue.Queue` in
+[backend/file_watcher.py](../backend/file_watcher.py) (`FolderWatcher._enqueue`
+→ `_worker_loop`); repeat events for the same file are deduped via a pending
+set, and the 2s write-settle wait is measured from each file's arrival, so a
+long backlog doesn't re-pay it per file. Expect a few seconds per RAF, ~1s
+per JPEG — a 260-file card takes a while, but the UI stays responsive the
+whole time and progress is visible.
+
+Before 2026-07-19 this spawned one analysis thread **per file**, so a bulk
+card drop launched hundreds of simultaneous RAW decodes and wedged the whole
+backend (334 threads / 16 GB RAM / frozen UI). If the watcher ever looks
+stuck again, check thread count and `data/app.log` before assuming it's dead.
+
 ---
 
 ## Grouping & comparison

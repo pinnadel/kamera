@@ -12,6 +12,7 @@ Usage (called from main.py at startup):
     watcher.stop()
 """
 
+import queue
 import threading
 import time
 import logging
@@ -145,13 +146,11 @@ def _analyze_and_store(file_path: Path, db_path: Path,
 class _PhotoEventHandler(FileSystemEventHandler):
     """Called by watchdog on file system events."""
 
-    def __init__(self, db_path: Path, on_error: Optional[ErrorCallback] = None,
-                 owner: Optional["FolderWatcher"] = None):
+    def __init__(self, db_path: Path, owner: "FolderWatcher"):
         super().__init__()
         self._db_path = db_path
-        self._on_error = on_error
-        # Back-reference so analyze threads can report in-flight / analyzed
-        # counts to the owning FolderWatcher (drives GET /watch-progress).
+        # Owning FolderWatcher — detected files go onto its analysis queue,
+        # which one worker thread drains sequentially (drives /watch-progress).
         self._owner = owner
 
     def _handle(self, path_str: str) -> None:
@@ -163,37 +162,11 @@ class _PhotoEventHandler(FileSystemEventHandler):
         # destination; re-analyzing it is both pointless (already decided) and
         # racy — an external archiver (Provenance) may move the keeper out of
         # _Keeps before our 2s settle elapses, making cv2.imread fail and toast
-        # a spurious "Could not load image". Dropping it here, before any thread
-        # spawns, fixes that at the source and keeps the counters honest.
+        # a spurious "Could not load image". Dropping it here, before anything
+        # is queued, fixes that at the source and keeps the counters honest.
         if any(part in DECISION_SUBFOLDERS for part in path.parts):
             return
-        # Run analysis in a daemon thread so we don't block the watchdog event loop
-        threading.Thread(
-            target=self._settle_then_analyze,
-            args=(path,),
-            daemon=True,
-        ).start()
-
-    def _settle_then_analyze(self, path: Path) -> None:
-        """Wait for the file to finish writing before analyzing.
-
-        In-flight is incremented at the very START (before the settle sleep) so a
-        burst of on_created events (e.g. a Fuji frame's fast JPG followed by its
-        slow RAF) keeps in_flight > 0 across the gap — the live "analyzing…"
-        indicator must not clear between them. The finally always decrements, so
-        a failing file can't strand the counter.
-        """
-        if self._owner is not None:
-            self._owner._enter_inflight()
-        analyzed = False
-        try:
-            time.sleep(SETTLE_SECONDS)
-            if path.exists():
-                _analyze_and_store(path, self._db_path, on_error=self._on_error)
-                analyzed = True
-        finally:
-            if self._owner is not None:
-                self._owner._exit_inflight(analyzed)
+        self._owner._enqueue(path)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -227,6 +200,13 @@ class FolderWatcher:
     """
     Manages a watchdog Observer that monitors one folder at a time.
 
+    Detected files are queued and analyzed by ONE worker thread, sequentially.
+    The original thread-per-file design melted down on bulk drops: copying a
+    full card into the watched folder spawned one rawpy decode thread per file
+    (2026-07-19 incident: 263 files → 334 threads, 13 GB RSS, API wedged).
+    Sequential matches the batch loop — parallelism lives inside a photo's
+    scorer fan, never across photos.
+
     Thread-safe: start/stop can be called from the FastAPI main thread.
     """
 
@@ -235,9 +215,17 @@ class FolderWatcher:
         self._on_error  = on_error
         self._observer  = None
         self._watch_path: str | None = None
-        # Live-analysis counters for GET /watch-progress. _in_flight = analyze
-        # threads currently settling/running; _analyzed = files this session has
-        # finished. Guarded by _lock (touched from many daemon analyze threads).
+        # Analysis pipeline: watchdog event threads enqueue, one worker drains.
+        # _pending dedupes paths already queued (one copy can fire several
+        # events for the same file). start() creates a fresh queue + worker per
+        # session; stop() abandons the backlog via _worker_stop + sentinel.
+        self._queue: queue.Queue = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._worker_stop = threading.Event()
+        self._pending: set[str] = set()
+        # Live-analysis counters for GET /watch-progress. _in_flight = files
+        # queued or currently analyzing; _analyzed = files this session has
+        # finished. Guarded by _lock (touched from watchdog + worker threads).
         self._in_flight = 0
         self._analyzed  = 0
         self._lock = threading.Lock()
@@ -259,15 +247,57 @@ class FolderWatcher:
         with self._lock:
             return self._analyzed
 
-    def _enter_inflight(self) -> None:
-        with self._lock:
-            self._in_flight += 1
+    def _enqueue(self, path: Path) -> None:
+        """Queue a detected file for the worker. Dedupes repeat events.
 
-    def _exit_inflight(self, analyzed: bool) -> None:
+        In-flight is bumped at enqueue time so a burst of on_created events
+        (e.g. a Fuji frame's fast JPG followed by its slow RAF) keeps
+        in_flight > 0 across the gap — the live "analyzing…" indicator must
+        not clear between them.
+        """
+        key = str(path)
         with self._lock:
+            if key in self._pending:
+                return
+            self._pending.add(key)
+            self._in_flight += 1
+        self._queue.put((path, time.monotonic()))
+
+    def _finish(self, path: Path, analyzed: bool) -> None:
+        with self._lock:
+            self._pending.discard(str(path))
             self._in_flight = max(0, self._in_flight - 1)
             if analyzed:
                 self._analyzed += 1
+
+    def _worker_loop(self, q: queue.Queue, stop_evt: threading.Event) -> None:
+        """Drain the queue one file at a time until stopped.
+
+        SETTLE_SECONDS is measured from the file's event, not from dequeue —
+        under a backlog the settle window has long elapsed by the time a file
+        reaches the front, so the worker proceeds without sleeping.
+        """
+        while True:
+            item = q.get()
+            if item is None or stop_evt.is_set():
+                return
+            path, seen_at = item
+            analyzed = False
+            try:
+                remaining = SETTLE_SECONDS - (time.monotonic() - seen_at)
+                if remaining > 0:
+                    time.sleep(remaining)
+                if stop_evt.is_set():
+                    return
+                if path.exists():
+                    _analyze_and_store(path, self._db_path, on_error=self._on_error)
+                    analyzed = True
+            except Exception:
+                # _analyze_and_store handles its own errors; this guards the
+                # loop itself so one bad file can't kill the whole session.
+                log.exception("Watcher worker error on: %s", path.name)
+            finally:
+                self._finish(path, analyzed)
 
     def start(self, folder_path: str) -> None:
         """Start watching a folder. Stops any existing watch first."""
@@ -276,14 +306,23 @@ class FolderWatcher:
         if not path.is_dir():
             raise ValueError(f"Not a directory: {folder_path}")
 
-        # Fresh session → reset counters so /watch-progress reflects only this
-        # watch's activity.
+        # Fresh session → zeroed counters for /watch-progress, and a fresh
+        # queue + worker (the old queue may still hold the stop sentinel).
         with self._lock:
             self._in_flight = 0
             self._analyzed = 0
+            self._pending.clear()
+        self._queue = queue.Queue()
+        self._worker_stop = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            args=(self._queue, self._worker_stop),
+            daemon=True,
+            name="watcher-analyze",
+        )
+        self._worker.start()
 
-        handler = _PhotoEventHandler(self._db_path, on_error=self._on_error,
-                                     owner=self)
+        handler = _PhotoEventHandler(self._db_path, owner=self)
         self._observer = Observer()
         self._observer.schedule(handler, str(path), recursive=False)
         self._observer.start()
@@ -296,4 +335,11 @@ class FolderWatcher:
             self._observer.stop()
             self._observer.join()
             self._observer = None
+        if self._worker is not None:
+            # Signal first, then unblock the blocking get(). The worker drops
+            # any backlog and exits after at most the file it is currently
+            # analyzing (a RAW decode is uncancellable, same as the batch).
+            self._worker_stop.set()
+            self._queue.put(None)
+            self._worker = None
         self._watch_path = None

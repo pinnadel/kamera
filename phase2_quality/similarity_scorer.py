@@ -36,6 +36,7 @@ CPU inference: ~0.3–1.0s per image at 224px resolution.
 
 import json
 import logging
+import threading
 from pathlib import Path
 
 from phase2_quality.model_status import begin as _begin, end as _end
@@ -65,6 +66,14 @@ _siglip = None  # tuple(model, processor, tokenizer) once ready
 
 # Permanent-failure flag — see _load_failed handling in _get_siglip().
 _load_failed = False
+
+# Serialises the lazy load. torch 2.11 + transformers 4.57 initialise weights
+# on the meta device via accelerate GLOBAL state, so two threads racing
+# from_pretrained()/.to(device) fail with "Cannot copy out of meta tensor" —
+# and the loser sets _load_failed, poisoning the whole process even though the
+# winner's model works (2026-07-19 incident: warm-up thread vs first analyze).
+# Same reason _warm_models loads the three models sequentially.
+_load_lock = threading.Lock()
 
 
 def _is_siglip_cached() -> bool:
@@ -98,34 +107,44 @@ def _get_siglip():
       otherwise produces N stack traces for an N-photo batch.
     """
     global _siglip, _load_failed
-    if _load_failed:
-        raise RuntimeError(
-            "SigLIP model failed to load earlier in this process; "
-            "not retrying. Check the first SigLIP error in the log."
-        )
-    if _siglip is None:
-        from transformers import AutoModel, AutoProcessor, AutoTokenizer
+    if _siglip is not None:   # fast path — no lock once loaded
+        return _siglip
+    with _load_lock:
+        if _load_failed:
+            raise RuntimeError(
+                "SigLIP model failed to load earlier in this process; "
+                "not retrying. Check the first SigLIP error in the log."
+            )
+        if _siglip is None:
+            from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
-        downloading = not _is_siglip_cached()
-        _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
-        try:
-            logger.info("Loading SigLIP-2 model (first use — may download ~300 MB)…")
-            model = AutoModel.from_pretrained(_MODEL_ID)
-            model.eval()
-            model = model.to(_get_device())
-            processor = AutoProcessor.from_pretrained(_MODEL_ID)
-            tokenizer = AutoTokenizer.from_pretrained(_MODEL_ID)
-            if processor is None or tokenizer is None:
-                raise RuntimeError(
-                    f"SigLIP processor/tokenizer load returned None for {_MODEL_ID!r}"
-                )
-            _siglip = (model, processor, tokenizer)
-            logger.info("SigLIP-2 model ready on %s.", _get_device())
-        except Exception:
-            _load_failed = True
-            raise
-        finally:
-            _end(_MODEL_ID)
+            downloading = not _is_siglip_cached()
+            _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
+            # A cached model must load from disk ONLY. Without this,
+            # from_pretrained() phones huggingface.co to check for updates on
+            # every warm load, and a network flake at that moment fails the
+            # whole load — which _load_failed then latches for the life of
+            # the process (2026-07-19 incident: one SSL EOF during an import
+            # disabled SigLIP for the entire 183-photo run).
+            offline = {} if downloading else {"local_files_only": True}
+            try:
+                logger.info("Loading SigLIP-2 model (first use — may download ~300 MB)…")
+                model = AutoModel.from_pretrained(_MODEL_ID, **offline)
+                model.eval()
+                model = model.to(_get_device())
+                processor = AutoProcessor.from_pretrained(_MODEL_ID, **offline)
+                tokenizer = AutoTokenizer.from_pretrained(_MODEL_ID, **offline)
+                if processor is None or tokenizer is None:
+                    raise RuntimeError(
+                        f"SigLIP processor/tokenizer load returned None for {_MODEL_ID!r}"
+                    )
+                _siglip = (model, processor, tokenizer)
+                logger.info("SigLIP-2 model ready on %s.", _get_device())
+            except Exception:
+                _load_failed = True
+                raise
+            finally:
+                _end(_MODEL_ID)
 
     return _siglip
 

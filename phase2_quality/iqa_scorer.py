@@ -16,6 +16,7 @@ Inference runs at 1024px preview scale (~0.5–2s per image).
 """
 
 import logging
+import threading
 from pathlib import Path
 
 from PIL import Image
@@ -68,6 +69,11 @@ _MAX_SIDE = 1024
 _metric = None
 _load_failed = False  # Set after a fatal load error so we don't retry every photo.
 
+# Serialises the lazy load — concurrent first-loads (warm-up thread vs first
+# analyze) race accelerate's meta-device init and fail with "Cannot copy out
+# of meta tensor". See the matching lock + incident note in similarity_scorer.
+_load_lock = threading.Lock()
+
 
 def _get_metric():
     """Load TOPIQ no-reference metric, or return the already-loaded instance.
@@ -81,23 +87,26 @@ def _get_metric():
     after the user fixes the underlying problem (e.g. torch version).
     """
     global _metric, _load_failed
-    if _load_failed:
-        raise RuntimeError("TOPIQ model failed to load earlier in this session.")
-    if _metric is None:
-        import torch
-        import pyiqa
-        downloading = not _is_topiq_cached()
-        _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
-        try:
-            logger.info("Loading TOPIQ model (first use — may download ~100 MB)…")
-            _metric = pyiqa.create_metric("topiq_nr", device=_get_device())
-            logger.info("TOPIQ model ready.")
-        except Exception:
-            _load_failed = True
-            logger.exception("TOPIQ model load failed — disabling for this session.")
-            raise
-        finally:
-            _end(_MODEL_ID)
+    if _metric is not None:   # fast path — no lock once loaded
+        return _metric
+    with _load_lock:
+        if _load_failed:
+            raise RuntimeError("TOPIQ model failed to load earlier in this session.")
+        if _metric is None:
+            import torch
+            import pyiqa
+            downloading = not _is_topiq_cached()
+            _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
+            try:
+                logger.info("Loading TOPIQ model (first use — may download ~100 MB)…")
+                _metric = pyiqa.create_metric("topiq_nr", device=_get_device())
+                logger.info("TOPIQ model ready.")
+            except Exception:
+                _load_failed = True
+                logger.exception("TOPIQ model load failed — disabling for this session.")
+                raise
+            finally:
+                _end(_MODEL_ID)
     return _metric
 
 
