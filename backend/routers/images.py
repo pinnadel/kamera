@@ -10,8 +10,12 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS
+from backend.constants import (
+    SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif,
+    is_raw_format, companion_stem_matches,
+)
 from backend.database import get_db
+from backend.routers.settings import get_raw_jpeg_display_mode
 from backend.state import PREVIEW_CACHE_DIR, _personal_model, _progress
 
 logger = logging.getLogger(__name__)
@@ -22,6 +26,42 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _filter_raw_jpeg_pairs(rows: list[dict]) -> list[dict]:
+    """
+    Hide one member of each detected RAW+JPEG (or RAW+standalone-HIF) pair
+    per the raw_jpeg_display_mode setting. Mode 'both' is a no-op (today's
+    behaviour). A "pair" is two rows in the same source_folder whose
+    filenames share a stem and whose formats are on opposite sides of the
+    RAW/processed split.
+
+    Orphans (a RAW or JPEG with no same-stem sibling in this result set) are
+    always kept regardless of mode — the filter only ever hides one half of
+    an actual detected pair, never a photo the user has no other copy of.
+    """
+    mode = get_raw_jpeg_display_mode()
+    if mode == "both":
+        return rows
+
+    # Group candidate rows by (source_folder, stem) to find pairs cheaply.
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = (row.get("source_folder"), Path(row["filename"]).stem.lower())
+        groups.setdefault(key, []).append(row)
+
+    hide_ids: set[int] = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue  # orphan — no companion in this result set, always shown
+        raw_members = [r for r in members if is_raw_format(r.get("format"))]
+        processed_members = [r for r in members if not is_raw_format(r.get("format"))]
+        if not raw_members or not processed_members:
+            continue  # same-stem rows that aren't actually a RAW/processed pair
+        losers = processed_members if mode == "raw" else raw_members
+        hide_ids.update(r["id"] for r in losers)
+
+    return [r for r in rows if r["id"] not in hide_ids]
 
 
 def _delete_image_rows(ids: list[int]) -> int:
@@ -117,6 +157,7 @@ def list_images(source_folder: str | None = None):
             rows = conn.execute(base_sql + " ORDER BY i.imported_at DESC").fetchall()
 
     rows_dicts = [dict(row) for row in rows]
+    rows_dicts = _filter_raw_jpeg_pairs(rows_dicts)
 
     # Annotate with personal_score if the model has been trained.
     # predict_batch() calls pipeline.predict() once for all N rows — fast.
@@ -213,18 +254,25 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
 
+    def _is_analyzable(f: Path) -> bool:
+        if f.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return False
+        if f.suffix.lower() == ".hif" and not is_standalone_hif(f):
+            return False  # RAW+HIF sidecar — moves with its RAF, never analyzed alone
+        return True
+
     if include_subfolders:
         skip_dirs = DECISION_SUBFOLDERS
         candidates = [
             f for f in folder.rglob("*")
             if f.is_file()
-            and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            and _is_analyzable(f)
             and not any(part in skip_dirs for part in f.relative_to(folder).parts)
         ]
     else:
         candidates = [
             f for f in folder.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            if f.is_file() and _is_analyzable(f)
         ]
 
     total_on_disk = len(candidates)

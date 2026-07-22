@@ -4,6 +4,24 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## RAW+JPEG display mode: filter grid tiles + mirror decisions to the hidden companion (2026-07-22)
+
+User asked why `DSCF1041.JPG` scored Technical Quality 99 while `DSCF1041.RAF` scored 46 — same shot, RAW+JPEG capture. Answer: the JPEG is Fuji's in-camera-processed rendition (sharpened, denoised) while the RAF is the raw demosaic with zero sharpening applied (sharpness is deliberately non-recoverable, see Key Active Decisions). Not a bug — but it surfaced that RAW+JPEG pairs have always been two fully independent `images` rows (own id, own scores, own decision) with **zero linkage**, doubling grid density and letting the two sides of one shot get decided completely independently — confirmed live in `data/app.log`: `DSCF1041.JPG` moved to `_Keeps/` while `DSCF1041.RAF` moved to `_Trash/` in the same batch.
+
+**New setting — `raw_jpeg_display_mode`** (`"raw" | "processed" | "both"`, default `"both"`, Settings → Display → "RAW+JPEG grid tiles"). First string/enum setting in the app; added a `_STRING_SETTINGS` registry in [backend/routers/settings.py](../backend/routers/settings.py) alongside the existing `_NUMERIC_SETTINGS`/`_BOOL_SETTINGS`, wired through `GET`/`POST /settings` and `tunable_setting_keys()` (so it's included in taste-model backup/export).
+
+**Pairing is inferred at query time, not stored.** A RAW+JPEG pair = two rows in the same `source_folder` whose filenames share a stem (case-insensitive), one `format` in `RAW_FORMATS` and one not (`is_raw_format()` / `companion_stem_matches()` in [backend/constants.py](../backend/constants.py)). No schema migration. `GET /images` (`_filter_raw_jpeg_pairs` in [backend/routers/images.py](../backend/routers/images.py)) hides one side of a detected pair when mode isn't `both` — orphans (no same-stem sibling in the folder) always show regardless of mode.
+
+**Decisions mirror to the hidden companion.** `_apply_decision` and `_apply_undo` in [backend/routers/decisions.py](../backend/routers/decisions.py) look up the companion via `_find_companion_image_id` and recursively apply the same decision (or undo) to it, so both files move together and the DB stays consistent even though the user only saw one tile. Guarded against re-entrancy (`_mirror=False` on the recursive call) and best-effort (a companion move failure never fails the visible photo's already-committed decision).
+
+**The companion never trains the model — this is the part that needed care.** RAW and processed renditions of the same shot score very differently on sharpness (46 vs. 99 in the motivating example), so mirroring a "keep" onto both would teach the GBR delta model contradictory sharpness labels for what is compositionally one photo. Fixed by decoupling "was this a system decision" (`is_auto`, controls auto-cull semantics) from "should this write a training sample" (`_train`, new internal-only param) — the mirrored companion call always passes `_train=False` regardless of whether the trigger was manual or auto-cull. Only the photo the user actually looked at contributes its feature vector to `training_samples`.
+
+12 new tests in `tests/test_raw_jpeg_companion.py` (mirroring, training exclusion incl. the manual-decision case, undo mirroring incl. real-filesystem move/undo round-trip, cross-folder non-pairing, orphan visibility) + 5 in `tests/test_settings_persistence.py` for the new string-setting registry. Caught and fixed a pre-existing test-fixture gap along the way: `get_setting()` always resolves against `DEFAULT_DB_PATH` unless a caller threads a different path through explicitly (same as every other single-setting reader in the codebase — `_reject_to_system_trash_enabled`, `_is_sidecar_preview_preferred` — this is fine in production since there's only ever one real DB, but `test_settings_persistence.py`'s `settings_db` fixture wasn't intercepting that explicit-argument call, so it silently read the real DB instead of the tmp one). 323/323 passing.
+
+`npm run build` clean. **Not browser-tested this session** — the backend couldn't be reached from this environment's tool sandbox during the verification pass, so the live Settings → Display click-through and a real K/M/R + undo cycle on a RAW+JPEG folder are still outstanding. Worth doing before trusting this in a real culling session.
+
+---
+
 ## Watch-folder bulk-drop meltdown → queued single-worker watcher + locked model loads (2026-07-19)
 
 Copying a full card (263 RAF+JPG files) into the watched folder wedged the whole backend: "auto-analysing pictures added to the watch folder seems to not work." Live diagnosis on the running process: 334 threads, 16 GB RSS, 258% CPU, HTTP unresponsive for 12+ minutes, ~3 files analyzed in 16 minutes.

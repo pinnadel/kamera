@@ -24,8 +24,17 @@ constants here is the cheapest fix.
 # directly. Update both this list AND
 # phase2_quality/burst_ranker.py::_DIRECT_PASS_FORMATS /
 # _RAW_FALLBACK_FORMATS when adding a new format.
+#
+# .hif is included as a directly-analyzable format (Fuji X100VI/X Half can
+# shoot HIF-only, no RAW at all — those files were previously invisible to
+# KaMeRa). But .hif is ALSO written as a sidecar next to a .RAF in RAW+HIF
+# mode, where it must stay move-only (see file_mover.py) and never get its
+# own DB row / independent analysis — that would double-count the shot and
+# double-move on decision. is_standalone_hif() below is the gate: callers
+# that walk a folder for analysis candidates must skip a .hif file that has
+# a same-stem RAW sibling.
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".raf", ".nef", ".3fr", ".png", ".tiff", ".tif",
+    ".jpg", ".jpeg", ".raf", ".nef", ".3fr", ".png", ".tiff", ".tif", ".hif",
 })
 
 # Uppercase canonical format names used in `images.format` column for
@@ -36,6 +45,56 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
 RAW_FORMATS: frozenset[str] = frozenset({
     "RAF", "NEF", "3FR", "ARW", "CR2", "CR3", "DNG",
 })
+
+# Extensions that, when found as a same-stem sibling of a .hif file, mean
+# the .hif is a camera-baked sidecar preview (not a standalone photo).
+_HIF_PAIRED_RAW_EXTS: frozenset[str] = frozenset({".raf", ".nef", ".3fr"})
+
+
+def is_standalone_hif(path) -> bool:
+    """
+    True if `path` is a .hif/.HIF file with no same-stem RAW sibling in its
+    folder — i.e. a real photo (X100VI/X Half HIF-only shooting mode), not a
+    RAW+HIF sidecar preview. Non-.hif paths always return False.
+
+    Folder is scanned once per call; callers filtering many candidates
+    should cache siblings per-directory rather than calling this in a
+    tight loop over a large folder.
+    """
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if p.suffix.lower() != ".hif":
+        return False
+    stem_lower = p.stem.lower()
+    try:
+        siblings = list(p.parent.iterdir())
+    except OSError:
+        return True
+    for sibling in siblings:
+        if sibling.suffix.lower() in _HIF_PAIRED_RAW_EXTS and sibling.stem.lower() == stem_lower:
+            return False
+    return True
+
+def is_raw_format(fmt: str | None) -> bool:
+    """True if `fmt` (an images.format value, e.g. 'RAF', 'JPG') is RAW."""
+    return bool(fmt) and fmt.upper() in RAW_FORMATS
+
+
+def companion_stem_matches(filename_a: str, filename_b: str) -> bool:
+    """
+    True if two filenames are the same shot in different formats — same stem,
+    case-insensitive (APFS default), different file. Used to pair a RAW+JPEG
+    (or RAW+standalone-HIF) capture across two independent `images` rows.
+
+    Does NOT check source_folder — callers must already have scoped the
+    comparison to the same folder (two files with the same stem in different
+    folders are unrelated shots, not a pair).
+    """
+    from pathlib import Path as _Path
+    if filename_a == filename_b:
+        return False
+    return _Path(filename_a).stem.lower() == _Path(filename_b).stem.lower()
+
 
 # Subfolder names a photo is moved INTO once a keep/maybe/reject decision is
 # made (see file_mover.resolve_dest_folder). Files here are post-decision and

@@ -455,6 +455,13 @@ export default function App() {
   const progress        = activeTab?.progress        ?? null
   const analyzeResult   = activeTab?.analyzeResult   ?? null
   const resultDismissed = activeTab?.resultDismissed ?? false
+  // Watch-live indicator (the /watch path, e.g. Provenance's Import & Analyze)
+  // — separate from `analyzing` (the /analyze-folder batch path). Files
+  // trickle in continuously so there's no fixed total; liveAnalyzed+liveLeft
+  // is a live-updating "session so far" denominator, not a real batch size.
+  const liveAnalyzing   = !analyzing && !!activeTab?.liveAnalyzing
+  const liveLeft        = activeTab?.liveLeft     ?? 0
+  const liveAnalyzed    = activeTab?.liveAnalyzed ?? 0
 
   // ── Semantic search fetch (depends on activeTab being defined above) ─────────
   useEffect(() => {
@@ -478,7 +485,9 @@ export default function App() {
 
   // ── Quit (production launcher only) ──────────────────────────────────────
   const [quitting, setQuitting] = useState(false)
+  const [quitConfirmOpen, setQuitConfirmOpen] = useState(false)
   async function quitApp() {
+    setQuitConfirmOpen(false)
     setQuitting(true)
     try { await fetch(`${API}/quit`, { method: 'POST' }) } catch (_) {}
     // Give the server 1s to shut down, then close the tab.
@@ -721,7 +730,7 @@ export default function App() {
       ensureTabForFolder(folder)
       setTabs(prev => prev.map(t =>
         t.folderPath === folder
-          ? { ...t, liveAnalyzing: true, liveLeft: watch.in_flight }
+          ? { ...t, liveAnalyzing: true, liveLeft: watch.in_flight, liveAnalyzed: watch.analyzed ?? 0 }
           : t
       ))
       return
@@ -744,7 +753,7 @@ export default function App() {
           // Truly done — clear the indicator on any tab still showing it.
           setTabs(prev => prev.map(t =>
             t.folderPath === folder && t.liveAnalyzing
-              ? { ...t, liveAnalyzing: false, liveLeft: 0 } : t
+              ? { ...t, liveAnalyzing: false, liveLeft: 0, liveAnalyzed: 0 } : t
           ))
         }
       })
@@ -2120,6 +2129,18 @@ export default function App() {
         />
       )}
 
+      {quitConfirmOpen && (
+        <ConfirmModal
+          title="Quit KaMeRa?"
+          body="This shuts down the backend server. Any in-progress analysis will be stopped."
+          confirmLabel="Quit"
+          confirmTone="danger"
+          confirmIcon={Power}
+          onCancel={() => setQuitConfirmOpen(false)}
+          onConfirm={quitApp}
+        />
+      )}
+
       {busyRequest && (() => {
         const tab = tabs.find(t => t.id === busyRequest.tabId)
         const name = tab ? tabLabel(tab) : 'another tab'
@@ -2462,7 +2483,7 @@ export default function App() {
                 Hidden in dev mode (port 5173) where the terminal is already visible. */}
             {window.location.port === '8000' && (
               <button
-                onClick={quitApp}
+                onClick={() => setQuitConfirmOpen(true)}
                 disabled={quitting}
                 className={`${BTN_ICON} hover:text-[#C97B7B] disabled:opacity-40`}
                 title="Quit KaMeRa"
@@ -2505,10 +2526,37 @@ export default function App() {
 
         {/* Band 2 — Contextual toolbar */}
         {((analyzing && progress && progress.total > 0)
+          || liveAnalyzing
           || (!analyzing && analyzeResult && !analyzeResult.error && !resultDismissed)
           || (analyzeResult?.error && !resultDismissed)
         ) && (
         <div className="px-6 py-3 space-y-2">
+
+          {/* Watch-live progress bar — same visual language as the manual
+              progress bar below, but no fixed total (files trickle in as
+              they're imported) so there's no ETA/Stop, just a live count. */}
+          {liveAnalyzing && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs font-mono text-[#8a8a8a]">
+                <span className="truncate text-[#f0f0f0]">Analyzing imported photos…</span>
+                <span className="flex items-center gap-3 text-[#9c9c9d]">
+                  <span className="text-[#8a8a8a]">
+                    {Math.round((liveAnalyzed / Math.max(1, liveAnalyzed + liveLeft)) * 100)}%
+                    &nbsp;{liveAnalyzed}/{liveAnalyzed + liveLeft}
+                  </span>
+                </span>
+              </div>
+              <div className="w-full bg-[#1b1c1e] rounded-[3px] h-1.5">
+                <div
+                  className="bg-[#5BB8D4] h-1.5 rounded-[3px] transition-all duration-300"
+                  style={{ width: `${Math.round((liveAnalyzed / Math.max(1, liveAnalyzed + liveLeft)) * 100)}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-[#9c9c9d]">
+                New photos are analyzed as they arrive — this folder is being watched live.
+              </p>
+            </div>
+          )}
 
           {/* Progress bar + Stop button */}
           {analyzing && progress && progress.total > 0 && (

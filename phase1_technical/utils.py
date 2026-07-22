@@ -22,5 +22,10 @@ def load_as_gray(image_path: str) -> np.ndarray:
     else:
         img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            raise ValueError(f"Could not load image: {image_path}")
+            # OpenCV has no built-in HEIF/HIF decoder — falls through here for
+            # .hif (and any other format Pillow can read but cv2 can't).
+            # pillow-heif's opener is registered globally in backend/main.py.
+            from PIL import Image as _PILImage
+            with _PILImage.open(image_path) as pil_img:
+                return np.array(pil_img.convert("L"))
         return img

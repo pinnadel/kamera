@@ -49,10 +49,16 @@ router = APIRouter()
 # /folders/unfinished endpoint, burst_ranker's RAW fallback) should import
 # directly from backend.constants to avoid pulling in this module's heavy
 # transitive deps (rawpy, pyiqa, torch).
-from backend.constants import SUPPORTED_EXTENSIONS, RAW_FORMATS, DECISION_SUBFOLDERS
-# .hif is intentionally excluded from SUPPORTED_EXTENSIONS — Fuji writes it
-# next to every .RAF in RAW+HIF mode. We treat HIF as a sidecar of the RAF
-# (move-only, never analyzed on its own).
+from backend.constants import (
+    SUPPORTED_EXTENSIONS,
+    RAW_FORMATS,
+    DECISION_SUBFOLDERS,
+    is_standalone_hif,
+)
+# .hif is in SUPPORTED_EXTENSIONS but only analyzed standalone (X100VI/X Half
+# HIF-only shooting). When a same-stem .RAF exists, the .hif is a RAW+HIF
+# sidecar preview — move-only, never analyzed on its own. See
+# is_standalone_hif() and backend/file_mover.py.
 
 # Sidecar preview extensions — companions written next to a RAW that hold the
 # camera's baked rendition of the same shot. Order matters: HIF is checked
@@ -725,9 +731,12 @@ def has_subfolders(folder_path: str):
             continue
         # Cheap check: does this subdir (or any descendant) contain a photo?
         for path in sub.rglob("*"):
-            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                count += 1
-                break
+            if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            if path.suffix.lower() == ".hif" and not is_standalone_hif(path):
+                continue  # RAW+HIF sidecar, not an independently analyzable photo
+            count += 1
+            break
     return {"has_subfolders": count > 0, "count": count}
 
 
@@ -752,6 +761,13 @@ def analyze_folder(request: AnalyzeFolderRequest):
     if _progress.get("running"):
         raise HTTPException(status_code=409, detail="Analysis already running")
 
+    def _is_analyzable(f: Path) -> bool:
+        if f.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return False
+        if f.suffix.lower() == ".hif" and not is_standalone_hif(f):
+            return False  # RAW+HIF sidecar — moves with its RAF, never analyzed alone
+        return True
+
     if request.include_subfolders:
         # Recursive walk. Skip the conventional decision subfolders so a
         # re-analysis doesn't suck in already-decided photos as fresh inputs.
@@ -759,13 +775,13 @@ def analyze_folder(request: AnalyzeFolderRequest):
         candidates = sorted(
             f for f in folder.rglob("*")
             if f.is_file()
-            and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            and _is_analyzable(f)
             and not any(part in skip_dirs for part in f.relative_to(folder).parts)
         )
     else:
         candidates = sorted(
             f for f in folder.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            if f.is_file() and _is_analyzable(f)
         )
     if not candidates:
         # Nothing to analyze — return immediately without touching _progress.

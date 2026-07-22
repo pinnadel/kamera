@@ -11,8 +11,10 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.constants import is_raw_format, companion_stem_matches
 from backend.database import get_db, get_folder_overrides, get_setting
 from backend.file_mover import move_photo, resolve_dest_folder, trash_photo
+from backend.routers.settings import get_raw_jpeg_display_mode
 from backend.state import _personal_model
 from phase3_learning.auto_trainer import maybe_train_async
 from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION, serialize_features
@@ -217,7 +219,43 @@ def _compute_auto_decision(
     return "reject", "threshold_reject"
 
 
-def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict:
+def _find_companion_image_id(image_row: dict) -> int | None:
+    """
+    Find the paired RAW/processed row for `image_row` (same source_folder,
+    same filename stem, opposite side of the RAW/processed split).
+
+    Used to mirror K/M/R decisions onto the hidden half of a pair when
+    raw_jpeg_display_mode isn't 'both' — see _apply_decision. Returns None
+    if no such row exists (the photo is an orphan, or has more than one
+    same-stem candidate, which we don't try to disambiguate).
+    """
+    source_folder = image_row.get("source_folder")
+    filename = image_row["filename"]
+    want_raw = not is_raw_format(image_row.get("format"))  # companion is the OTHER side
+
+    with get_db() as conn:
+        candidates = conn.execute(
+            "SELECT id, filename, format FROM images WHERE source_folder IS ? AND id != ?",
+            (source_folder, image_row["id"]),
+        ).fetchall()
+
+    matches = [
+        dict(c) for c in candidates
+        if companion_stem_matches(filename, c["filename"])
+        and is_raw_format(c["format"]) == want_raw
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]["id"]
+
+
+def _apply_decision(
+    image_id: int,
+    decision: str,
+    is_auto: bool = False,
+    _mirror: bool = True,
+    _train: bool = True,
+) -> dict:
     """
     Move the file to its destination folder and record the decision in DB.
     Shared by POST /decision and POST /auto-cull so the file-move + decisions
@@ -229,6 +267,19 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
     model never learns from its own output (a self-reinforcement loop). When
     the user later manually changes (or confirms) an auto-cull decision, that
     manual call writes the training sample as normal.
+
+    `_mirror` / `_train` are internal-only (never set by callers outside this
+    module). When raw_jpeg_display_mode hides one half of a RAW+JPEG pair,
+    the visible photo's decision mirrors onto its companion so both files
+    move together and the DB stays consistent — but the companion's own
+    feature vector is never written to training_samples (RAW vs. processed
+    sharpness/exposure differ systematically for the same shot, e.g. an
+    unprocessed RAF scoring ~46 vs. its camera JPEG scoring ~99 — mirroring
+    that pair into training would teach the model contradictory sharpness
+    labels for what is compositionally one photo). `_mirror=False` on the
+    recursive companion call prevents it from trying to mirror back;
+    `_train=False` forces the training write off for that companion call
+    regardless of is_auto.
 
     Raises HTTPException on 404 / 409 / 500.
     """
@@ -300,8 +351,8 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
         # A later manual decision on the same photo (override or confirm)
         # comes through with is_auto=False and INSERTs the sample then.
         sample_uuid = image_row.get("uuid")
-        if is_auto:
-            pass  # system decision — not a training sample
+        if is_auto or not _train:
+            pass  # system decision, or a mirrored companion write — not a training sample
         elif sample_uuid:
             try:
                 conn.execute(
@@ -335,6 +386,22 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
                 "Image %s has no UUID — skipping training_samples write", image_id
             )
 
+    # Mirror onto the paired RAW/processed companion when the display setting
+    # is hiding one side — the user only saw and judged one tile, but both
+    # files represent the same shot and should carry the same decision.
+    # Best-effort: a companion-move failure must never fail the visible
+    # photo's own (already-committed) decision.
+    if _mirror and get_raw_jpeg_display_mode() != "both":
+        companion_id = _find_companion_image_id(image_row)
+        if companion_id is not None:
+            try:
+                _apply_decision(companion_id, decision, is_auto=is_auto, _mirror=False, _train=False)
+            except HTTPException as exc:
+                logger.warning(
+                    "Companion mirror failed for image %s → %s: %s",
+                    image_id, companion_id, exc.detail,
+                )
+
     # Fire-and-forget auto-train. Internally gated by sample count and a
     # retrain-delta floor, so the daemon thread only actually runs when
     # there's meaningful new data. Never blocks the user.
@@ -361,11 +428,19 @@ def save_decision(request: DecisionRequest):
     return {"status": "ok", **result}
 
 
-@router.post("/undo-decision")
-def undo_decision(request: UndoDecisionRequest):
+def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) -> dict:
     """
     Reverse a decision: move the file back to `previous_path`, clear the
     `decisions` row, and drop the durable training_samples row keyed by UUID.
+
+    `_mirror` is internal-only: when raw_jpeg_display_mode hides one half of
+    a RAW+JPEG pair, undoing the visible photo's decision also undoes its
+    companion's mirrored decision, keeping the pair in sync (they were
+    decided together by _apply_decision, so they're undone together too).
+    The recursive companion call always passes previous_path=None — the
+    caller's previous_path is scoped to the *visible* photo's filename and
+    would be wrong for the companion, so we fall back to the same
+    parent-parent reconstruction used for photos with no supplied path.
 
     Errors:
       404 — image_id unknown.
@@ -373,9 +448,6 @@ def undo_decision(request: UndoDecisionRequest):
             or destination parent folder no longer exists.
       500 — unexpected filesystem failure during move.
     """
-    image_id      = request.image_id
-    previous_path = request.previous_path
-
     with get_db() as conn:
         image = conn.execute(
             "SELECT * FROM images WHERE id = ?",
@@ -457,12 +529,38 @@ def undo_decision(request: UndoDecisionRequest):
                     image_id, exc,
                 )
 
+    # Mirror the undo onto the paired RAW/processed companion, if any —
+    # symmetric with the mirrored decision made in _apply_decision.
+    # Best-effort: a companion with nothing to undo (409) or a missing
+    # companion file is silently skipped rather than failing this undo.
+    if _mirror and get_raw_jpeg_display_mode() != "both":
+        companion_id = _find_companion_image_id(image_row)
+        if companion_id is not None:
+            try:
+                _apply_undo(companion_id, None, _mirror=False)
+            except HTTPException as exc:
+                logger.warning(
+                    "Companion undo-mirror failed for image %s → %s: %s",
+                    image_id, companion_id, exc.detail,
+                )
+
     # Retrain the personal model so it stops weighting the undone sample.
     # Same fire-and-forget pattern as _apply_decision — gated internally on
     # sample count + retrain-delta floor, never blocks the user.
     maybe_train_async(_personal_model)
 
     return {"status": "ok", "image_id": image_id, "decision": None, "new_path": new_path}
+
+
+@router.post("/undo-decision")
+def undo_decision(request: UndoDecisionRequest):
+    """
+    Reverse a decision and immediately move the file back.
+
+    See _apply_undo for the full contract (also mirrors onto a RAW/JPEG
+    companion when raw_jpeg_display_mode hides one half of the pair).
+    """
+    return _apply_undo(request.image_id, request.previous_path)
 
 
 @router.post("/bulk-decision")

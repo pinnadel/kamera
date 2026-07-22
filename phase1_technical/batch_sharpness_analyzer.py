@@ -176,8 +176,15 @@ def detect_sharpness(image_path):
         else:
             rgb = cv2.imread(str(image_path))
             if rgb is None:
-                return None
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                # OpenCV has no built-in HEIF/HIF decoder — falls through here
+                # for .hif (and any other format Pillow can read but cv2
+                # can't). pillow-heif's opener is registered globally in
+                # backend/main.py.
+                from PIL import Image as _PILImage
+                with _PILImage.open(str(image_path)) as pil_img:
+                    rgb = np.array(pil_img.convert("RGB"))
+            else:
+                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         height, width = gray.shape

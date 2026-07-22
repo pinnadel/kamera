@@ -223,6 +223,9 @@ def main():
     parser = argparse.ArgumentParser(description="KaMeRa launcher")
     parser.add_argument("--dev", action="store_true",
                         help="Use Vite dev server instead of pre-built frontend")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Don't open the app after start (for callers like "
+                             "Provenance that open their own window)")
     args = parser.parse_args()
 
     processes: list[subprocess.Popen] = []
@@ -250,7 +253,8 @@ def main():
             sys.exit(1)
         print(" ready.")
 
-        webbrowser.open(app_url)
+        if not args.no_browser:
+            webbrowser.open(app_url)
         _run_icon(processes, app_url)
 
     except KeyboardInterrupt:

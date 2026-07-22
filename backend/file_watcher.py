@@ -34,9 +34,13 @@ log = logging.getLogger(__name__)
 # error logs (e.g. /debug/last-errors).
 ErrorCallback = Callable[[dict], None]
 
-from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS  # noqa: E402 — re-export for callers that imported from here historically
-# .hif is intentionally excluded — Fuji writes it next to every .RAF in RAW+HIF
-# mode. We treat HIF as a sidecar of the RAF (move-only, never analyzed).
+from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif  # noqa: E402 — re-export for callers that imported from here historically
+# .hif is analyzed standalone (X100VI/X Half HIF-only shooting) but skipped
+# when a same-stem .RAF sibling exists — then it's a RAW+HIF sidecar preview,
+# move-only (see file_mover.py). The standalone check happens in
+# _worker_loop AFTER the settle delay, not at event time: a card copy can
+# drop the RAF and HIF as separate events in either order, so checking too
+# early could misjudge a HIF as standalone before its RAF sibling has landed.
 
 # Delay before analyzing a newly detected file.
 # Cameras and card readers write files in chunks — analyzing mid-write gives corrupt results.
@@ -290,8 +294,11 @@ class FolderWatcher:
                 if stop_evt.is_set():
                     return
                 if path.exists():
-                    _analyze_and_store(path, self._db_path, on_error=self._on_error)
-                    analyzed = True
+                    if path.suffix.lower() == ".hif" and not is_standalone_hif(path):
+                        pass  # RAW+HIF sidecar — its RAF will carry it on decision
+                    else:
+                        _analyze_and_store(path, self._db_path, on_error=self._on_error)
+                        analyzed = True
             except Exception:
                 # _analyze_and_store handles its own errors; this guards the
                 # loop itself so one bad file can't kill the whole session.

@@ -40,6 +40,8 @@ class SettingsRequest(BaseModel):
     # PR3 boundary routing — high-variance near-boundary photos route to Maybe.
     auto_cull_uncertain_to_maybe: bool  | None = None
     uncertainty_threshold:        float | None = None
+    # RAW+JPEG pair visibility — 'raw' | 'processed' | 'both'.
+    raw_jpeg_display_mode:        str   | None = None
 
 
 class FolderSettingsRequest(BaseModel):
@@ -56,6 +58,15 @@ class FolderSettingsRequest(BaseModel):
 # Numeric setting key → (default, lo, hi).
 _NUMERIC_SETTINGS: dict[str, tuple[float, float, float]] = {}
 _BOOL_SETTINGS:    dict[str, bool] = {}
+# String/enum setting key → (default, allowed values).
+_STRING_SETTINGS:  dict[str, tuple[str, frozenset[str]]] = {
+    # Which member(s) of a RAW+JPEG (or RAW+standalone-HIF) pair appear as
+    # grid/group tiles. 'both' preserves today's behaviour (every analyzed
+    # file is its own tile). Read live by GET /images and by _apply_decision
+    # (routers/decisions.py) to decide whether a K/M/R on one member should
+    # mirror onto its companion.
+    "raw_jpeg_display_mode": ("both", frozenset({"raw", "processed", "both"})),
+}
 
 
 def _init_setting_specs() -> None:
@@ -128,7 +139,17 @@ def tunable_setting_keys() -> tuple[str, ...]:
     and reject_high_background_distraction), so callers that need the full set
     of keys must go through here, not the Pydantic model.
     """
-    return tuple(_NUMERIC_SETTINGS.keys()) + tuple(_BOOL_SETTINGS.keys())
+    return tuple(_NUMERIC_SETTINGS.keys()) + tuple(_BOOL_SETTINGS.keys()) + tuple(_STRING_SETTINGS.keys())
+
+
+def get_raw_jpeg_display_mode() -> str:
+    """Read the current value of raw_jpeg_display_mode ('raw' | 'processed' | 'both')."""
+    from backend.database import get_setting
+    default, allowed = _STRING_SETTINGS["raw_jpeg_display_mode"]
+    raw = get_setting("raw_jpeg_display_mode")
+    if raw is None or raw not in allowed:
+        return default
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +182,7 @@ def get_settings():
     Return current scoring weight + decision threshold settings with defaults
     resolved.
     """
-    all_keys = tuple(_NUMERIC_SETTINGS.keys()) + tuple(_BOOL_SETTINGS.keys())
+    all_keys = tuple(_NUMERIC_SETTINGS.keys()) + tuple(_BOOL_SETTINGS.keys()) + tuple(_STRING_SETTINGS.keys())
     placeholders = ",".join("?" * len(all_keys))
 
     with get_db() as conn:
@@ -189,6 +210,11 @@ def get_settings():
         out[key] = (raw.strip().lower() in ("1", "true", "yes", "on")) if raw is not None else default
         out[f"{key}_is_default"] = key not in overrides
 
+    for key, (default, allowed) in _STRING_SETTINGS.items():
+        raw = overrides.get(key)
+        out[key] = raw if raw in allowed else default
+        out[f"{key}_is_default"] = key not in overrides
+
     return out
 
 
@@ -206,6 +232,12 @@ def update_settings(request: SettingsRequest):
             v = getattr(request, key)
             if v is not None and not (lo <= v <= hi):
                 raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+
+    for key, (_default, allowed) in _STRING_SETTINGS.items():
+        if key in fields_set:
+            v = getattr(request, key)
+            if v is not None and v not in allowed:
+                raise HTTPException(status_code=400, detail=f"{key} must be one of {sorted(allowed)}")
 
     def _effective(field: str) -> float:
         if field in fields_set and getattr(request, field) is not None:
@@ -254,6 +286,18 @@ def update_settings(request: SettingsRequest):
                 conn.execute(
                     "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                     (key, "1" if v else "0"),
+                )
+
+        for key in _STRING_SETTINGS:
+            if key not in fields_set:
+                continue
+            v = getattr(request, key)
+            if v is None:
+                conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (key, v),
                 )
 
         if "sharpness_weight" in fields_set:

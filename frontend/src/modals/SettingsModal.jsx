@@ -130,6 +130,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   useEffect(() => {
     setRejectToTrash(settings?.reject_to_system_trash ?? false)
   }, [settings?.reject_to_system_trash])
+  const [rawJpegMode, setRawJpegMode] = useState(settings?.raw_jpeg_display_mode ?? 'both')
+  const [savingRawJpegMode, setSavingRawJpegMode] = useState(false)
+  useEffect(() => {
+    setRawJpegMode(settings?.raw_jpeg_display_mode ?? 'both')
+  }, [settings?.raw_jpeg_display_mode])
   // Advanced sort-options visibility (localStorage). Lean defaults preselected;
   // user can opt into the rest. Section collapsed by default — these are
   // power-user toggles, not first-run choices.
@@ -262,6 +267,40 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
       onToast({ type: 'error', message: 'Could not save preference — server error' })
     } finally {
       setSavingDisplay(false)
+    }
+  }
+
+  // RAW+JPEG pair visibility. Same optimistic-save pattern as the sidecar
+  // toggle above. Switching to 'raw' or 'processed' takes effect on the next
+  // GET /images refetch — the hidden half simply stops appearing in the grid,
+  // nothing is deleted or moved until a decision is actually made.
+  async function handleRawJpegModeChange(next) {
+    if (next === rawJpegMode) return
+    const prev = rawJpegMode
+    setRawJpegMode(next)
+    setSavingRawJpegMode(true)
+    try {
+      const res = await fetch(`${API}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_jpeg_display_mode: next }),
+      })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
+      await onSave()
+      onToast({
+        type: 'success',
+        message: next === 'both'
+          ? 'Showing both RAW and processed files'
+          : next === 'raw'
+            ? 'Showing RAW files only — decisions apply to the processed companion too'
+            : 'Showing processed files only — decisions apply to the RAW companion too',
+      })
+    } catch (err) {
+      console.error('RAW/JPEG display mode save failed:', err)
+      setRawJpegMode(prev)
+      onToast({ type: 'error', message: 'Could not save preference — server error' })
+    } finally {
+      setSavingRawJpegMode(false)
     }
   }
 
@@ -1218,6 +1257,44 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 Cached previews are regenerated the first time each photo is
                 viewed after the toggle changes — there’s a brief delay on the
                 next grid scroll.
+              </p>
+            </div>
+
+            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+              <p className="label mb-1">RAW+JPEG grid tiles</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
+                When a shot was taken RAW+JPEG (both files land in your
+                library as separate, independently-scored tiles), choose
+                which one shows up in grid and group view. This is separate
+                from “Preview source” above — that only swaps which image is
+                rendered for a single RAW tile, it doesn’t hide anything.
+              </p>
+
+              <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingRawJpegMode ? 'opacity-50 pointer-events-none' : ''}`}>
+                {[
+                  { key: 'raw', label: 'RAW only', title: 'Show only the uncompressed RAW/RAF/NEF/3FR file' },
+                  { key: 'processed', label: 'Processed only', title: 'Show only the compressed JPEG/HIF file' },
+                  { key: 'both', label: 'Both', title: 'Show every analyzed file as its own tile (default)' },
+                ].map(({ key, label, title }, i) => (
+                  <button
+                    key={key}
+                    onClick={() => handleRawJpegModeChange(key)}
+                    title={title}
+                    className={`px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${rawJpegMode === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
+                A photo with no companion (RAW-only or JPEG-only import)
+                always shows regardless of this setting. When set to RAW
+                only or Processed only, a K/M/R decision on the visible file
+                automatically applies to its hidden companion too, so both
+                move together — the companion's own scores are never used to
+                train your taste model, since RAW and processed renditions
+                of the same shot score very differently on sharpness.
               </p>
             </div>
 
