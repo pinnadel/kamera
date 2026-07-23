@@ -15,7 +15,7 @@ from backend.constants import is_raw_format, companion_stem_matches
 from backend.database import get_db, get_folder_overrides, get_setting
 from backend.file_mover import move_photo, resolve_dest_folder, trash_photo
 from backend.routers.settings import get_raw_jpeg_display_mode
-from backend.state import _personal_model
+from backend.state import _decision_move_lock, _personal_model
 from phase3_learning.auto_trainer import maybe_train_async
 from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION, serialize_features
 
@@ -297,38 +297,50 @@ def _apply_decision(
 
     use_system_trash = decision == "reject" and _reject_to_system_trash_enabled()
 
-    if use_system_trash:
-        try:
-            new_path = trash_photo(current_path)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"Trash failed: {exc}")
-    else:
-        # Default subfolder lives next to the photo at *ingest time* — mirrors
-        # the subfolder shape from recursive analysis (a photo in /root/Italy/
-        # goes to /root/Italy/_Keeps/ not /root/_Keeps/) while staying correct
-        # on re-decisions. Using `Path(current_path).parent` here would nest
-        # _Keeps/_Maybes/ when K→M because the photo has already been moved
-        # into _Keeps. `images.source_folder` is the durable ingest parent,
-        # captured at analysis time (analysis.py:424), so it always points to
-        # the original location regardless of intermediate moves.
-        photo_parent = source_folder or str(Path(current_path).parent)
-        overrides = get_folder_overrides(photo_parent)
-        dest_folder = resolve_dest_folder(decision, photo_parent, overrides)
+    # Hold _decision_move_lock across "file physically moved" → "images.file_path
+    # updated to match". POST /sync-folder checks Path(file_path).exists() to
+    # find rows to drop; without this lock it can read the OLD path in that
+    # exact window, see nothing there (the file's already at its new path),
+    # and delete a row for a photo that's perfectly safe on disk. See the
+    # incident note on _decision_move_lock in backend/state.py.
+    with _decision_move_lock:
+        if use_system_trash:
+            try:
+                new_path = trash_photo(current_path)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Trash failed: {exc}")
+        else:
+            # Default subfolder lives next to the photo at *ingest time* — mirrors
+            # the subfolder shape from recursive analysis (a photo in /root/Italy/
+            # goes to /root/Italy/_Keeps/ not /root/_Keeps/) while staying correct
+            # on re-decisions. Using `Path(current_path).parent` here would nest
+            # _Keeps/_Maybes/ when K→M because the photo has already been moved
+            # into _Keeps. `images.source_folder` is the durable ingest parent,
+            # captured at analysis time (analysis.py:424), so it always points to
+            # the original location regardless of intermediate moves.
+            photo_parent = source_folder or str(Path(current_path).parent)
+            overrides = get_folder_overrides(photo_parent)
+            dest_folder = resolve_dest_folder(decision, photo_parent, overrides)
 
-        try:
-            new_path = move_photo(current_path, dest_folder)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
+            try:
+                new_path = move_photo(current_path, dest_folder)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
 
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE images SET file_path = ? WHERE id = ?",
+                (new_path, image_id),
+            )
+    # Lock released — file_path on disk and in the DB agree again, so
+    # sync-folder can safely run its existence check from here on. The
+    # remaining writes (decisions, training_samples) don't touch file_path
+    # and don't need the lock.
     with get_db() as conn:
-        conn.execute(
-            "UPDATE images SET file_path = ? WHERE id = ?",
-            (new_path, image_id),
-        )
         try:
             conn.execute(
                 """
@@ -489,32 +501,37 @@ def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) 
         == os.path.normpath(previous_path).lower()
     )
 
-    new_path = current_path
-    if not already_home:
-        if not Path(current_path).exists():
-            raise HTTPException(
-                status_code=409,
-                detail="File missing — cannot undo (may be in system Trash)",
+    # Same move-then-update race as _apply_decision — see the incident note
+    # on _decision_move_lock in backend/state.py.
+    with _decision_move_lock:
+        new_path = current_path
+        if not already_home:
+            if not Path(current_path).exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="File missing — cannot undo (may be in system Trash)",
+                )
+            prev_parent = Path(previous_path).parent
+            if not prev_parent.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Source folder no longer exists: {prev_parent}",
+                )
+            try:
+                new_path = move_photo(current_path, prev_parent)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE images SET file_path = ? WHERE id = ?",
+                (new_path, image_id),
             )
-        prev_parent = Path(previous_path).parent
-        if not prev_parent.exists():
-            raise HTTPException(
-                status_code=409,
-                detail=f"Source folder no longer exists: {prev_parent}",
-            )
-        try:
-            new_path = move_photo(current_path, prev_parent)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
 
     with get_db() as conn:
         conn.execute("DELETE FROM decisions WHERE image_id = ?", (image_id,))
-        conn.execute(
-            "UPDATE images SET file_path = ? WHERE id = ?",
-            (new_path, image_id),
-        )
         # Remove the durable training_samples row so the model doesn't keep
         # learning from a judgment the user took back.
         if sample_uuid:

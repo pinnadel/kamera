@@ -16,7 +16,7 @@ from backend.constants import (
 )
 from backend.database import get_db
 from backend.routers.settings import get_raw_jpeg_display_mode
-from backend.state import PREVIEW_CACHE_DIR, _personal_model, _progress
+from backend.state import PREVIEW_CACHE_DIR, _decision_move_lock, _personal_model, _progress
 
 logger = logging.getLogger(__name__)
 
@@ -317,14 +317,19 @@ def sync_folder(request: ClearFolderRequest):
             detail="Analysis is running for this folder — wait or stop it first.",
         )
 
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, file_path FROM images WHERE source_folder = ?",
-            (request.source_folder,),
-        ).fetchall()
+    # Read + existence-check under _decision_move_lock so this can't observe a
+    # photo mid-move (file already relocated on disk, file_path not updated
+    # yet) and wrongly conclude the row is orphaned. See the incident note on
+    # _decision_move_lock in backend/state.py.
+    with _decision_move_lock:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, file_path FROM images WHERE source_folder = ?",
+                (request.source_folder,),
+            ).fetchall()
 
-    missing_ids = [r["id"] for r in rows if not Path(r["file_path"]).exists()]
-    previews_removed = _delete_image_rows(missing_ids)
+        missing_ids = [r["id"] for r in rows if not Path(r["file_path"]).exists()]
+        previews_removed = _delete_image_rows(missing_ids)
 
     return {
         "status": "synced",
