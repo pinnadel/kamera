@@ -451,6 +451,32 @@ export default function App() {
   const images          = activeTab?.images          ?? []
   const selectedIdx     = activeTab?.selectedIdx     ?? 0
   const selectedGroupId = activeTab?.selectedGroupId ?? null
+
+  // Keep selectedIdx pointed at the SAME photo when `images` is replaced out
+  // from under it — e.g. a background analysis or Watch Live poll landing new
+  // rows. The backend returns newest-first, so any arrival shifts every
+  // existing photo's index; without this, selectedIdx silently starts
+  // resolving to a different photo (grid selection ring + DetailView jump to
+  // it). We track the previously-selected photo's id and re-resolve its
+  // index whenever `images` changes, only after the user has actually
+  // selected something (mirrors userHasNavigatedRef's gate — an untouched
+  // tab's selectedIdx defaulting to 0 is fine and shouldn't fight this).
+  const selectedIdRef = useRef(null)
+  useEffect(() => {
+    if (!userHasNavigatedRef.current) return
+    const currentId = selectedIdRef.current
+    if (currentId == null) return
+    const stillAtSameIdx = images[selectedIdx]?.id === currentId
+    if (stillAtSameIdx) return
+    const newIdx = images.findIndex(img => img.id === currentId)
+    if (newIdx >= 0) setSelectedIdx(newIdx)
+    // else: the selected photo left `images` entirely (moved by a decision
+    // elsewhere) — leave selectedIdx as-is, existing decision-handling code
+    // paths already manage that case explicitly.
+  }, [images]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    selectedIdRef.current = images[selectedIdx]?.id ?? null
+  }, [images, selectedIdx])
   const analyzing       = activeTab?.status === 'analyzing'
   const progress        = activeTab?.progress        ?? null
   const analyzeResult   = activeTab?.analyzeResult   ?? null

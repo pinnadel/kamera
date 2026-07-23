@@ -441,15 +441,33 @@ export function GroupLoupe({
   // focus when the LLM rank arrives later, that would feel like the cursor
   // is jumping under the user. The amber ring/badge does shift to the LLM
   // pick; only the focused tile stays where the user put it.
+  //
+  // Guard: `best_image_id` also changes when a background analysis drops a
+  // new (higher-scoring) photo into the group the user already has open —
+  // that's not a "group changed" event from the user's POV, and shouldn't
+  // rip focus away from whatever they're looking at. So only jump to the
+  // hero when the currently-focused photo isn't (or is no longer) a member
+  // of this group; otherwise leave focusedId exactly where the user left it.
   useEffect(() => {
     if (!group) return
-    const heroId = group.best_image_id ?? sortedImages[0]?.id ?? null
-    setFocusedId(heroId)
+    let focusPreserved = false
+    setFocusedId(prev => {
+      if (prev != null && sortedImages.some(img => img.id === prev)) {
+        focusPreserved = true
+        return prev
+      }
+      return group.best_image_id ?? sortedImages[0]?.id ?? null
+    })
     // Mode is NOT reset on group change — the user's preferred view
-    // (Survey / Filmstrip) persists across loupes via localStorage.
-    setZoomOn(false)
-    setZoomOrigin({ x: 0.5, y: 0.5 })
-  }, [group?.best_image_id])
+    // (Survey / Filmstrip) persists across loupes via localStorage. Zoom
+    // likewise only resets on a real group switch, not when focus was
+    // preserved through a background photo arrival.
+    if (!focusPreserved) {
+      setZoomOn(false)
+      setZoomOrigin({ x: 0.5, y: 0.5 })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [group?.best_image_id, sortedImages])
 
   // Close View dropdown on outside click
   useEffect(() => {
