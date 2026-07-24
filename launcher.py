@@ -44,10 +44,40 @@ BACKEND_URL  = f"http://localhost:{BACKEND_PORT}"
 HEALTH_URL   = f"{BACKEND_URL}/health"
 FRONTEND_URL = "http://localhost:5173"
 
+# The KaMeRa UI is shown as an installed Chrome PWA (its own Dock icon). The
+# macOS launcher applet opens it; this launcher only owns the backend. So the
+# menu-bar "Quit" must ALSO close the PWA window — otherwise the backend dies
+# but the Chrome app-window keeps its Dock icon lit.
+#
+# The PWA runs as a Chrome "app_mode_loader" launched from its shim bundle. A
+# clean Apple-event quit (osascript / NSRunningApplication.terminate) does NOT
+# close it — Chrome ignores that for app-mode windows. The reliable, safe lever
+# is pkill matched on the shim's UNIQUE executable path: the regular Chrome
+# browser runs from a different path (Google Chrome.app/…/Google Chrome), so
+# this never touches the user's browser or other PWAs. The app-id / _crx_
+# marker is NOT in the loader's matchable args, so don't match on those.
+PWA_LOADER_PATH = "Chrome Apps.localized/KaMeRa.app/Contents/MacOS/app_mode_loader"
+
 
 # ---------------------------------------------------------------------------
 # Setup helpers
 # ---------------------------------------------------------------------------
+
+def _close_pwa_window():
+    """Close the KaMeRa Chrome PWA window (macOS only; no-op elsewhere).
+
+    Kills the app_mode_loader by its unique shim path so the Dock icon clears.
+    Scoped to KaMeRa's own bundle path — never the user's regular Chrome.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            ["pkill", "-f", PWA_LOADER_PATH],
+            timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 def _ensure_venv():
     if PYTHON.exists():
@@ -136,8 +166,24 @@ def _generate_icon(path: Path):
 # ---------------------------------------------------------------------------
 
 def _run_menubar_macos(processes: list, app_url: str):
-    """Native macOS menu-bar app using rumps. Blocks until Quit."""
+    """Native macOS menu-bar app using rumps. Blocks until Quit.
+
+    Runs as an "accessory" app (LSUIElement): a menu-bar icon with NO Dock
+    icon. Without this, rumps' NSApplication defaults to a regular app and
+    shows a generic Python "rocket" icon in the Dock next to the real KaMeRa
+    launcher-applet icon. Setting the activation policy to Accessory before
+    the run loop starts keeps only the menu-bar presence.
+    """
     import rumps
+    from AppKit import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+    )
+
+    # Must be set before rumps builds the app / enters its run loop.
+    NSApplication.sharedApplication().setActivationPolicy_(
+        NSApplicationActivationPolicyAccessory
+    )
 
     icon_path = _ensure_icon()
 
@@ -155,6 +201,7 @@ def _run_menubar_macos(processes: list, app_url: str):
             webbrowser.open(app_url)
 
         def quit_app(self, _):
+            _close_pwa_window()   # close the Chrome PWA window too (clears its Dock icon)
             for p in processes:
                 try:
                     p.terminate()
