@@ -147,7 +147,7 @@ For curious readers — a quick map of how it works.
 | Phase 2 ML | MediaPipe · pyiqa (TOPIQ) · SigLIP-2 · FaceNet · LAION aesthetic predictor |
 | Phase 3 ML | scikit-learn GBR · NumPy |
 | LLM | Ollama (local daemon) + qwen2.5vl:7b vision model |
-| Launcher | rumps (macOS menu bar) · pystray (Windows / Linux tray) |
+| Launcher | headless PWA-watch loop (macOS) · pystray (Windows / Linux tray) |
 
 **How the personal model works**
 

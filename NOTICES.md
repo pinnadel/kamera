@@ -31,7 +31,6 @@ Nothing in KaMeRa transmits photos, metadata, or telemetry to any third party. A
 | openai (Python SDK) | Apache 2.0 | https://github.com/openai/openai-python |
 | python-dotenv | BSD-3-Clause | https://github.com/theskumar/python-dotenv |
 | pystray | LGPLv3 | https://github.com/moses-palmer/pystray |
-| rumps | BSD-3-Clause | https://github.com/jaredks/rumps |
 
 **LGPLv3 note (pystray):** KaMeRa imports `pystray` dynamically as an unmodified PyPI package. No source modifications are made.
 

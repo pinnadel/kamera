@@ -66,9 +66,8 @@ openai>=1.0.0
 # Trash utility — send files to macOS Trash (recoverable), used by POST /trash-rejects
 send2trash>=1.8.0
 
-# Launcher — menu bar / tray icon
-pystray>=0.19.0   # Windows / Linux tray icon
-rumps>=0.4.0      # macOS-native menu bar app (ignored on other platforms)
+# Launcher — Windows / Linux tray icon (macOS launcher is headless, no tray dep)
+pystray>=0.19.0
 
 # Environment
 python-dotenv==1.2.2

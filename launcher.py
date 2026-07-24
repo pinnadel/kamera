@@ -2,8 +2,9 @@
 KaMeRa — launcher.
 
 Starts the FastAPI backend silently, waits until it is healthy, then opens
-the app in the default browser. A menu-bar / tray icon lets the user open
-the app again or quit cleanly.
+the app in the default browser. On macOS the launcher then runs headless,
+watching the KaMeRa PWA window and quitting the backend when it closes. On
+Windows/Linux a tray icon lets the user open the app again or quit cleanly.
 
 Usage:
     python launcher.py          # normal launch (pre-built frontend)
@@ -28,7 +29,6 @@ FRONTEND     = ROOT / "frontend"
 DIST         = FRONTEND / "dist"
 REQUIREMENTS = ROOT / "requirements.txt"
 ICON_PATH    = ROOT / "launcher" / "icon.png"   # PNG for pystray (Windows/Linux)
-ICNS_PATH    = ROOT / "launcher" / "icon.icns"  # icns for rumps (macOS)
 
 if sys.platform == "win32":
     PYTHON  = VENV / "Scripts" / "python.exe"
@@ -44,18 +44,13 @@ BACKEND_URL  = f"http://localhost:{BACKEND_PORT}"
 HEALTH_URL   = f"{BACKEND_URL}/health"
 FRONTEND_URL = "http://localhost:5173"
 
-# The KaMeRa UI is shown as an installed Chrome PWA (its own Dock icon). The
-# macOS launcher applet opens it; this launcher only owns the backend. So the
-# menu-bar "Quit" must ALSO close the PWA window — otherwise the backend dies
-# but the Chrome app-window keeps its Dock icon lit.
-#
-# The PWA runs as a Chrome "app_mode_loader" launched from its shim bundle. A
-# clean Apple-event quit (osascript / NSRunningApplication.terminate) does NOT
-# close it — Chrome ignores that for app-mode windows. The reliable, safe lever
-# is pkill matched on the shim's UNIQUE executable path: the regular Chrome
-# browser runs from a different path (Google Chrome.app/…/Google Chrome), so
-# this never touches the user's browser or other PWAs. The app-id / _crx_
-# marker is NOT in the loader's matchable args, so don't match on those.
+# The KaMeRa UI is shown as an installed Chrome PWA with its own Dock icon,
+# running as a Chrome "app_mode_loader" launched from its shim bundle. The
+# launcher only owns the backend process, so it watches this process to know
+# when the user has quit the app (see _watch_pwa_macos below) and tears the
+# backend down in response. Matched on the shim's UNIQUE executable path: the
+# regular Chrome browser runs from a different path (Google Chrome.app/…/
+# Google Chrome), so this never matches the user's browser or other PWAs.
 PWA_LOADER_PATH = "Chrome Apps.localized/KaMeRa.app/Contents/MacOS/app_mode_loader"
 
 
@@ -63,21 +58,16 @@ PWA_LOADER_PATH = "Chrome Apps.localized/KaMeRa.app/Contents/MacOS/app_mode_load
 # Setup helpers
 # ---------------------------------------------------------------------------
 
-def _close_pwa_window():
-    """Close the KaMeRa Chrome PWA window (macOS only; no-op elsewhere).
-
-    Kills the app_mode_loader by its unique shim path so the Dock icon clears.
-    Scoped to KaMeRa's own bundle path — never the user's regular Chrome.
-    """
-    if sys.platform != "darwin":
-        return
+def _pwa_is_running() -> bool:
+    """True while the KaMeRa PWA window's app_mode_loader process is alive."""
     try:
-        subprocess.run(
-            ["pkill", "-f", PWA_LOADER_PATH],
+        result = subprocess.run(
+            ["pgrep", "-f", PWA_LOADER_PATH],
             timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        return result.returncode == 0
     except Exception:
-        pass
+        return True  # can't tell — assume alive rather than tearing down early
 
 def _ensure_venv():
     if PYTHON.exists():
@@ -137,7 +127,7 @@ def _wait_for_backend(timeout: int = 60) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Icon image — written to disk so macOS rumps can find it
+# Icon image — written to disk so pystray (Windows/Linux) can find it
 # ---------------------------------------------------------------------------
 
 def _ensure_icon() -> str:
@@ -162,54 +152,35 @@ def _generate_icon(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Menu-bar icon — rumps (macOS) or pystray (Windows / Linux)
+# Supervisor — headless PWA watcher (macOS) or pystray tray icon (Windows / Linux)
 # ---------------------------------------------------------------------------
 
-def _run_menubar_macos(processes: list, app_url: str):
-    """Native macOS menu-bar app using rumps. Blocks until Quit.
+PWA_POLL_SECONDS = 2
 
-    Runs as an "accessory" app (LSUIElement): a menu-bar icon with NO Dock
-    icon. Without this, rumps' NSApplication defaults to a regular app and
-    shows a generic Python "rocket" icon in the Dock next to the real KaMeRa
-    launcher-applet icon. Setting the activation policy to Accessory before
-    the run loop starts keeps only the menu-bar presence.
+def _watch_pwa_macos(processes: list, app_url: str):
+    """Headless supervisor: no menu-bar icon, no Dock icon of its own.
+
+    KaMeRa opens as an installed Chrome PWA with its OWN Dock icon — quitting
+    the app from the Dock (right-click → Quit, or Cmd+Q on the PWA window) is
+    the natural way a user ends a mac app. This loop polls whether that PWA
+    process is still alive; once it's gone, the backend has no reason to keep
+    running, so we terminate it and exit. This replaces an earlier menu-bar
+    icon (rumps) that duplicated "Quit" as a separate, easy-to-miss control
+    and left a redundant "Open KaMeRa" that just spawned a second window.
+
+    First poll waits PWA_POLL_SECONDS before checking, giving the just-opened
+    PWA process time to actually launch.
     """
-    import rumps
-    from AppKit import (
-        NSApplication,
-        NSApplicationActivationPolicyAccessory,
-    )
+    while True:
+        time.sleep(PWA_POLL_SECONDS)
+        if not _pwa_is_running():
+            break
 
-    # Must be set before rumps builds the app / enters its run loop.
-    NSApplication.sharedApplication().setActivationPolicy_(
-        NSApplicationActivationPolicyAccessory
-    )
-
-    icon_path = _ensure_icon()
-
-    class PCAApp(rumps.App):
-        def __init__(self):
-            icns = str(ICNS_PATH) if ICNS_PATH.exists() else icon_path
-            super().__init__("KaMeRa", icon=icns, quit_button=None)
-            self.menu = [
-                rumps.MenuItem("Open KaMeRa", callback=self.open_app),
-                None,  # separator
-                rumps.MenuItem("Quit", callback=self.quit_app),
-            ]
-
-        def open_app(self, _):
-            webbrowser.open(app_url)
-
-        def quit_app(self, _):
-            _close_pwa_window()   # close the Chrome PWA window too (clears its Dock icon)
-            for p in processes:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
-            rumps.quit_application()
-
-    PCAApp().run()
+    for p in processes:
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 
 def _run_tray_pystray(processes: list, app_url: str):
@@ -242,14 +213,20 @@ def _run_tray_pystray(processes: list, app_url: str):
     icon.run()
 
 
-def _run_icon(processes: list, app_url: str):
+def _run_supervisor(processes: list, app_url: str):
+    """Block until the app should quit, then terminate `processes`.
+
+    macOS: headless — watches the PWA window's process (see _watch_pwa_macos).
+    Windows/Linux: no installed-PWA equivalent, so keep the pystray tray icon
+    with a manual Quit.
+    """
     try:
         if sys.platform == "darwin":
-            _run_menubar_macos(processes, app_url)
+            _watch_pwa_macos(processes, app_url)
         else:
             _run_tray_pystray(processes, app_url)
     except Exception as e:
-        print(f"Menu-bar icon unavailable ({e}). Press Ctrl+C to quit.")
+        print(f"Supervisor unavailable ({e}). Press Ctrl+C to quit.")
         try:
             processes[0].wait()
         except (KeyboardInterrupt, IndexError):
@@ -302,7 +279,7 @@ def main():
 
         if not args.no_browser:
             webbrowser.open(app_url)
-        _run_icon(processes, app_url)
+        _run_supervisor(processes, app_url)
 
     except KeyboardInterrupt:
         pass
