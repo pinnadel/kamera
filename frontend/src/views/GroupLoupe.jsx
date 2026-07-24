@@ -11,6 +11,7 @@ import { ViewPill } from '../ui/ViewPill'
 import { THUMB_ASPECT, FILMSTRIP_CHROME_BARE, stripHeight } from '../ui/filmstripMetrics'
 import { Filmstrip } from '../ui/Filmstrip'
 import { useMultiSelect } from '../hooks/useMultiSelect'
+import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // GroupLoupe — full-screen workspace for triaging one similarity group.
 //
@@ -1343,7 +1344,7 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
   //   3. hero (no decision yet) → ring-2 amber
   //   4. default → faint white hover
   const ring = (() => {
-    if (isMultiSelected || isFocused) return 'ring-1 ring-[#5BB8D4]'
+    if (isMultiSelected || isFocused) return SELECTION_RING
     const dec = img.decision
     if (dec === 'keep')   return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(125,184,154,0.55)] hover:ring-[rgba(125,184,154,0.75)]`
     if (dec === 'maybe')  return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(232,184,74,0.55)] hover:ring-[rgba(232,184,74,0.75)]`
@@ -1480,7 +1481,7 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
           const notLlmEvaluated = wasFiltered && evaluatedSet ? !evaluatedSet.has(img.id) : false
           // Same ring priority as SurveyTile — keep these in sync.
           const ring = (() => {
-            if (isMultiSelected || isFocused) return 'ring-1 ring-[#5BB8D4]'
+            if (isMultiSelected || isFocused) return SELECTION_RING
             const dec = img.decision
             if (dec === 'keep')   return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(125,184,154,0.55)] hover:ring-[rgba(125,184,154,0.75)]`
             if (dec === 'maybe')  return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(232,184,74,0.55)] hover:ring-[rgba(232,184,74,0.75)]`
@@ -1586,8 +1587,8 @@ function RailGroupTile({ group, isOpen, isPickTarget, isDropHover, onClick, onDr
   }, [isOpen])
   if (!hero) return null
   let ring
-  if (isDropHover)    ring = 'ring-[3px] ring-[#5BB8D4]'
-  else if (isOpen)    ring = 'ring-1 ring-[#5BB8D4]'
+  if (isDropHover)    ring = SELECTION_RING_STRONG
+  else if (isOpen)    ring = SELECTION_RING
   else if (isPickTarget) ring = 'ring-1 ring-[rgba(91,184,212,0.55)] hover:ring-[#5BB8D4]'
   else                ring = 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.18)]'
   return (

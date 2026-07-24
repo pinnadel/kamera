@@ -3,6 +3,7 @@ import { Check } from 'lucide-react'
 import { API } from '../api'
 import { HighlightedText } from '../ui/primitives'
 import { middleTruncate } from '../ui/format'
+import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // ImageCard — one tile in the grid.
 //
@@ -63,8 +64,8 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   // True when this tile sits inside a shared group-run border (Rejects/Maybes).
   // The group border is an outer coral/amber frame drawn by App.jsx; a normal
   // (outset) cyan selection ring would collide with it in the grid gutter, so
-  // when set we draw the interaction ring INSET — it hugs the inside of the
-  // tile and reads as "selected within the group" without fighting the frame.
+  // when set, selection is instead drawn as an absolute-overlay border that
+  // hugs the inside of the tile — see `selectionOverlayBorder` below.
   inGroupBorder = false,
 }) {
   // Per-card load state. RAW previews are generated on first /previews/<id>
@@ -80,21 +81,28 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   //
   // Inside a shared group border the per-tile rings would draw vertical lines
   // in the gutter between members, breaking the single-enclosure read. So when
-  // `inGroupBorder`: (1) the cyan interaction rings are drawn INSET so they hug
-  // the tile instead of clashing with the frame, and (2) the decision ring is
-  // dropped entirely — every run member shares the view's decision, which the
-  // group frame's colour already conveys.
-  const inset = inGroupBorder ? ' ring-inset' : ''
+  // `inGroupBorder`, selection is drawn as a separate absolute-overlay real
+  // `border` (`selectionOverlayBorder`, rendered in the JSX below) instead of
+  // this box-shadow ring — a box-shadow ring-inset would paint UNDER the
+  // opaque, edge-to-edge image content and be invisible. The decision ring is
+  // also dropped entirely inside a group run: every member shares the view's
+  // decision, which the group frame's colour already conveys.
   let border
-  if (isDropHover) {
-    border = `ring-[3px] ring-[#5BB8D4] scale-[1.02]${inset}`
-  } else if (isMultiSelected) {
-    border = `ring-1 ring-[#5BB8D4]${inset}`
-  } else if (isSelected) {
-    border = `ring-1 ring-[#5BB8D4]${inset}`
-  } else if (inGroupBorder) {
+  let selectionOverlayBorder = null
+  if (inGroupBorder) {
+    if (isDropHover) {
+      selectionOverlayBorder = 'border-[3px] border-[#5BB8D4]'
+    } else if (isMultiSelected || isSelected) {
+      selectionOverlayBorder = 'border-2 border-[#5BB8D4]'
+    }
     // No per-tile decision ring — the group frame is the boundary.
     border = ''
+  } else if (isDropHover) {
+    border = `${SELECTION_RING_STRONG} scale-[1.02]`
+  } else if (isMultiSelected) {
+    border = SELECTION_RING
+  } else if (isSelected) {
+    border = SELECTION_RING
   } else if (image.decision === 'keep') {
     border = 'ring-1 ring-[rgba(125,184,154,0.40)] hover:ring-[rgba(125,184,154,0.65)]'
   } else if (image.decision === 'maybe') {
@@ -147,11 +155,27 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
 
   return (
     <div
-      className={`bg-[#161718] rounded-lg overflow-hidden transition-all flex items-stretch ${border} ${dimmedBySelectMode || rejectedOpacity} ${dragCursor}`}
+      className={`relative bg-[#161718] rounded-lg overflow-hidden transition-all flex items-stretch ${border} ${dimmedBySelectMode || rejectedOpacity} ${dragCursor}`}
       draggable={draggable}
       onDragStart={draggable ? onDragStart : undefined}
       onDragEnd={draggable ? onDragEnd : undefined}
     >
+      {/* Selection ring, grouped-tile case only: a real `border` (not a
+          box-shadow ring) drawn as a separate ABSOLUTE overlay on top of all
+          other children. A box-shadow ring-inset here would get painted UNDER
+          the opaque, edge-to-edge image block and be invisible; an absolute
+          overlay always paints last regardless of the flush layout beneath
+          it, and `border` (vs. `inset` box-shadow) needs no z-order help
+          because it's the topmost sibling in DOM order. z-20 clears the
+          select-mode check badge (z auto) and shimmer overlay. No layout
+          shift: this is overlaid, not part of the box model, so the image
+          never resizes when selected. */}
+      {selectionOverlayBorder && (
+        <div
+          aria-hidden="true"
+          className={`pointer-events-none absolute inset-0 z-20 rounded-lg ${selectionOverlayBorder}`}
+        />
+      )}
       {/* Left column — image + optional footer. `min-w-0` so the flex child can
           shrink to make room for the right-edge bar without overflowing. */}
       <div className="min-w-0 flex-1">

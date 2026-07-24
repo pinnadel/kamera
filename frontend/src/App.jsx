@@ -3251,7 +3251,17 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative' : ''}`}
+                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative' : ''}${
+                    // Selection must win visually over the group-run border overlay
+                    // below (z-10, amber/coral) — otherwise the cyan ring is painted
+                    // first and gets covered on 3 of 4 edges, leaving only the
+                    // unclipped corner near the footer visible. Bumping the whole
+                    // tile above both the border overlay and the partner chip
+                    // (z-20) lets ImageCard's ring paint fully on top.
+                    (!gridMultiSelect.isSelectMode && selectedGroupId == null && item.image.id === images[selectedIdx]?.id) ||
+                    gridMultiSelect.selected.has(item.image.id)
+                      ? ' z-30' : ''
+                  }`}
                   onFocus={() => {
                     const i = images.findIndex(img => img.id === item.image.id)
                     if (selectedGroupId == null && selectedIdx === i) return

@@ -61,3 +61,20 @@ export const BTN_ICON          = 'inline-flex items-center justify-center w-9 h-
 // rings are a separate vocabulary; leave them alone.
 export const ACTIVE_PILL   = 'bg-[rgba(91,184,212,0.12)] border-[rgba(91,184,212,0.30)] text-[#5BB8D4] font-bold'
 export const ACTIVE_TOGGLE = 'text-[#5BB8D4] font-bold'
+
+// ── Selection ring (single source of truth) ────────────────────────────────
+// The cyan "this is the currently-selected photo" ring, used on every
+// thumbnail across the grid, GroupLoupe, DetailView filmstrip, CompareView,
+// and PairwiseTrainingView. Was previously `ring-1` (1px), independently
+// hand-copied into 10+ call sites with no shared constant — bumped to `ring-2`
+// (2px) for legibility and consolidated here so all sites stay in sync.
+//
+//   SELECTION_RING         — standard selected/focused/multi-selected state.
+//   SELECTION_RING_STRONG  — heavier variant for drop-hover (an active drag
+//     target), kept visually louder than a plain selection.
+//   SELECTION_RING_INSET   — same ring, drawn inward. Use inside a shared
+//     group-run border (grid) so the cyan ring hugs the tile instead of
+//     colliding with the group frame in the gutter.
+export const SELECTION_RING        = 'ring-2 ring-[#5BB8D4]'
+export const SELECTION_RING_STRONG = 'ring-[3px] ring-[#5BB8D4]'
+export const SELECTION_RING_INSET  = 'ring-2 ring-[#5BB8D4] ring-inset'

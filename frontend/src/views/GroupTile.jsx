@@ -2,6 +2,7 @@ import { memo } from 'react'
 import { API } from '../api'
 import { middleTruncate } from '../ui/format'
 import { GroupOverlayChips } from '../ui/TileChips'
+import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // GroupTile — a single grid cell standing in for the UNDECIDED remainder of a
 // similarity group.
@@ -55,9 +56,9 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
   // selection still win; select-mode disabled dims the whole tile.
   let ringClass
   if (isDropHover) {
-    ringClass = 'ring-[3px] ring-[#5BB8D4] scale-[1.02]'
+    ringClass = `${SELECTION_RING_STRONG} scale-[1.02]`
   } else if (isSelected) {
-    ringClass = 'ring-1 ring-[#5BB8D4]'
+    ringClass = SELECTION_RING
   } else {
     ringClass = 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.18)]'
   }

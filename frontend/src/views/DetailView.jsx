@@ -21,6 +21,7 @@ import { THUMB_ASPECT, FILMSTRIP_CHROME_WITH_BADGES, stripHeight } from '../ui/f
 import { Filmstrip, FILMSTRIP_TOOLBAR_HEIGHT } from '../ui/Filmstrip'
 import { CollapsibleSection, Chevron } from '../ui/CollapsibleSection'
 import { useLocalStorageState } from '../hooks/useLocalStorageState'
+import { SELECTION_RING } from '../ui/buttons'
 
 // Fullscreen photo zoom cycle — same model as GroupLoupe + CompareView so
 // click-on-photo behaves consistently app-wide. 1× = fit-to-viewport.
@@ -549,7 +550,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
             const isFocused = img.id === image.id
             const isHero    = img.id === groupContext.best_image_id
             const ring = isFocused
-              ? 'ring-1 ring-[#5BB8D4]'
+              ? SELECTION_RING
               : isHero
                 ? 'ring-1 ring-[rgba(255,255,255,0.20)]'
                 : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.20)]'
@@ -960,7 +961,7 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
       renderThumb={(item, idx) => {
         const isFocused = idx === focusedIndex
         const ring = isFocused
-          ? 'ring-1 ring-[#5BB8D4]'
+          ? SELECTION_RING
           : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.20)]'
         if (item.type === 'group') {
           const group = item.group

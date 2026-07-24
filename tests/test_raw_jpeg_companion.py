@@ -45,17 +45,18 @@ def _insert_image(
     fmt: str,
     source_folder: str = "/fake/source",
     overall_score: float = 80.0,
+    sharpness_score: float = 80.0,
 ) -> None:
     """Minimal analyzed image row sufficient for _apply_decision / list_images."""
     with get_db(db_path) as conn:
         conn.execute(
             """
             INSERT INTO images (id, file_path, filename, uuid, source_folder,
-                                format, overall_score, analysis_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'done')
+                                format, overall_score, sharpness_score, analysis_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'done')
             """,
             (image_id, f"{source_folder}/{filename}", filename, uuid,
-             source_folder, fmt, overall_score),
+             source_folder, fmt, overall_score, sharpness_score),
         )
 
 
@@ -192,6 +193,31 @@ def test_auto_cull_mirror_also_skips_training(
     assert _decision(patched, 2) == "reject"
     assert _sample_count(patched, "raw-3") == 0
     assert _sample_count(patched, "jpg-3") == 0
+
+
+def test_auto_cull_scores_each_side_of_a_pair_independently(
+    patched: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for a bug where POST /auto-cull, run while
+    raw_jpeg_display_mode hid one side of a RAW+JPEG pair, mirrored
+    _apply_decision's companion write onto BOTH sides after each had already
+    been independently scored — so a camera JPEG correctly decided 'keep'
+    got silently overwritten with its much-lower-scoring RAW twin's 'reject'
+    (or vice versa, depending on loop order). Real-world case: a JPEG with
+    overall_score=99.7 landed as 'maybe' because its RAF sibling scored 53.2.
+
+    run_auto_cull must call _apply_decision with _mirror=False so each row's
+    own _compute_auto_decision verdict sticks, regardless of display mode."""
+    _set_mode(monkeypatch, "raw")
+    _insert_image(patched, image_id=1, uuid="raw-5", filename="DSCF5000.RAF",
+                  fmt="RAF", overall_score=30.0, sharpness_score=30.0)  # → reject
+    _insert_image(patched, image_id=2, uuid="jpg-5", filename="DSCF5000.JPG",
+                  fmt="JPG", overall_score=99.0, sharpness_score=99.0)  # → keep
+
+    decisions_mod.run_auto_cull()
+
+    assert _decision(patched, 1) == "reject"
+    assert _decision(patched, 2) == "keep"
 
 
 def test_mirror_only_pairs_within_same_source_folder(

@@ -965,12 +965,23 @@ def run_auto_cull(source_folder: str | None = None):
         })
 
     # Phase 3: apply the decisions (now post-promotion).
+    #
+    # _mirror=False here is deliberate: every row (RAW and processed alike)
+    # already went through _compute_auto_decision independently above, using
+    # its own scores. Letting _apply_decision mirror one side's decision onto
+    # its companion would silently overwrite that independent verdict with
+    # whichever sibling happened to be applied second in this loop — e.g. a
+    # camera JPEG scoring personal_score=100 ("keep") getting dragged down to
+    # match its un-demosaiced RAW twin scoring ~35 ("maybe"), even though both
+    # were correctly scored on their own. Manual K/M/X from the UI still
+    # mirrors (see POST /decision) because there the user only ever judges
+    # one visible tile and both files should follow that single verdict.
     counts: dict[str, int] = {"keep": 0, "maybe": 0, "reject": 0}
     errors: list[dict] = []
     for row in rows_dicts:
         decision = decisions[row["id"]]
         try:
-            _apply_decision(row["id"], decision, is_auto=True)
+            _apply_decision(row["id"], decision, is_auto=True, _mirror=False)
             counts[decision] += 1
         except HTTPException as exc:
             errors.append({"id": row["id"], "error": exc.detail})
