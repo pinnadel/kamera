@@ -42,6 +42,8 @@ class SettingsRequest(BaseModel):
     uncertainty_threshold:        float | None = None
     # RAW+JPEG pair visibility — 'raw' | 'processed' | 'both'.
     raw_jpeg_display_mode:        str   | None = None
+    # Analysis scope — 'full' | 'jpeg_priority'.
+    analysis_mode:                str   | None = None
 
 
 class FolderSettingsRequest(BaseModel):
@@ -66,6 +68,18 @@ _STRING_SETTINGS:  dict[str, tuple[str, frozenset[str]]] = {
     # (routers/decisions.py) to decide whether a K/M/R on one member should
     # mirror onto its companion.
     "raw_jpeg_display_mode": ("both", frozenset({"raw", "processed", "both"})),
+    # 'jpeg_priority' skips scoring a RAW file (RAF/NEF/3FR) when a same-stem
+    # processed sibling exists in the same folder — any of .jpg/.jpeg/.hif/
+    # .png/.tif/.tiff, not just JPEG (see constants.py::has_processed_sibling
+    # / _PROCESSED_SIBLING_EXTS; the setting value keeps the 'jpeg_priority'
+    # name for backward compatibility with already-saved settings rows). The
+    # RAW still gets a lightweight images row (analysis_status='skipped') so
+    # K/M/R decisions mirror onto it and it moves with its sibling, it just
+    # never runs the scorers. A RAW with no sibling is always analyzed in
+    # full regardless of this setting (nothing else to cull from). Read live
+    # by _scan_candidates/_is_analyzable (routers/analysis.py) and
+    # file_watcher.py.
+    "analysis_mode": ("full", frozenset({"full", "jpeg_priority"})),
 }
 
 
@@ -147,6 +161,16 @@ def get_raw_jpeg_display_mode() -> str:
     from backend.database import get_setting
     default, allowed = _STRING_SETTINGS["raw_jpeg_display_mode"]
     raw = get_setting("raw_jpeg_display_mode")
+    if raw is None or raw not in allowed:
+        return default
+    return raw
+
+
+def get_analysis_mode() -> str:
+    """Read the current value of analysis_mode ('full' | 'jpeg_priority')."""
+    from backend.database import get_setting
+    default, allowed = _STRING_SETTINGS["analysis_mode"]
+    raw = get_setting("analysis_mode")
     if raw is None or raw not in allowed:
         return default
     return raw

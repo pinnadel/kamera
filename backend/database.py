@@ -536,6 +536,38 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
     # default. No-op if it was never set.
     (48, "Drop write_xmp_ratings setting row",
          "DELETE FROM settings WHERE key = 'write_xmp_ratings'"),
+    # v49: Record WHY each current decision was made. The reason names the rule
+    # that fired ('manual', 'auto', 'uncertain', 'burst_keep_guarantee',
+    # 'closed_eyes', 'personal_keep', …). This is CURRENT-STATE only — it lives
+    # on the decisions row and is overwritten on re-decision and deleted when
+    # the tab/analysis is cleared. For durable history see auto_decision_log
+    # (v50). Nullable: pre-existing decision rows have no recorded reason.
+    (49, "Add reason column to decisions",
+         "ALTER TABLE decisions ADD COLUMN reason TEXT"),
+    # v50: Durable append-only audit of every decision (auto AND manual). Unlike
+    # the decisions table, rows here are NEVER overwritten or deleted by closing
+    # a tab / Clear Analysis — keyed on sample_uuid with no FK to images, same
+    # survival semantics as training_samples and shooting_log. This is what
+    # answers "how often does each auto-cull path fire" and "how often do I
+    # override an auto-decision" (is_auto flag + the later manual row on the
+    # same uuid). Append-only: no UNIQUE on sample_uuid, because one photo
+    # legitimately gets many log rows over its life (auto-reject → manual keep).
+    (50, "Create auto_decision_log table",
+         """
+         CREATE TABLE IF NOT EXISTS auto_decision_log (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             sample_uuid   TEXT,
+             image_id      INTEGER,
+             decision      TEXT    NOT NULL CHECK (decision IN ('keep', 'maybe', 'reject')),
+             reason        TEXT,
+             is_auto       INTEGER NOT NULL DEFAULT 0,
+             decided_at    DATETIME NOT NULL DEFAULT (DATETIME('now'))
+         )
+         """),
+    (50, "Index on auto_decision_log.sample_uuid",
+         "CREATE INDEX IF NOT EXISTS idx_auto_decision_log_uuid ON auto_decision_log(sample_uuid)"),
+    (50, "Index on auto_decision_log.decided_at",
+         "CREATE INDEX IF NOT EXISTS idx_auto_decision_log_decided_at ON auto_decision_log(decided_at)"),
 ]
 
 
@@ -753,7 +785,7 @@ CREATE TABLE IF NOT EXISTS images (
     shake_detected      INTEGER DEFAULT 0,          -- 1 = likely camera shake (SQLite has no BOOL)
 
     -- Pipeline state
-    analysis_status     TEXT    NOT NULL DEFAULT 'pending',  -- 'pending' | 'done' | 'error'
+    analysis_status     TEXT    NOT NULL DEFAULT 'pending',  -- 'pending' | 'done' | 'error' | 'skipped'
     imported_at         DATETIME NOT NULL DEFAULT (DATETIME('now'))
 );
 

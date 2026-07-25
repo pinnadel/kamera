@@ -78,6 +78,38 @@ def test_resolve_dest_folder_partial_override_fallback(tmp_path: Path) -> None:
     assert result == Path(SOURCE_FOLDER) / "_Trash"
 
 
+# ---------------------------------------------------------------------------
+# resolve_dest_folder — reviewed=True (PLAN-keeps-reviewed Piece 1)
+# ---------------------------------------------------------------------------
+
+def test_resolve_dest_folder_reviewed_default_keep() -> None:
+    """reviewed=True nests _Keeps_reviewed under the default _Keeps folder."""
+    result = resolve_dest_folder("keep", SOURCE_FOLDER, overrides=None, reviewed=True)
+    assert result == Path(SOURCE_FOLDER) / "_Keeps" / "_Keeps_reviewed"
+
+
+def test_resolve_dest_folder_reviewed_with_override(tmp_path: Path) -> None:
+    """reviewed=True nests _Keeps_reviewed under an overridden keep folder too."""
+    custom = str(tmp_path / "NAS" / "Keeps")
+    overrides = {"keeps_folder": custom}
+    result = resolve_dest_folder("keep", SOURCE_FOLDER, overrides=overrides, reviewed=True)
+    assert result == Path(custom) / "_Keeps_reviewed"
+
+
+def test_resolve_dest_folder_reviewed_false_is_unaffected() -> None:
+    """reviewed=False (the default) behaves exactly as before — no nesting."""
+    result = resolve_dest_folder("keep", SOURCE_FOLDER, overrides=None, reviewed=False)
+    assert result == Path(SOURCE_FOLDER) / "_Keeps"
+
+
+def test_resolve_dest_folder_reviewed_ignored_for_non_keep() -> None:
+    """reviewed=True has no effect on maybe/reject — only 'keep' nests."""
+    maybe_result = resolve_dest_folder("maybe", SOURCE_FOLDER, overrides=None, reviewed=True)
+    reject_result = resolve_dest_folder("reject", SOURCE_FOLDER, overrides=None, reviewed=True)
+    assert maybe_result == Path(SOURCE_FOLDER) / "_Maybes"
+    assert reject_result == Path(SOURCE_FOLDER) / "_Trash"
+
+
 def test_resolve_dest_folder_returns_path_type() -> None:
     """resolve_dest_folder() always returns a pathlib.Path, not a string."""
     result = resolve_dest_folder("keep", SOURCE_FOLDER)

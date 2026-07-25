@@ -273,8 +273,10 @@ def test_undo_mirrors_to_companion(
     decisions_mod._apply_decision(1, "keep")
     assert _decision(patched, 1) == "keep"
     assert _decision(patched, 2) == "keep"
-    assert (source_folder / "_Keeps" / "DSCF5000.RAF").exists()
-    assert (source_folder / "_Keeps" / "DSCF5000.JPG").exists()
+    # Manual keep (is_auto=False, the default) routes straight to
+    # _Keeps_reviewed — see docs/PLAN-keeps-reviewed.md.
+    assert (source_folder / "_Keeps" / "_Keeps_reviewed" / "DSCF5000.RAF").exists()
+    assert (source_folder / "_Keeps" / "_Keeps_reviewed" / "DSCF5000.JPG").exists()
 
     decisions_mod._apply_undo(1, str(raw_path))
 

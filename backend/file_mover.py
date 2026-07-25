@@ -29,11 +29,20 @@ _DECISION_SETTING_KEY: dict[str, str] = {
     "reject": "trash_folder",
 }
 
+# Nested under whatever the "keep" folder currently resolves to (default
+# subfolder OR an active override) — see resolve_dest_folder(reviewed=True).
+# Provenance watches <keep folder>/_Keeps_reviewed and archives from there;
+# plain _Keeps is left alone so an un-reviewed auto-cull keeper never gets
+# archived out from under KaMeRa. See docs/PLAN-keeps-reviewed.md.
+_KEEPS_REVIEWED_SUBFOLDER = "_Keeps_reviewed"
+
 
 def resolve_dest_folder(
     decision: str,
     source_folder: str | Path,
     overrides: dict[str, str] | None = None,
+    *,
+    reviewed: bool = False,
 ) -> Path:
     """
     Return the absolute destination folder for a decision.
@@ -41,11 +50,19 @@ def resolve_dest_folder(
     overrides is a dict with optional keys: keeps_folder, maybes_folder, trash_folder.
     If the key for this decision is present and non-empty, use it as an absolute path.
     Otherwise create the default subfolder inside source_folder.
+
+    `reviewed=True` only applies to decision == "keep": returns the
+    "_Keeps_reviewed" subfolder nested under wherever "keep" resolves to
+    (default or overridden), instead of the keep folder itself.
     """
     key = _DECISION_SETTING_KEY[decision]
     if overrides and overrides.get(key):
-        return Path(overrides[key])
-    return Path(source_folder) / _DECISION_FOLDERS[decision]
+        base = Path(overrides[key])
+    else:
+        base = Path(source_folder) / _DECISION_FOLDERS[decision]
+    if decision == "keep" and reviewed:
+        return base / _KEEPS_REVIEWED_SUBFOLDER
+    return base
 
 
 _SIDECAR_EXTS: tuple[str, ...] = (".hif", ".HIF")

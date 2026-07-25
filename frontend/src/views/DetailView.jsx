@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react'
 import { API } from '../api'
-import { formatShutter, iqaLabel, aestheticLabel, faceQualityScore, pickHeadlineScore } from '../ui/format'
+import { formatShutter, iqaLabel, aestheticLabel, faceQualityScore, pickHeadlineScore, needsReview } from '../ui/format'
 import { ScoreBar, InfoTooltip, HoverPopover, ScoreBadge, DecisionBadge, DecisionWord } from '../ui/primitives'
 import { PullVisionModelButton } from '../ui/PullVisionModelButton'
 import { InstallOllamaCTA } from '../ui/InstallOllamaCTA'
@@ -39,7 +39,7 @@ const FS_ZOOM_SCALES = [1, 1.5, 3]
 // hop between siblings without losing the detail panel context. Without
 // `groupContext`, DetailView behaves exactly as before — prev/next walk
 // the global images array.
-export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, onUndo, onAmend = null, onRegisterDecisionIntent = null, onPrev, onNext, hasPrev, hasNext, autoGenerate, onExplanationGenerated, groupContext = null, onPickGroupMember = null, gridFilmstrip = null, onBulk = null, addToast = null, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, setFilmstripCollapsed = null, onStartStripResize = null, setBottomToolbarSlot = null, suppressPanelResize = false }) {
+export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, onUndo, onAmend = null, onRegisterDecisionIntent = null, onMarkReviewed = null, onPrev, onNext, hasPrev, hasNext, autoGenerate, onExplanationGenerated, groupContext = null, onPickGroupMember = null, gridFilmstrip = null, onBulk = null, addToast = null, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, setFilmstripCollapsed = null, onStartStripResize = null, setBottomToolbarSlot = null, suppressPanelResize = false }) {
   const shutter = formatShutter(image.shutter_speed)
   // Click on the in-panel photo enters fullscreen (true fullscreen overlay,
   // no info panel, no chrome — UX feedback 2026-05-06). Inside fullscreen,
@@ -272,6 +272,15 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
   useHotkeys('k', () => decideFromDetail('keep'),   { enableOnFormTags: false }, [decideFromDetail])
   useHotkeys('m', () => decideFromDetail('maybe'),  { enableOnFormTags: false }, [decideFromDetail])
   useHotkeys('r', () => decideFromDetail('reject'), { enableOnFormTags: false }, [decideFromDetail])
+
+  // Mark reviewed — releases an auto-culled keeper (plain _Keeps) into
+  // _Keeps/_Keeps_reviewed so Provenance picks it up. Only ever shown when
+  // needsReview(image) is true (see the button render below), so no guard
+  // needed here beyond onMarkReviewed being wired.
+  const showMarkReviewed = needsReview(image)
+  const markReviewedFromDetail = useCallback(() => {
+    onMarkReviewed?.(image.id)
+  }, [onMarkReviewed, image])
 
   // O — open the focused group in GroupLoupe. Only active when DetailView
   // is showing a group entry from the grid filmstrip; silent no-op for solo
@@ -697,20 +706,35 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
             // -mx-3 widens the row 12 px past the header padding so the
             // K/M/R buttons line up with the Section cards in the body,
             // which use the same -mx-3 trick.
-            <div className="-mx-3 flex gap-1.5">
-              {DECISION_BTNS.map(({ d, label, hotkey, activeClass, idleClass }) => (
+            <div className="-mx-3 flex flex-col gap-1.5">
+              <div className="flex gap-1.5">
+                {DECISION_BTNS.map(({ d, label, hotkey, activeClass, idleClass }) => (
+                  <button
+                    key={d}
+                    onClick={() => decideFromDetail(d)}
+                    className={`flex-1 py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1 ${image.decision === d ? activeClass : idleClass}`}
+                  >
+                    <span
+                      className="inline-flex items-center justify-center w-[18px] h-[18px] bg-gradient-to-b from-[#121212] to-[#0d0d0d] rounded-[4px] text-[11px] font-semibold mr-1"
+                      style={{boxShadow:'0 1.5px 0.5px 2.5px rgba(0,0,0,0.4),inset 0 1px 0 rgba(255,255,255,0.08),inset 0 -1px 0 rgba(0,0,0,0.4),0 1px 0 rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.04)'}}
+                    >{hotkey}</span>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {/* Mark reviewed — only for auto-culled keepers still sitting in
+                  plain _Keeps (see docs/PLAN-keeps-reviewed.md). A manual keep
+                  never shows this; it already skipped straight to
+                  _Keeps_reviewed. */}
+              {showMarkReviewed && (
                 <button
-                  key={d}
-                  onClick={() => decideFromDetail(d)}
-                  className={`flex-1 py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1 ${image.decision === d ? activeClass : idleClass}`}
+                  onClick={markReviewedFromDetail}
+                  className="w-full py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1.5 bg-[rgba(125,184,154,0.10)] text-[#7DB89A] border-[rgba(125,184,154,0.30)] hover:opacity-70"
+                  title="Release this photo to Provenance for archiving"
                 >
-                  <span
-                    className="inline-flex items-center justify-center w-[18px] h-[18px] bg-gradient-to-b from-[#121212] to-[#0d0d0d] rounded-[4px] text-[11px] font-semibold mr-1"
-                    style={{boxShadow:'0 1.5px 0.5px 2.5px rgba(0,0,0,0.4),inset 0 1px 0 rgba(255,255,255,0.08),inset 0 -1px 0 rgba(0,0,0,0.4),0 1px 0 rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.04)'}}
-                  >{hotkey}</span>
-                  {label}
+                  <CheckIcon size={13} /> Mark reviewed
                 </button>
-              ))}
+              )}
             </div>
           )}
         </div>

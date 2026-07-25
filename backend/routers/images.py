@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from backend.constants import (
     SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif,
-    is_raw_format, companion_stem_matches,
+    is_raw_format, companion_stem_matches, has_processed_sibling,
 )
 from backend.database import get_db
 from backend.routers.settings import get_raw_jpeg_display_mode
@@ -39,7 +39,15 @@ def _filter_raw_jpeg_pairs(rows: list[dict]) -> list[dict]:
     Orphans (a RAW or JPEG with no same-stem sibling in this result set) are
     always kept regardless of mode — the filter only ever hides one half of
     an actual detected pair, never a photo the user has no other copy of.
+
+    A row with analysis_status='skipped' (analysis_mode=jpeg_priority — see
+    settings.py) is ALWAYS hidden here, unconditionally on raw_jpeg_display_mode.
+    It exists only so K/M/R decisions can mirror onto it and move it with its
+    processed sibling; it has no scores and was never meant to render as a
+    tile.
     """
+    rows = [r for r in rows if r.get("analysis_status") != "skipped"]
+
     mode = get_raw_jpeg_display_mode()
     if mode == "both":
         return rows
@@ -291,8 +299,21 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
                 (str(folder),),
             ).fetchall()
         }
+        skipped_raw_paths = {
+            row[0] for row in conn.execute(
+                "SELECT file_path FROM images WHERE analysis_status = 'skipped' AND source_folder = ?",
+                (str(folder),),
+            ).fetchall()
+        }
 
-    done_count = sum(1 for f in candidates if str(f) in done_paths)
+    # A 'skipped' RAW (jpeg_priority analysis mode) still counts as "finished"
+    # here as long as its processed sibling is still on disk — otherwise the
+    # Resume-analysis banner would nag forever about a RAW that was
+    # intentionally left unscored. See analyze_folder's identical guard.
+    still_skippable = {p for p in skipped_raw_paths if has_processed_sibling(Path(p))}
+    resolved_paths = done_paths | still_skippable
+
+    done_count = sum(1 for f in candidates if str(f) in resolved_paths)
     return {
         "folder_path": str(folder),
         "total_on_disk": total_on_disk,

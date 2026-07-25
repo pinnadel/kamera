@@ -13,7 +13,12 @@ from pydantic import BaseModel
 
 from backend.constants import is_raw_format, companion_stem_matches
 from backend.database import get_db, get_folder_overrides, get_setting
-from backend.file_mover import move_photo, resolve_dest_folder, trash_photo
+from backend.file_mover import (
+    _KEEPS_REVIEWED_SUBFOLDER,
+    move_photo,
+    resolve_dest_folder,
+    trash_photo,
+)
 from backend.routers.settings import get_raw_jpeg_display_mode
 from backend.state import _decision_move_lock, _personal_model
 from phase3_learning.auto_trainer import maybe_train_async
@@ -38,6 +43,16 @@ class DecisionRequest(BaseModel):
 class BulkDecisionRequest(BaseModel):
     image_ids: list[int]
     decision: str
+
+
+class MarkReviewedRequest(BaseModel):
+    """Body expected by POST /mark-reviewed."""
+    image_id: int
+
+
+class BulkMarkReviewedRequest(BaseModel):
+    """Body expected by POST /bulk-mark-reviewed."""
+    image_ids: list[int]
 
 
 class UndoDecisionRequest(BaseModel):
@@ -249,10 +264,28 @@ def _find_companion_image_id(image_row: dict) -> int | None:
     return matches[0]["id"]
 
 
+def _companion_is_hidden(companion_id: int) -> bool:
+    """
+    True if `companion_id` isn't independently visible/reviewable, so a
+    decision/undo on its sibling should mirror onto it instead of leaving it
+    untouched. Two cases: raw_jpeg_display_mode is hiding it from the grid,
+    or it's an unscored analysis_mode=jpeg_priority row (analysis_status=
+    'skipped') that can never be independently judged in the first place.
+    """
+    if get_raw_jpeg_display_mode() != "both":
+        return True
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT analysis_status FROM images WHERE id = ?", (companion_id,)
+        ).fetchone()
+    return row is not None and row["analysis_status"] == "skipped"
+
+
 def _apply_decision(
     image_id: int,
     decision: str,
     is_auto: bool = False,
+    reason: str | None = None,
     _mirror: bool = True,
     _train: bool = True,
 ) -> dict:
@@ -267,6 +300,14 @@ def _apply_decision(
     model never learns from its own output (a self-reinforcement loop). When
     the user later manually changes (or confirms) an auto-cull decision, that
     manual call writes the training sample as normal.
+
+    `reason` names why this decision was made (e.g. 'manual', 'personal_keep',
+    'closed_eyes', 'burst_keep_guarantee', 'uncertain'). Written to
+    decisions.reason (current-state, overwritten on re-decision, cleared on
+    Clear Analysis) AND appended to auto_decision_log (durable, survives
+    Clear Analysis — see database.py migration v50). Callers that don't know
+    a specific rule name should still pass something meaningful ('manual' for
+    plain user K/M/X) so the log stays queryable.
 
     `_mirror` / `_train` are internal-only (never set by callers outside this
     module). When raw_jpeg_display_mode hides one half of a RAW+JPEG pair,
@@ -322,7 +363,16 @@ def _apply_decision(
             # the original location regardless of intermediate moves.
             photo_parent = source_folder or str(Path(current_path).parent)
             overrides = get_folder_overrides(photo_parent)
-            dest_folder = resolve_dest_folder(decision, photo_parent, overrides)
+            # A manual keep (is_auto=False) already IS the human review
+            # Provenance's gate exists to guarantee — route it straight to
+            # _Keeps/_Keeps_reviewed so it skips the extra "mark reviewed"
+            # step. Auto-cull keeps (is_auto=True) land in plain _Keeps and
+            # wait for a human to confirm via mark_reviewed(). See
+            # docs/PLAN-keeps-reviewed.md.
+            dest_folder = resolve_dest_folder(
+                decision, photo_parent, overrides,
+                reviewed=(decision == "keep" and not is_auto),
+            )
 
             try:
                 new_path = move_photo(current_path, dest_folder)
@@ -345,13 +395,30 @@ def _apply_decision(
             conn.execute(
                 """
                 INSERT OR REPLACE INTO decisions
-                    (image_id, decision, decided_at)
-                VALUES (?, ?, DATETIME('now'))
+                    (image_id, decision, reason, decided_at)
+                VALUES (?, ?, ?, DATETIME('now'))
                 """,
-                (image_id, decision),
+                (image_id, decision, reason),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=422, detail="decision must be 'keep', 'reject', or 'maybe'")
+
+        # Durable audit log — never overwritten or deleted by Clear Analysis /
+        # tab close (unlike the decisions row above). Answers "how often does
+        # each auto-cull path fire" and "how often do I override an
+        # auto-decision" (join on sample_uuid across is_auto=1 then is_auto=0
+        # rows). Best-effort: never fail the user's decision over a log write.
+        try:
+            conn.execute(
+                """
+                INSERT INTO auto_decision_log
+                    (sample_uuid, image_id, decision, reason, is_auto, decided_at)
+                VALUES (?, ?, ?, ?, ?, DATETIME('now'))
+                """,
+                (image_row.get("uuid"), image_id, decision, reason, int(is_auto)),
+            )
+        except Exception as exc:
+            logger.exception("auto_decision_log write failed for image %s: %s", image_id, exc)
 
         # Durable training corpus — survives Clear Analysis and folder moves.
         # Captured here so the photo's analyzed features are frozen at the
@@ -398,16 +465,19 @@ def _apply_decision(
                 "Image %s has no UUID — skipping training_samples write", image_id
             )
 
-    # Mirror onto the paired RAW/processed companion when the display setting
-    # is hiding one side — the user only saw and judged one tile, but both
-    # files represent the same shot and should carry the same decision.
-    # Best-effort: a companion-move failure must never fail the visible
-    # photo's own (already-committed) decision.
-    if _mirror and get_raw_jpeg_display_mode() != "both":
+    # Mirror onto the paired RAW/processed companion when it's not being
+    # independently reviewed — either the display setting is hiding one side,
+    # or the companion is an unscored analysis_mode=jpeg_priority row (skipped
+    # RAW rows can never be independently judged, so mirroring is the only
+    # way they ever get moved; see settings.py::analysis_mode). The user only
+    # saw and judged one tile, but both files represent the same shot and
+    # should carry the same decision. Best-effort: a companion-move failure
+    # must never fail the visible photo's own (already-committed) decision.
+    if _mirror:
         companion_id = _find_companion_image_id(image_row)
-        if companion_id is not None:
+        if companion_id is not None and _companion_is_hidden(companion_id):
             try:
-                _apply_decision(companion_id, decision, is_auto=is_auto, _mirror=False, _train=False)
+                _apply_decision(companion_id, decision, is_auto=is_auto, reason=reason, _mirror=False, _train=False)
             except HTTPException as exc:
                 logger.warning(
                     "Companion mirror failed for image %s → %s: %s",
@@ -420,6 +490,76 @@ def _apply_decision(
     maybe_train_async(_personal_model)
 
     return {"image_id": image_id, "decision": decision, "new_path": new_path}
+
+
+def _move_to_reviewed(image_id: int, _mirror: bool = True) -> dict:
+    """
+    Move an already-kept photo from `_Keeps` into `_Keeps/_Keeps_reviewed`.
+
+    The human counterpart to Piece 1's automatic routing: for photos that
+    landed in `_Keeps` via auto-cull, this is the "I looked, this is
+    correct" action that releases the photo to Provenance's archive watch.
+    Requires the photo's current decision to be 'keep' and its current
+    `file_path` to sit directly under a `_Keeps` folder (not already under
+    `_Keeps_reviewed`) — both are 400s, not silent no-ops, since calling
+    this on the wrong photo is a caller bug, not a race.
+
+    Mirrors onto a hidden RAW/JPEG companion the same way _apply_decision
+    does, so both files of a pair release to Provenance together.
+    """
+    with get_db() as conn:
+        image = conn.execute(
+            "SELECT * FROM images WHERE id = ?", (image_id,)
+        ).fetchone()
+    if image is None:
+        raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+
+    image_row = dict(image)
+    current_path = Path(image_row["file_path"])
+
+    with get_db() as conn:
+        decision_row = conn.execute(
+            "SELECT decision FROM decisions WHERE image_id = ?", (image_id,)
+        ).fetchone()
+    if decision_row is None or decision_row["decision"] != "keep":
+        raise HTTPException(status_code=400, detail="Photo is not decided 'keep'")
+
+    parts = current_path.parts
+    if "_Keeps" not in parts:
+        raise HTTPException(status_code=400, detail="Photo is not currently in _Keeps")
+    if _KEEPS_REVIEWED_SUBFOLDER in parts:
+        raise HTTPException(status_code=400, detail="Photo is already in _Keeps_reviewed")
+
+    keeps_idx = parts.index("_Keeps")
+    keeps_folder = Path(*parts[: keeps_idx + 1])
+    dest_folder = keeps_folder / _KEEPS_REVIEWED_SUBFOLDER
+
+    with _decision_move_lock:
+        try:
+            new_path = move_photo(current_path, dest_folder)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE images SET file_path = ? WHERE id = ?",
+                (new_path, image_id),
+            )
+
+    if _mirror:
+        companion_id = _find_companion_image_id(image_row)
+        if companion_id is not None and _companion_is_hidden(companion_id):
+            try:
+                _move_to_reviewed(companion_id, _mirror=False)
+            except HTTPException as exc:
+                logger.warning(
+                    "Mark-reviewed companion mirror failed for image %s → %s: %s",
+                    image_id, companion_id, exc.detail,
+                )
+
+    return {"image_id": image_id, "new_path": new_path}
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +576,25 @@ def save_decision(request: DecisionRequest):
     Raises 409 if the file is missing from disk.
     Raises 500 for unexpected filesystem errors.
     """
-    result = _apply_decision(request.image_id, request.decision)
+    result = _apply_decision(request.image_id, request.decision, reason="manual")
+    return {"status": "ok", **result}
+
+
+@router.post("/mark-reviewed")
+def mark_reviewed(request: MarkReviewedRequest):
+    """
+    Release a kept photo from `_Keeps` into `_Keeps/_Keeps_reviewed`.
+
+    For photos that landed in `_Keeps` via auto-cull (a manual keep already
+    goes straight to `_Keeps_reviewed` — see /decision), this is the "I
+    looked, this is correct" action. Provenance watches `_Keeps_reviewed`
+    and archives from there.
+
+    Raises 400 if the photo isn't decided 'keep' or isn't currently under
+    `_Keeps` (already reviewed, or was never kept).
+    Raises 404 if image_id is unknown. 409 if the file is missing from disk.
+    """
+    result = _move_to_reviewed(request.image_id)
     return {"status": "ok", **result}
 
 
@@ -480,19 +638,27 @@ def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) 
 
     # Per-photo undo path: when the caller didn't supply a previous_path
     # (i.e. the undo isn't replaying a recent action, it's "send this
-    # photo home"), move the file UP one level — out of the K/M/R
-    # subfolder it was sorted into. This handles three cases correctly:
+    # photo home"), move the file UP out of the K/M/R subfolder (and, for a
+    # reviewed keep, the extra _Keeps_reviewed level too). This handles four
+    # cases correctly:
     #   - Default subfolders: .../source/_Keeps/photo.JPG → .../source/photo.JPG
     #   - Subfolder analysis: .../source/sub/_Keeps/photo.JPG → .../source/sub/photo.JPG
     #   - Custom override:    /any/where/MyKeeps/photo.JPG  → /any/where/photo.JPG
+    #   - Reviewed keep:      .../source/_Keeps/_Keeps_reviewed/photo.JPG → .../source/photo.JPG
     # Using `images.source_folder + filename` would flatten subfolder structure
     # and break custom-override undo. Filename comes from the live file (not the
     # DB) so any de-dup suffix added by `_claim_path` during the original move
     # comes along for the round trip.
     if previous_path is None:
         filename = Path(current_path).name
-        parent_parent = Path(current_path).parent.parent
-        previous_path = str(parent_parent / filename)
+        parent = Path(current_path).parent
+        # A reviewed keep sits two levels deep (_Keeps/_Keeps_reviewed/photo)
+        # instead of one (_Keeps/photo) — strip the extra level first so
+        # "home" lands outside _Keeps either way.
+        if parent.name == _KEEPS_REVIEWED_SUBFOLDER:
+            parent = parent.parent
+        home = parent.parent
+        previous_path = str(home / filename)
 
     # Already at home (e.g. someone manually moved the file back, or path
     # normalization quirks): skip the move and just clear DB state.
@@ -547,12 +713,13 @@ def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) 
                 )
 
     # Mirror the undo onto the paired RAW/processed companion, if any —
-    # symmetric with the mirrored decision made in _apply_decision.
-    # Best-effort: a companion with nothing to undo (409) or a missing
-    # companion file is silently skipped rather than failing this undo.
-    if _mirror and get_raw_jpeg_display_mode() != "both":
+    # symmetric with the mirrored decision made in _apply_decision (same
+    # companion-hidden test: display setting OR an unscored jpeg_priority
+    # skip row). Best-effort: a companion with nothing to undo (409) or a
+    # missing companion file is silently skipped rather than failing this undo.
+    if _mirror:
         companion_id = _find_companion_image_id(image_row)
-        if companion_id is not None:
+        if companion_id is not None and _companion_is_hidden(companion_id):
             try:
                 _apply_undo(companion_id, None, _mirror=False)
             except HTTPException as exc:
@@ -592,11 +759,37 @@ def bulk_decision(request: BulkDecisionRequest):
     moved, errors = 0, []
     for image_id in request.image_ids:
         try:
-            _apply_decision(image_id, request.decision)
+            _apply_decision(image_id, request.decision, reason="manual")
             moved += 1
         except HTTPException as exc:
             errors.append({"id": image_id, "error": exc.detail})
     return {"moved": moved, "errors": errors}
+
+
+@router.post("/bulk-mark-reviewed")
+def bulk_mark_reviewed(request: BulkMarkReviewedRequest):
+    """
+    Release a batch of kept photos from `_Keeps` into `_Keeps/_Keeps_reviewed`
+    — batch version of POST /mark-reviewed, for "mark all reviewed" over a
+    filtered Keeps view.
+
+    Idempotent: a photo already in `_Keeps_reviewed` is silently skipped
+    (not counted as an error) so re-running over a view that mixes
+    already-reviewed and not-yet-reviewed photos is safe. Photos that
+    aren't decided 'keep' at all, or that fail to move, are reported in
+    `errors`.
+    """
+    moved, skipped, errors = 0, 0, []
+    for image_id in request.image_ids:
+        try:
+            _move_to_reviewed(image_id)
+            moved += 1
+        except HTTPException as exc:
+            if exc.status_code == 400 and "already in _Keeps_reviewed" in exc.detail:
+                skipped += 1
+            else:
+                errors.append({"id": image_id, "error": exc.detail})
+    return {"moved": moved, "skipped": skipped, "errors": errors}
 
 
 @router.post("/trash-rejects")
@@ -956,6 +1149,11 @@ def run_auto_cull(source_folder: str | None = None):
             # report "this burst was almost lost" in the response.
             continue
         decisions[winner_id] = "maybe"
+        # Overwrite the winner's pre-promotion reject reason so Phase 3 (and
+        # the auto_decision_log audit trail) record the TRUE cause of the
+        # final decision, not the reject rule that would have fired without
+        # this post-pass.
+        reasons[winner_id] = "burst_keep_guarantee"
         promotions.append({
             "image_id": winner_id,
             "from": current,
@@ -981,7 +1179,7 @@ def run_auto_cull(source_folder: str | None = None):
     for row in rows_dicts:
         decision = decisions[row["id"]]
         try:
-            _apply_decision(row["id"], decision, is_auto=True, _mirror=False)
+            _apply_decision(row["id"], decision, is_auto=True, reason=reasons.get(row["id"]), _mirror=False)
             counts[decision] += 1
         except HTTPException as exc:
             errors.append({"id": row["id"], "error": exc.detail})

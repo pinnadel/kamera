@@ -80,6 +80,44 @@ def is_raw_format(fmt: str | None) -> bool:
     return bool(fmt) and fmt.upper() in RAW_FORMATS
 
 
+# Extensions that count as a "processed" sibling for the jpeg_priority
+# analysis-mode skip (backend/routers/settings.py::analysis_mode). Deliberately
+# the non-RAW half of SUPPORTED_EXTENSIONS minus .hif-as-sidecar nuance —
+# .hif itself counts, since an X100VI/X Half RAW+HIF pair should skip the RAW
+# the same way a RAW+JPEG pair does.
+_PROCESSED_SIBLING_EXTS: frozenset[str] = frozenset({
+    ".jpg", ".jpeg", ".hif", ".png", ".tiff", ".tif",
+})
+
+
+def has_processed_sibling(path) -> bool:
+    """
+    True if `path` (a RAW file) has a same-stem JPEG/HIF/etc. sibling in its
+    folder — i.e. it's safe to skip scoring it under analysis_mode=jpeg_priority
+    because a processed rendition exists to cull from instead. Non-RAW paths
+    and RAW files with no such sibling return False (the latter must still be
+    analyzed in full — nothing else to judge the shot by).
+
+    Folder is scanned once per call; callers filtering many candidates should
+    cache siblings per-directory rather than calling this in a tight loop.
+    """
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if p.suffix.upper().lstrip(".") not in RAW_FORMATS:
+        return False
+    stem_lower = p.stem.lower()
+    try:
+        siblings = list(p.parent.iterdir())
+    except OSError:
+        return False
+    for sibling in siblings:
+        if (sibling.suffix.lower() in _PROCESSED_SIBLING_EXTS
+                and sibling.stem.lower() == stem_lower
+                and sibling != p):
+            return True
+    return False
+
+
 def companion_stem_matches(filename_a: str, filename_b: str) -> bool:
     """
     True if two filenames are the same shot in different formats — same stem,

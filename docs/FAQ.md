@@ -289,7 +289,18 @@ The hero tile in a group is selected by `personal_score` when the model is
 ready, otherwise by `overall_score`. When a vision model is installed in Ollama,
 opening GroupLoupe fires a comparative LLM rank (see "How does AI burst ranking
 work?" below) and the rank-1 photo from that overrides the score-based pick.
-Amber ring + corner star in both Survey and Loupe filmstrip mark the pick.
+Amber ring + corner star in both Survey and Loupe filmstrip mark the pick, and
+both modes now also show the LLM's one-line reason ("AI pick — sharpest eyes,
+subject leaning into frame") — as a small badge under the star in Survey, and
+as a caption over the big preview in Filmstrip mode while the hero photo is
+focused. Non-hero photos the LLM ranked also carry a small numbered badge
+(`2`, `3`, …) so a burst reads as fully triaged, not just "one winner picked."
+
+Press **A** to accept the AI's pick in one keystroke: keeps the hero, rejects
+the rest of the burst, closes the loupe. Same underlying call as the "Keep
+best · Reject rest" toolbar button — the hotkey just skips the mouse. See
+[frontend/src/views/GroupLoupe.jsx](../frontend/src/views/GroupLoupe.jsx)
+`runBatch`, `rankById`.
 
 ### How does AI burst ranking work?
 
@@ -318,6 +329,48 @@ See [phase2_quality/burst_ranker.py](../phase2_quality/burst_ranker.py),
 [backend/group_scoring.py](../backend/group_scoring.py) for the pre-filter helper,
 [backend/routers/model.py](../backend/routers/model.py) `rank_burst_endpoint`,
 [frontend/src/views/GroupLoupe.jsx](../frontend/src/views/GroupLoupe.jsx) `BurstRankStatus`.
+
+### Does the AI burst ranking ever influence auto-cull decisions?
+
+No, and this is deliberate. `/rank-burst` only ever affects the loupe UI (which
+tile gets the amber "AI pick" star, and the hero used by the "Keep best ·
+Reject rest" batch action) — it never writes a decision on its own, and
+`_compute_auto_decision`/`_apply_decision`
+([backend/routers/decisions.py](../backend/routers/decisions.py)) contain no
+reference to it. The personal GBR model (trained only on your own manual
+decisions) is the only thing that drives auto-cull.
+
+The reasoning: `qwen2.5vl` is a generic vision model with generic "good photo"
+priors, not your taste specifically. Letting it influence a *committed*
+decision — even just as a tiebreaker in the burst-keep-guarantee post-pass,
+which only ever promotes to Maybe — would mean a generic model's judgment
+quietly shapes which photos later become training samples (a promoted Maybe
+you confirm or override still trains the model). That's a slow-taste-dilution
+risk, not a performance one, so the LLM stays confined to the one place you're
+actually looking at the photo and can accept or reject its suggestion
+yourself — see the "AI pick" hotkey (**A**) above.
+
+### How do I see why a photo got a particular auto-cull decision?
+
+Two places, with different lifetimes:
+
+- **`decisions.reason`** — the rule that produced the *current* decision
+  (`manual`, `personal_keep`, `closed_eyes`, `burst_keep_guarantee`,
+  `uncertain`, …). Overwritten on re-decision; cleared by Clear Analysis or
+  closing a tab, same as the decision itself.
+- **`auto_decision_log`** — an append-only history of every decision ever
+  made, manual and auto alike (with an `is_auto` flag), keyed on the photo's
+  `uuid` so it survives re-imports. Unlike `decisions`, this table is *not*
+  wiped by Clear Analysis or tab-close — same durability convention as
+  `training_samples`/`shooting_log`. This is what makes questions like "how
+  often does the keep-guarantee actually fire" or "how often do I override
+  auto-cull" answerable from the database instead of guessed at. No UI reads
+  it yet as of 2026-07-25 — it's a foundation for future dashboard/analytics
+  work.
+
+See migrations v49/v50 in [backend/database.py](../backend/database.py) and
+`_apply_decision()` in
+[backend/routers/decisions.py](../backend/routers/decisions.py).
 
 ### When does AI burst ranking start running for a freshly analyzed folder?
 

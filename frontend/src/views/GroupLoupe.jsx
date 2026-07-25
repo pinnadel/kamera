@@ -436,6 +436,18 @@ export function GroupLoupe({
     burstResult.filtered_from > (burstResult.evaluated_ids?.length || 0)
   )
 
+  // Map image_id → LLM rank (1 = best) so tiles can show the AI's full order,
+  // not just who's rank-1. Lets a user skim a burst as "AI already triaged
+  // this, ranks 1–3 are the real contenders" instead of eyeballing every
+  // near-dupe frame. Empty/absent outside a successful 'ranked' response —
+  // no ordinal renders for near_duplicates/error/loading/score-based-only.
+  const rankById = useMemo(() => {
+    if (burstStatus !== 'ranked' || !Array.isArray(burstResult?.rankings)) return null
+    const m = new Map()
+    for (const r of burstResult.rankings) m.set(r.image_id, r.rank)
+    return m
+  }, [burstStatus, burstResult])
+
   // Pick a sensible default focus (the AI hero) on open or when the group
   // changes. Falls back to the first photo if hero somehow isn't in the list.
   // Deliberately keyed on the score-based hero only — we don't auto-shift
@@ -659,6 +671,13 @@ export function GroupLoupe({
 
     onAllDecided?.()
   }, [group, nonHero, onBulk, sortedImages, effectiveHeroId, onAllDecided])
+
+  // A — one-keystroke "accept the AI pick": keep effectiveHeroId, reject
+  // everyone else in the burst, close the loupe. Same underlying call as the
+  // "Keep best · Reject rest" toolbar button; the hotkey just gives K/R-only
+  // cullers a way to clear a whole near-dupe burst without reaching for the
+  // mouse. No-op when there's no hero or nothing left to reject.
+  useHotkeys('a', () => runBatch('reject'), { enabled: !!group && nonHero.length > 0 }, [runBatch, group, nonHero])
 
   // ── Finish group ─────────────────────────────────────────────────────────
   // "Respect my Keeps, reject everything else." Unlike runBatch (which forces
@@ -1145,6 +1164,7 @@ export function GroupLoupe({
             images={sortedImages}
             heroId={effectiveHeroId}
             heroReason={effectiveHeroReason}
+            rankById={rankById}
             focusedId={focusedId}
             evaluatedSet={evaluatedSet}
             wasFiltered={wasFiltered}
@@ -1179,6 +1199,8 @@ export function GroupLoupe({
           <LoupePane
             images={sortedImages}
             heroId={effectiveHeroId}
+            heroReason={effectiveHeroReason}
+            rankById={rankById}
             focusedImage={focusedImage}
             evaluatedSet={evaluatedSet}
             wasFiltered={wasFiltered}
@@ -1296,7 +1318,7 @@ export function GroupLoupe({
 const TILE_SIZE_MAP = { S: 130, M: 280, L: 540 }
 const ROW_HEIGHT_MAP = { S: 120, M: 240, L: 460 }
 
-function SurveyGrid({ images, heroId, heroReason, focusedId, evaluatedSet, wasFiltered, onTileClick, onTileDoubleClick, onTileMouseDown, onWheel, transformStyle, zoomOn, tileSize, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile }) {
+function SurveyGrid({ images, heroId, heroReason, rankById, focusedId, evaluatedSet, wasFiltered, onTileClick, onTileDoubleClick, onTileMouseDown, onWheel, transformStyle, zoomOn, tileSize, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile }) {
   const minTile  = TILE_SIZE_MAP[tileSize] ?? (images.length <= 3 ? 480 : images.length <= 6 ? 340 : 260)
   const rowHeight = ROW_HEIGHT_MAP[tileSize] ?? (images.length <= 3 ? 420 : images.length <= 6 ? 290 : 220)
 
@@ -1312,6 +1334,7 @@ function SurveyGrid({ images, heroId, heroReason, focusedId, evaluatedSet, wasFi
             img={img}
             isHero={img.id === heroId}
             heroReason={img.id === heroId ? heroReason : null}
+            rank={rankById?.get(img.id) ?? null}
             isFocused={img.id === focusedId}
             // notLlmEvaluated: only meaningful when the burst was pre-filtered.
             // For un-filtered bursts (≤12), every tile was evaluated, so we
@@ -1336,7 +1359,7 @@ function SurveyGrid({ images, heroId, heroReason, focusedId, evaluatedSet, wasFi
   )
 }
 
-function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onClick, onDoubleClick, onMouseDown, onWheel, transformStyle, zoomOn, modelInfo, isMultiSelected = false, isSelectMode = false, draggable = false, onDragStart, onDragEnd }) {
+function SurveyTile({ img, isHero, heroReason, rank, isFocused, notLlmEvaluated, onClick, onDoubleClick, onMouseDown, onWheel, transformStyle, zoomOn, modelInfo, isMultiSelected = false, isSelectMode = false, draggable = false, onDragStart, onDragEnd }) {
   // Ring priority (most specific wins):
   //   1. multi-select / focused → cyan (active user gesture)
   //   2. decision K/M/R → green/amber/coral; ring-2 if this is also the
@@ -1405,6 +1428,21 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
             aria-label="Not LLM-evaluated"
           />
         )}
+        {!isHero && typeof rank === 'number' && (
+          // AI rank ordinal for non-hero photos the LLM ranked. Mutually
+          // exclusive with notLlmEvaluated (a ranked photo was, by
+          // definition, evaluated), so both can safely share the top-right
+          // corner. Lets a user skim "AI already triaged this burst" —
+          // ranks 2/3 are real contenders, higher numbers are the LLM's
+          // rejects — without opening the top-bar inspect popover.
+          <span
+            className="absolute top-2 right-2 min-w-[20px] h-5 px-1.5 rounded-full bg-[rgba(0,0,0,0.65)] text-[#9c9c9d] text-[10px] font-semibold shadow flex items-center justify-center tabular-nums"
+            title={`AI rank ${rank}`}
+            aria-label={`AI rank ${rank}`}
+          >
+            {rank}
+          </span>
+        )}
         {/* Multi-select check overlay — bottom-left so it never collides
             with the Best/hero badge in the top-left. */}
         {isSelectMode && (
@@ -1442,15 +1480,16 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
 }
 
 // ── Loupe + filmstrip ───────────────────────────────────────────────────────
-function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, onPickFilmstrip, onMouseDown, onWheel, transformStyle, zoomOn, thumbSize = 112, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, onStartFilmstripResize = null }) {
+function LoupePane({ images, heroId, heroReason, rankById, focusedImage, evaluatedSet, wasFiltered, onPickFilmstrip, onMouseDown, onWheel, transformStyle, zoomOn, thumbSize = 112, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, onStartFilmstripResize = null }) {
   if (!focusedImage) return null
   const thumbW = thumbSize
   const thumbH = Math.round(thumbSize * THUMB_ASPECT)
+  const showHeroReason = focusedImage.id === heroId && !!heroReason
   return (
     <div className="h-full flex flex-col">
       {/* Big preview */}
       <div
-        className={`flex-1 min-h-0 bg-[#07080a] flex items-center justify-center overflow-hidden p-4 ${zoomOn ? 'cursor-grab' : ''}`}
+        className={`relative flex-1 min-h-0 bg-[#07080a] flex items-center justify-center overflow-hidden p-4 ${zoomOn ? 'cursor-grab' : ''}`}
         onMouseDown={(e) => onMouseDown(focusedImage, e)}
         onWheel={onWheel}
         onClick={() => onPickFilmstrip(focusedImage)}
@@ -1462,6 +1501,19 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
           style={transformStyle}
           draggable={false}
         />
+        {/* AI pick reason — same information as the Survey-mode badge, surfaced
+            here so Filmstrip-mode users (the default for most cullers) get the
+            "why" without switching views. Only shown while the hero itself is
+            focused; stepping to another photo hides it rather than showing a
+            stale reason that belongs to a different frame. */}
+        {showHeroReason && (
+          <span
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 max-w-[85%] px-2.5 py-1 rounded-md text-xs bg-[rgba(7,8,10,0.75)] border border-[rgba(232,184,74,0.30)] text-[#E8B84A] text-center truncate select-none pointer-events-none"
+            title={heroReason}
+          >
+            AI pick — {heroReason}
+          </span>
+        )}
       </div>
       {/* Filmstrip — shared primitive owns toolbar + collapse + resize +
           thumb row layout. Per-thumb chrome (hero ring, multi-select,
@@ -1491,6 +1543,12 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
           })()
           const dimmed = isSelectMode && !isMultiSelected ? 'opacity-70' : ''
           const isDraggable = isMultiSelected
+          // Rank ordinal — only for non-hero photos the LLM actually ranked
+          // (rank 1 already has the star badge below; showing "1" too would
+          // be redundant). Lets a user skim "AI already triaged this burst"
+          // without re-reading the top-bar chip for every thumb.
+          const rank = rankById?.get(img.id)
+          const showRankBadge = !isHero && typeof rank === 'number'
           return (
             <button
               key={img.id}
@@ -1502,7 +1560,7 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
               onDragStart={isDraggable ? (e) => onDragStartTile?.(img, e) : undefined}
               onDragEnd={isDraggable ? onDragEndTile : undefined}
               className={`relative flex-shrink-0 rounded-md overflow-hidden bg-[#161718] transition-all ${isDraggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'} ${ring} ${dimmed || (img.decision === 'reject' && !isFocused ? 'opacity-[0.45]' : '')}`}
-              title={isHero ? `${img.filename} — Best in group` : img.filename}
+              title={isHero ? `${img.filename} — Best in group` : showRankBadge ? `${img.filename} — AI rank ${rank}` : img.filename}
             >
               <div
                 style={{ height: `${thumbH}px` }}
@@ -1521,6 +1579,14 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
                     <svg width="8" height="8" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
                       <path d="M8 1.5 L9.9 5.85 L14.5 6.4 L11.05 9.55 L11.95 14.1 L8 11.85 L4.05 14.1 L4.95 9.55 L1.5 6.4 L6.1 5.85 Z" />
                     </svg>
+                  </span>
+                )}
+                {showRankBadge && (
+                  <span
+                    className="absolute top-1 left-1 min-w-[16px] h-4 px-1 rounded-full bg-[rgba(0,0,0,0.65)] text-[#9c9c9d] text-[9px] font-semibold shadow flex items-center justify-center tabular-nums"
+                    aria-label={`AI rank ${rank}`}
+                  >
+                    {rank}
                   </span>
                 )}
                 {notLlmEvaluated && (

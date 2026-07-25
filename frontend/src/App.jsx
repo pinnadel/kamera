@@ -68,7 +68,7 @@ import {
 import { MoveIntoGroupModal } from './modals/MoveIntoGroupModal'
 import { API } from './api'
 import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, ACTIVE_TOGGLE } from './ui/buttons'
-import { formatEta, formatDuration } from './ui/format'
+import { formatEta, formatDuration, needsReview } from './ui/format'
 import { Spinner, DecisionWord, Toggle } from './ui/primitives'
 import { DownloadToast, ToastStack } from './ui/toasts'
 import { ShortcutsModal } from './modals/ShortcutsModal'
@@ -964,6 +964,14 @@ export default function App() {
     reject:    images.filter(img => img.decision === 'reject').length,
   }), [images])
 
+  // Auto-culled keepers still awaiting a human "mark reviewed" — the "Mark
+  // all reviewed" bulk bar's scope (docs/PLAN-keeps-reviewed.md Piece 3).
+  // Manual keeps never appear here (they skip straight to _Keeps_reviewed).
+  const needsReviewIds = useMemo(
+    () => images.filter(needsReview).map(img => img.id),
+    [images]
+  )
+
   const displayGridItems = useMemo(() => {
     const q = searchQuery.trim().toLowerCase()
 
@@ -1289,6 +1297,56 @@ export default function App() {
       addToast({ type: 'error', message: `Undo failed: ${err.message}`, duration: 6000 })
     }
   }, [images, addToast, setImages, loadModelInfo])
+
+  // ── markReviewed — release an auto-culled keeper to Provenance ────────────
+  // The human counterpart to the manual-K routing: auto-cull keeps land in
+  // plain _Keeps and wait here. Photo stays visible in the Keep-filtered
+  // view (badge, not disappear — see docs/PLAN-keeps-reviewed.md).
+  const markReviewed = useCallback(async (imageId) => {
+    try {
+      const res = await fetch(`${API}/mark-reviewed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_id: imageId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        addToast({ type: 'error', message: data.detail || `Mark reviewed failed (${res.status})`, duration: 6000 })
+        return
+      }
+      setImages(prev => prev.map(img =>
+        img.id === imageId ? { ...img, file_path: data.new_path } : img
+      ))
+    } catch (err) {
+      addToast({ type: 'error', message: `Network error: ${err.message}`, duration: 6000 })
+    }
+  }, [addToast, setImages])
+
+  const bulkMarkReviewed = useCallback(async (imageIds) => {
+    setBulkRunning(true)
+    try {
+      const res = await fetch(`${API}/bulk-mark-reviewed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_ids: imageIds }),
+      })
+      const data = await res.json()
+      await loadImages()
+      const moved = data.moved ?? 0
+      const failed = data.errors?.length ?? 0
+      if (failed > 0) {
+        addToast({ type: 'warning', message: `${moved} marked reviewed · ${failed} failed`, duration: 6000 })
+      } else {
+        addToast({ type: 'info', message: `${moved} photo${moved !== 1 ? 's' : ''} marked reviewed` })
+      }
+    } catch (e) {
+      console.error('Bulk mark-reviewed failed:', e)
+      addToast({ type: 'error', message: 'Could not mark photos reviewed — server error' })
+    } finally {
+      setBulkRunning(false)
+      setBulkConfirm(null)
+    }
+  }, [loadImages, addToast])
 
   // ── Training mode ─────────────────────────────────────────────────────────
   const enterTrainingMode = useCallback(() => {
@@ -2345,6 +2403,7 @@ export default function App() {
           onUndo={runUndo}
           onAmend={amendLastDecision}
           onRegisterDecisionIntent={registerDecisionIntent}
+          onMarkReviewed={markReviewed}
           onPrev={onPrev}
           onNext={onNext}
           hasPrev={!!onPrev}
@@ -2840,6 +2899,37 @@ export default function App() {
             >
               <WandSparkles size={15} /> Auto cull
             </button>
+          </div>
+        )}
+
+        {/* Bulk action bar — keep filter (mark reviewed) */}
+        {decisionFilter === 'keep' && needsReviewIds.length > 0 && (
+          <div className="mb-3 flex items-center gap-3 px-3 py-2 bg-[rgba(125,184,154,0.06)] border border-[rgba(125,184,154,0.20)] rounded-lg text-xs">
+            <span className="text-[#7DB89A]/70">
+              {needsReviewIds.length} auto-culled {needsReviewIds.length === 1 ? 'photo' : 'photos'} awaiting review
+            </span>
+            <span className="text-[#6a6b6c]">
+              Reviewed photos release to Provenance for archiving
+            </span>
+            {bulkConfirm === 'mark-all-reviewed' ? (
+              <div className="ml-auto flex items-center gap-2">
+                <span className="text-[#7DB89A]">Mark {needsReviewIds.length} reviewed?</span>
+                <button onClick={() => bulkMarkReviewed(needsReviewIds)} disabled={bulkRunning}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.20)] border border-[rgba(255,255,255,0.10)] text-[#7DB89A] hover:opacity-70 transition-opacity disabled:opacity-50">
+                  <Check size={14} />
+                  {bulkRunning ? 'Marking…' : 'Confirm'}
+                </button>
+                <button onClick={() => setBulkConfirm(null)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
+                  <X size={14} /> Cancel
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => setBulkConfirm('mark-all-reviewed')}
+                className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.12)] border border-[rgba(125,184,154,0.30)] text-[#7DB89A] hover:opacity-70 transition-opacity">
+                <Check size={14} /> Mark all reviewed
+              </button>
+            )}
           </div>
         )}
 
@@ -3430,6 +3520,7 @@ export default function App() {
                     showFilename={showFilenames}
                     isAllView={decisionFilter === null}
                     inGroupBorder={!!item.groupRun && item.groupRun.position !== 'solo'}
+                    onMarkReviewed={markReviewed}
                     draggable
                     onDragStart={(e) => {
                       // Payload carries the entire current selection when

@@ -135,6 +135,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   useEffect(() => {
     setRawJpegMode(settings?.raw_jpeg_display_mode ?? 'both')
   }, [settings?.raw_jpeg_display_mode])
+  const [analysisMode, setAnalysisMode] = useState(settings?.analysis_mode ?? 'full')
+  const [savingAnalysisMode, setSavingAnalysisMode] = useState(false)
+  useEffect(() => {
+    setAnalysisMode(settings?.analysis_mode ?? 'full')
+  }, [settings?.analysis_mode])
   // Advanced sort-options visibility (localStorage). Lean defaults preselected;
   // user can opt into the rest. Section collapsed by default — these are
   // power-user toggles, not first-run choices.
@@ -304,6 +309,38 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     }
   }
 
+  // Analysis scope. Same optimistic-save pattern as the two settings above.
+  // Switching to 'jpeg_priority' takes effect on the NEXT analysis run for
+  // files not yet in the library — it doesn't retroactively drop scores
+  // already stored for RAWs analyzed under 'full'.
+  async function handleAnalysisModeChange(next) {
+    if (next === analysisMode) return
+    const prev = analysisMode
+    setAnalysisMode(next)
+    setSavingAnalysisMode(true)
+    try {
+      const res = await fetch(`${API}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ analysis_mode: next }),
+      })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
+      await onSave()
+      onToast({
+        type: 'success',
+        message: next === 'jpeg_priority'
+          ? 'Processed-priority mode on — RAW files with a matching JPEG/HIF/etc. will be skipped on the next analysis'
+          : 'Full analysis mode on — every file will be scored',
+      })
+    } catch (err) {
+      console.error('Analysis mode save failed:', err)
+      setAnalysisMode(prev)
+      onToast({ type: 'error', message: 'Could not save preference — server error' })
+    } finally {
+      setSavingAnalysisMode(false)
+    }
+  }
+
   // Reject-to-Trash toggle. When ON, future R presses send the file to the
   // system Trash via send2trash instead of moving it to _Trash/. Switching
   // this mid-session doesn't relocate already-rejected photos — applies to
@@ -408,6 +445,46 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
         {/* ── Model tab ── */}
         {activeTab === 'model' && (
           <div className="space-y-6">
+
+            {/* ── Analysis scope ───────────────────────────────────────── */}
+            <div>
+              <p className="label mb-1">Analysis scope</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
+                When a shot was taken RAW + a processed file (JPEG, HIF, PNG,
+                TIFF), choose whether the RAW also gets scored. Skipping it
+                can dramatically speed up analysis — the processed file's
+                score is used for culling, and any Keep / Maybe / Reject
+                decision on it automatically moves its RAW companion along
+                with it.
+              </p>
+
+              <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingAnalysisMode ? 'opacity-50 pointer-events-none' : ''}`}>
+                {[
+                  { key: 'full', label: 'Full', title: 'Analyze every file, including RAW + processed pairs' },
+                  { key: 'jpeg_priority', label: 'Processed (.jpg, .hif, …)', title: 'Skip a RAW file when a same-stem processed file (.jpg/.jpeg/.hif/.png/.tif/.tiff) exists' },
+                ].map(({ key, label, title }, i) => (
+                  <button
+                    key={key}
+                    onClick={() => handleAnalysisModeChange(key)}
+                    title={title}
+                    className={`px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${analysisMode === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
+                A RAW file with no processed sibling (RAW-only shooting) is
+                always analyzed in full, regardless of this setting — there's
+                nothing else to judge that shot by. Changing this setting
+                only affects files analyzed from now on — it never
+                retroactively scores an already-skipped RAW or clears scores
+                already stored for a fully-analyzed one. Use Clear Analysis
+                (or Clear folder) and re-analyze if you want to apply a new
+                mode to files already in your library.
+              </p>
+            </div>
 
             {/* ── Presets ───────────────────────────────────────────────── */}
             {(() => {

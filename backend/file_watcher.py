@@ -34,7 +34,10 @@ log = logging.getLogger(__name__)
 # error logs (e.g. /debug/last-errors).
 ErrorCallback = Callable[[dict], None]
 
-from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif  # noqa: E402 — re-export for callers that imported from here historically
+from backend.constants import (  # noqa: E402 — re-export for callers that imported from here historically
+    SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif,
+    is_raw_format, has_processed_sibling,
+)
 # .hif is analyzed standalone (X100VI/X Half HIF-only shooting) but skipped
 # when a same-stem .RAF sibling exists — then it's a RAW+HIF sidecar preview,
 # move-only (see file_mover.py). The standalone check happens in
@@ -46,6 +49,59 @@ from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_stan
 # Cameras and card readers write files in chunks — analyzing mid-write gives corrupt results.
 # 2 seconds is enough for most JPEG transfers; RAW files may need more on slow readers.
 SETTLE_SECONDS = 2.0
+
+
+def _analysis_mode_is_jpeg_priority() -> bool:
+    """Deferred import — backend.routers.settings pulls in backend.state,
+    which imports FolderWatcher from this module, so a top-level import here
+    would be circular. Read fresh on every call (cheap: one SQLite lookup),
+    matching _is_sidecar_preview_preferred's own late-import pattern."""
+    from backend.routers.settings import get_analysis_mode
+    return get_analysis_mode() == "jpeg_priority"
+
+
+def _store_skipped(file_path: Path, db_path: Path) -> None:
+    """
+    Lightweight upsert for a RAW file skipped under analysis_mode=jpeg_priority
+    (see backend/routers/settings.py::analysis_mode) — EXIF only, no scorers,
+    analysis_status='skipped'. Mirrors _INSERT_SKIPPED_SQL in
+    backend/routers/analysis.py; kept separate because this module avoids the
+    heavy analysis.py import chain (rawpy/pyiqa/torch) for cheap watcher events.
+    """
+    path_str = str(file_path)
+    try:
+        exif = extract_exif(path_str)
+        with get_db(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO images (
+                    file_path, filename, format, source_folder, uuid,
+                    camera, shot_at, focal_length_mm, aperture, shutter_speed, iso,
+                    analysis_status, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', DATETIME('now'))
+                ON CONFLICT(file_path) DO UPDATE SET
+                    uuid            = COALESCE(images.uuid, excluded.uuid),
+                    camera          = excluded.camera,
+                    shot_at         = excluded.shot_at,
+                    focal_length_mm = excluded.focal_length_mm,
+                    aperture        = excluded.aperture,
+                    shutter_speed   = excluded.shutter_speed,
+                    iso             = excluded.iso,
+                    analysis_status = CASE images.analysis_status WHEN 'done' THEN 'done' ELSE 'skipped' END
+                """,
+                (
+                    path_str, file_path.name,
+                    file_path.suffix.lstrip(".").upper(),
+                    str(file_path.parent),
+                    str(_uuid.uuid4()),
+                    exif["camera"], exif["shot_at"],
+                    exif["focal_length_mm"], exif["aperture"],
+                    exif["shutter_speed"], exif["iso"],
+                ),
+            )
+        log.info("Watcher skipped scoring (jpeg_priority): %s", file_path.name)
+    except Exception:
+        log.exception("Watcher failed to store skipped RAW: %s", file_path.name)
 
 
 def _analyze_and_store(file_path: Path, db_path: Path,
@@ -296,6 +352,17 @@ class FolderWatcher:
                 if path.exists():
                     if path.suffix.lower() == ".hif" and not is_standalone_hif(path):
                         pass  # RAW+HIF sidecar — its RAF will carry it on decision
+                    elif (
+                        is_raw_format(path.suffix.lstrip(".").upper())
+                        and _analysis_mode_is_jpeg_priority()
+                        and has_processed_sibling(path)
+                    ):
+                        # Same skip as the batch path (routers/analysis.py) —
+                        # a same-stem processed sibling (.jpg/.jpeg/.hif/.png/
+                        # .tif/.tiff) exists, so this RAW gets a lightweight
+                        # row instead of full scoring.
+                        _store_skipped(path, self._db_path)
+                        analyzed = True
                     else:
                         _analyze_and_store(path, self._db_path, on_error=self._on_error)
                         analyzed = True

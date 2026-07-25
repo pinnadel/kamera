@@ -1,3 +1,16 @@
+// PLAN-keeps-reviewed: "reviewed" state is derived from file_path alone (no
+// DB column — see docs/PLAN-keeps-reviewed.md's Piece 2 data-model note).
+// True only for photos an auto-cull decided 'keep' and that are sitting in
+// plain _Keeps, awaiting a human "Mark reviewed". A manual keep already
+// lands in _Keeps_reviewed directly (Piece 1), so this is false for those.
+export function needsReview(image) {
+  if (image?.decision !== 'keep') return false
+  const path = image?.file_path
+  if (!path) return false
+  const parts = path.split('/')
+  return parts.includes('_Keeps') && !parts.includes('_Keeps_reviewed')
+}
+
 export function formatEta(seconds) {
   if (seconds == null || seconds < 1) return null
   if (seconds < 60) return `${seconds}s`

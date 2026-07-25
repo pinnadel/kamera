@@ -54,7 +54,10 @@ from backend.constants import (
     RAW_FORMATS,
     DECISION_SUBFOLDERS,
     is_standalone_hif,
+    is_raw_format,
+    has_processed_sibling,
 )
+from backend.routers.settings import get_analysis_mode
 # .hif is in SUPPORTED_EXTENSIONS but only analyzed standalone (X100VI/X Half
 # HIF-only shooting). When a same-stem .RAF exists, the .hif is a RAW+HIF
 # sidecar preview — move-only, never analyzed on its own. See
@@ -418,6 +421,49 @@ _INSERT_SQL = """
 """
 
 
+# Lightweight insert for a RAW file skipped under analysis_mode=jpeg_priority
+# (see backend/routers/settings.py::analysis_mode). "jpeg_priority" is the
+# setting's stored value, but the skip fires for ANY processed sibling —
+# .jpg/.jpeg/.hif/.png/.tif/.tiff, see has_processed_sibling. No scorers run
+# — every score column stays NULL and analysis_status is 'skipped', not
+# 'done', so the row is excluded from every "done"-gated query (auto-cull,
+# pairwise, undecided counters, /folders/unfinished) and from the grid (see
+# _filter_raw_jpeg_pairs in routers/images.py). It still gets a uuid and
+# file_path so _find_companion_image_id can mirror K/M/R decisions onto it
+# and move it alongside its sibling. EXIF is cheap and kept for camera/shot_at
+# metadata (burst grouping, shooting log) even though nothing is scored.
+_INSERT_SKIPPED_SQL = """
+    INSERT INTO images (
+        file_path, filename, format, source_folder, uuid,
+        camera, shot_at, focal_length_mm, aperture, shutter_speed, iso,
+        analysis_status, imported_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', DATETIME('now'))
+    ON CONFLICT(file_path) DO UPDATE SET
+        uuid            = COALESCE(images.uuid, excluded.uuid),
+        camera          = excluded.camera,
+        shot_at         = excluded.shot_at,
+        focal_length_mm = excluded.focal_length_mm,
+        aperture        = excluded.aperture,
+        shutter_speed   = excluded.shutter_speed,
+        iso             = excluded.iso,
+        analysis_status = CASE images.analysis_status WHEN 'done' THEN 'done' ELSE 'skipped' END
+    RETURNING id, uuid
+"""
+
+
+def _build_skipped_insert_params(path: Path, exif: dict) -> tuple:
+    """Pack EXIF into the positional tuple for _INSERT_SKIPPED_SQL."""
+    return (
+        str(path), path.name,
+        path.suffix.lstrip(".").upper(),
+        str(path.parent),
+        str(_uuid.uuid4()),
+        exif["camera"], exif["shot_at"],
+        exif["focal_length_mm"], exif["aperture"],
+        exif["shutter_speed"], exif["iso"],
+    )
+
+
 def _build_insert_params(path: Path, result: dict, exif: dict) -> tuple:
     """Pack analysis + EXIF into the positional tuple for _INSERT_SQL."""
     sharpness  = result["sharpness"]
@@ -569,12 +615,49 @@ def analyze(request: AnalyzeRequest):
     )
 
 
+def _is_analyzable(f: Path) -> bool:
+    if f.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        return False
+    if f.suffix.lower() == ".hif" and not is_standalone_hif(f):
+        return False  # RAW+HIF sidecar — moves with its RAF, never analyzed alone
+    return True
+
+
+def _scan_candidates(folder: Path, include_subfolders: bool) -> list[Path]:
+    """Walk `folder` for analyzable files. Shared by the initial scan and the
+    mid-batch rescans that pick up files a live import (e.g. Provenance) drops
+    in while a batch is already running."""
+    if include_subfolders:
+        # Recursive walk. Skip the conventional decision subfolders so a
+        # re-analysis doesn't suck in already-decided photos as fresh inputs.
+        skip_dirs = DECISION_SUBFOLDERS
+        return sorted(
+            f for f in folder.rglob("*")
+            if f.is_file()
+            and _is_analyzable(f)
+            and not any(part in skip_dirs for part in f.relative_to(folder).parts)
+        )
+    return sorted(
+        f for f in folder.iterdir()
+        if f.is_file() and _is_analyzable(f)
+    )
+
+
+# How often _run_batch rescans the source folder for new arrivals. A live
+# Provenance import can drop hundreds of files after the batch's initial
+# snapshot; without a rescan they'd sit undiscovered until the batch ends
+# and the (paused-for-the-duration) watcher resumes. Time-based rather than
+# every N files so it stays cheap on fast (JPG-heavy) batches too.
+RESCAN_INTERVAL_SECONDS = 10.0
+
+
 def _run_batch(
     folder: Path,
     to_analyze: list[Path],
     skipped: list[str],
     total_candidates: int,
     paused_watch_path: Any,
+    include_subfolders: bool = False,
 ) -> None:
     """
     Run the batch analysis loop in a daemon thread.
@@ -586,21 +669,57 @@ def _run_batch(
     _progress is pre-initialised by analyze_folder before this thread starts.
     On completion (normal, stop, or error) _progress["running"] is set to False
     and the final counts are written so the last poll sees the totals.
+
+    to_analyze is a live list (not copied) — mid-batch rescans append to it
+    in place and bump _progress["total"] so a batch started against a partial
+    import (Provenance still copying files off a card) keeps absorbing new
+    arrivals instead of finishing early and leaving them undiscovered until
+    the watcher resumes.
     """
     analyzed, errors = 0, []
+    queued = {str(f) for f in to_analyze} | {str(folder / name) for name in skipped}
+    last_rescan = time.monotonic()
 
     # Read settings ONCE before the loop. Settings can't change mid-batch,
     # so the previous "fresh DB connection per photo per setting" pattern
     # was pure overhead (~10ms × 741 = ~7s on a typical batch).
     from phase1_technical.quality_analyzer import get_sharpness_weight as _get_sharpness_weight
     sharpness_weight = _get_sharpness_weight()
+    jpeg_priority = get_analysis_mode() == "jpeg_priority"
 
     try:
         with get_db() as conn:
-            for file_path in to_analyze:
+            i = 0
+            while i < len(to_analyze):
+                file_path = to_analyze[i]
+                i += 1
                 # Top-of-loop stop check — catches a Stop pressed between files.
                 if _progress.get("stop_requested") or _stop_event.is_set():
                     break
+
+                # Periodically rescan the folder for files that arrived after
+                # the batch started (or after the last rescan) — e.g. a card
+                # import still in progress. New files are appended to the live
+                # to_analyze list and total ticks up so the progress bar keeps
+                # reflecting reality instead of freezing at the original count.
+                now = time.monotonic()
+                if now - last_rescan >= RESCAN_INTERVAL_SECONDS:
+                    last_rescan = now
+                    try:
+                        found = _scan_candidates(folder, include_subfolders)
+                        new_files = [f for f in found if str(f) not in queued]
+                    except Exception:
+                        logger.exception("Batch rescan failed for %s", folder)
+                        new_files = []
+                    if new_files:
+                        queued.update(str(f) for f in new_files)
+                        to_analyze.extend(new_files)
+                        _progress["total"] = len(to_analyze)
+                        logger.info(
+                            "analyze — rescan picked up %d new file(s) in %s (total now %d)",
+                            len(new_files), folder, len(to_analyze),
+                        )
+
                 path_str = str(file_path)
                 _progress["current_file"] = file_path.name
                 _photo_t0 = time.monotonic()
@@ -614,27 +733,48 @@ def _run_batch(
                     if _progress.get("stop_requested") or _stop_event.is_set():
                         break
 
-                    _progress["_current_step"] = "analysis"
-                    result = analyze_photo_quality(
-                        path_str,
-                        stop_event=_stop_event,
-                        sharpness_weight=sharpness_weight,
+                    # jpeg_priority: a RAW with a same-stem processed sibling
+                    # (.jpg/.jpeg/.hif/.png/.tif/.tiff) gets a lightweight row
+                    # (EXIF only, no scorers) instead of full analysis — the
+                    # sibling is what gets scored and culled; this row exists
+                    # only so K/M/R on the sibling can mirror onto it and move
+                    # it. Orphan RAWs (no sibling) always get full analysis
+                    # regardless of the setting.
+                    skip_scoring = (
+                        jpeg_priority
+                        and is_raw_format(file_path.suffix.lstrip(".").upper())
+                        and has_processed_sibling(file_path)
                     )
-                    _progress["_current_step"] = "exif"
-                    exif   = extract_exif(path_str)
-                    _progress["_current_step"] = "database"
 
-                    # RETURNING id, uuid avoids a separate SELECT round-trip after
-                    # the upsert. Saves ~0.5–1ms × 741 photos = ~0.5–1s/batch.
-                    inserted = conn.execute(
-                        _INSERT_SQL, _build_insert_params(file_path, result, exif)
-                    ).fetchone()
-                    if inserted is not None:
-                        _personal_model.invalidate(inserted["id"])
-                        write_shooting_log(
-                            conn,
-                            **_shooting_log_kwargs(file_path, result, exif, inserted["uuid"]),
+                    if skip_scoring:
+                        _progress["_current_step"] = "exif"
+                        exif = extract_exif(path_str)
+                        _progress["_current_step"] = "database"
+                        conn.execute(
+                            _INSERT_SKIPPED_SQL, _build_skipped_insert_params(file_path, exif)
                         )
+                    else:
+                        _progress["_current_step"] = "analysis"
+                        result = analyze_photo_quality(
+                            path_str,
+                            stop_event=_stop_event,
+                            sharpness_weight=sharpness_weight,
+                        )
+                        _progress["_current_step"] = "exif"
+                        exif   = extract_exif(path_str)
+                        _progress["_current_step"] = "database"
+
+                        # RETURNING id, uuid avoids a separate SELECT round-trip after
+                        # the upsert. Saves ~0.5–1ms × 741 photos = ~0.5–1s/batch.
+                        inserted = conn.execute(
+                            _INSERT_SQL, _build_insert_params(file_path, result, exif)
+                        ).fetchone()
+                        if inserted is not None:
+                            _personal_model.invalidate(inserted["id"])
+                            write_shooting_log(
+                                conn,
+                                **_shooting_log_kwargs(file_path, result, exif, inserted["uuid"]),
+                            )
 
                     # Commit per-photo so the frontend's /images poll can see
                     # rows as they finish. Without this, SQLite holds the whole
@@ -761,28 +901,7 @@ def analyze_folder(request: AnalyzeFolderRequest):
     if _progress.get("running"):
         raise HTTPException(status_code=409, detail="Analysis already running")
 
-    def _is_analyzable(f: Path) -> bool:
-        if f.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            return False
-        if f.suffix.lower() == ".hif" and not is_standalone_hif(f):
-            return False  # RAW+HIF sidecar — moves with its RAF, never analyzed alone
-        return True
-
-    if request.include_subfolders:
-        # Recursive walk. Skip the conventional decision subfolders so a
-        # re-analysis doesn't suck in already-decided photos as fresh inputs.
-        skip_dirs = DECISION_SUBFOLDERS
-        candidates = sorted(
-            f for f in folder.rglob("*")
-            if f.is_file()
-            and _is_analyzable(f)
-            and not any(part in skip_dirs for part in f.relative_to(folder).parts)
-        )
-    else:
-        candidates = sorted(
-            f for f in folder.iterdir()
-            if f.is_file() and _is_analyzable(f)
-        )
+    candidates = _scan_candidates(folder, request.include_subfolders)
     if not candidates:
         # Nothing to analyze — return immediately without touching _progress.
         _progress.update({
@@ -797,9 +916,24 @@ def analyze_folder(request: AnalyzeFolderRequest):
                 "SELECT file_path FROM images WHERE analysis_status = 'done'"
             ).fetchall()
         }
+        skipped_raw_paths = {
+            row[0] for row in conn.execute(
+                "SELECT file_path FROM images WHERE analysis_status = 'skipped'"
+            ).fetchall()
+        }
 
-    to_analyze = [f for f in candidates if str(f) not in done_paths]
-    skipped = [f.name for f in candidates if str(f) in done_paths]
+    # A 'skipped' RAW is only left out of the re-queue while it still has a
+    # processed sibling — if that sibling was since deleted (orphaned RAW),
+    # fall through to a full re-analysis instead of leaving it unscored
+    # forever. Cheap: has_processed_sibling only runs for the small set of
+    # rows already marked 'skipped', not every candidate.
+    still_skippable = {
+        p for p in skipped_raw_paths if has_processed_sibling(Path(p))
+    }
+    resolved_paths = done_paths | still_skippable
+
+    to_analyze = [f for f in candidates if str(f) not in resolved_paths]
+    skipped = [f.name for f in candidates if str(f) in resolved_paths]
 
     # Initialise progress before starting the thread so the very first poll
     # already sees the correct total.  Reset the stop flag so a previous stop
@@ -827,7 +961,8 @@ def analyze_folder(request: AnalyzeFolderRequest):
 
     t = threading.Thread(
         target=_run_batch,
-        args=(folder, to_analyze, skipped, len(candidates), paused_watch_path),
+        args=(folder, to_analyze, skipped, len(candidates), paused_watch_path,
+              request.include_subfolders),
         daemon=True,
         name="batch-analysis",
     )

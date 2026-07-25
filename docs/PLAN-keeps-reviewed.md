@@ -313,18 +313,33 @@ first rather than guessing.
 
 ## Verification checklist before calling this done
 
-- [ ] Manual K in a live cull → file appears in `_Keeps/_Keeps_reviewed/`
-      immediately, NOT in `_Keeps/` even transiently.
-- [ ] Auto-cull batch → keepers land in `_Keeps/` only; none jump straight
-      to `_Keeps_reviewed`.
-- [ ] Mark-reviewed on an auto-cull keeper moves it into
-      `_Keeps/_Keeps_reviewed/`; Provenance (if running) picks it up and
-      archives it within its normal debounce window (~2s stable-size).
+> **Status update (2026-07-25):** Pieces 1–3 implemented. See
+> [docs/CHANGELOG.md](CHANGELOG.md)'s "`_Keeps_reviewed` review gate" entry
+> for the full account, including a real bug found and fixed mid-implementation
+> (undo's home-reconstruction didn't account for the extra `_Keeps_reviewed`
+> nesting level for the RAW/JPEG companion mirror path).
+
+- [x] Manual K in a live cull → file appears in `_Keeps/_Keeps_reviewed/`
+      immediately, NOT in `_Keeps/` even transiently. Verified via
+      `tests/test_keeps_reviewed.py` and live curl against the running
+      launcher instance (synthetic photo, not real data).
+- [x] Auto-cull batch → keepers land in `_Keeps/` only; none jump straight
+      to `_Keeps_reviewed`. Regression-guarded by
+      `test_auto_cull_keep_lands_in_plain_keeps`.
+- [x] Mark-reviewed on an auto-cull keeper moves it into
+      `_Keeps/_Keeps_reviewed/`. Verified live via `POST /mark-reviewed`.
+      Provenance pickup itself not verified this session (Provenance wasn't
+      running) — the filesystem contract (destination path) is confirmed;
+      Provenance-side debounce behavior is unchanged and out of scope here.
 - [ ] A photo sitting in plain `_Keeps` is confirmed to NOT be touched by
-      Provenance even after several minutes (regression guard for the whole
-      point of this feature).
-- [ ] Existing `_Keeps`-referencing tests (grid filtering, decision tests,
-      auto-cull tests) still pass unmodified except where Piece 1
-      intentionally changes manual-keep routing.
-- [ ] Folder-override settings (if any exist for the keep folder) still
-      produce a sane, tested `_Keeps_reviewed` location.
+      Provenance even after several minutes — not verified this session
+      (would need a live Provenance instance watching a real folder).
+- [x] Existing `_Keeps`-referencing tests still pass, updated where Piece 1
+      intentionally changes manual-keep routing: `test_raw_jpeg_companion.py`
+      and `test_analysis_mode_jpeg_priority.py` both had one assertion each
+      updated from plain `_Keeps` to `_Keeps/_Keeps_reviewed` (manual-keep
+      companion mirror tests). 345/345 passing.
+- [x] Folder-override settings still produce a sane, tested `_Keeps_reviewed`
+      location — nests under the override, not the default subfolder. See
+      `test_resolve_dest_folder_reviewed_with_override` and
+      `test_manual_keep_with_folder_override_nests_correctly`.

@@ -2,7 +2,7 @@ import { memo, useState } from 'react'
 import { Check } from 'lucide-react'
 import { API } from '../api'
 import { HighlightedText } from '../ui/primitives'
-import { middleTruncate } from '../ui/format'
+import { middleTruncate, needsReview } from '../ui/format'
 import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // ImageCard — one tile in the grid.
@@ -67,6 +67,11 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   // when set, selection is instead drawn as an absolute-overlay border that
   // hugs the inside of the tile — see `selectionOverlayBorder` below.
   inGroupBorder = false,
+  // Mark-reviewed affordance (docs/PLAN-keeps-reviewed.md Piece 2) — a
+  // hover-only top-right check button, shown only when needsReview(image)
+  // is true (auto-culled keeper still sitting in plain _Keeps) and not in
+  // select mode (avoids competing with the multi-select badge/intent).
+  onMarkReviewed,
 }) {
   // Per-card load state. RAW previews are generated on first /previews/<id>
   // request (1–3s for demosaicing), so a freshly-analyzed card needs its own
@@ -155,7 +160,7 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
 
   return (
     <div
-      className={`relative bg-[#161718] rounded-lg overflow-hidden transition-all flex items-stretch ${border} ${dimmedBySelectMode || rejectedOpacity} ${dragCursor}`}
+      className={`group relative bg-[#161718] rounded-lg overflow-hidden transition-all flex items-stretch ${border} ${dimmedBySelectMode || rejectedOpacity} ${dragCursor}`}
       draggable={draggable}
       onDragStart={draggable ? onDragStart : undefined}
       onDragEnd={draggable ? onDragEnd : undefined}
@@ -202,6 +207,24 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
           >
             <Check size={12} strokeWidth={3} />
           </span>
+        )}
+        {/* Mark-reviewed hover action — top-right, only for auto-culled
+            keepers still sitting in plain _Keeps (needsReview). Hidden in
+            select mode so it never competes with the multi-select badge or
+            intercepts a select-mode click. Hover-only (group-hover) keeps
+            the tile's normal chrome contract intact when idle — see the
+            file header's "no K/M/R chip" note; this is a review action, not
+            decision-state display, so it's allowed as an interaction
+            affordance the same way the select badge is. */}
+        {!isSelectMode && needsReview(image) && onMarkReviewed && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onMarkReviewed(image.id) }}
+            title="Mark reviewed — release to Provenance"
+            className="absolute top-1.5 right-1.5 z-10 inline-flex items-center justify-center h-6 w-6 rounded-full bg-[rgba(7,8,10,0.65)] ring-1 ring-[rgba(125,184,154,0.50)] text-[#7DB89A] opacity-0 group-hover:opacity-100 hover:bg-[rgba(125,184,154,0.25)] transition-opacity"
+          >
+            <Check size={13} strokeWidth={2.5} />
+          </button>
         )}
         {/* Shimmer overlay sits ON TOP of the <img> until it loads.
             Keeping the <img> at full opacity (rather than fading it in)
