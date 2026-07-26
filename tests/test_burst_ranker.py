@@ -303,11 +303,12 @@ def test_cache_hit_short_circuits_llm_call(tmp_db, fake_picker, fake_preview_rea
 
 
 def test_jpeg_falls_back_to_file_path_when_preview_path_null(tmp_db, fake_picker, fake_openai, monkeypatch):
-    """Non-RAW formats (JPEG/PNG/HIF) never populate preview_path — the
-    server-side /previews route streams them directly without caching.
-    Before the fallback fix, burst rank silently bailed with status="error"
-    on those photos. This test pins down the fix: when preview_path is NULL
-    AND format is JPEG, the ranker reads file_path instead."""
+    """A photo whose preview hasn't been cached yet has preview_path=NULL
+    (the /previews route populates it lazily on first request). Before the
+    fallback fix, burst rank silently bailed with status="error" on those
+    photos. This test pins down the fix: when preview_path is NULL AND
+    format is a directly-openable one like JPEG, the ranker reads file_path
+    instead of failing."""
     conn = _open_conn(tmp_db)
     for i in (1, 2, 3):
         _insert_image(conn, id=i, preview_path=None, format='JPEG',
@@ -552,15 +553,19 @@ def test_collapse_near_duplicates_merges_high_cosine(tmp_db):
     a third unrelated embedding stays separate."""
     conn = _open_conn(tmp_db)
     # ids 1 & 2: identical embedding (cosine=1.0, ≥ threshold). id 3: orthogonal.
-    _insert_image_with_emb(conn, id=1, embedding=[1.0, 0.0, 0.0], overall_score=80.0)
-    _insert_image_with_emb(conn, id=2, embedding=[1.0, 0.0, 0.0], overall_score=40.0)
+    # id=2 has the HIGHER score but is deliberately passed LAST so the rep must
+    # be chosen by priority order, not input order. Under the old
+    # top_n_candidates short-circuit (input order when n >= len) id=1 would
+    # have wrongly won as rep — this pins the priority-order contract.
+    _insert_image_with_emb(conn, id=1, embedding=[1.0, 0.0, 0.0], overall_score=40.0)
+    _insert_image_with_emb(conn, id=2, embedding=[1.0, 0.0, 0.0], overall_score=80.0)
     _insert_image_with_emb(conn, id=3, embedding=[0.0, 1.0, 0.0], overall_score=60.0)
     conn.commit()
 
     reps, merged = burst_ranker._collapse_near_duplicates([1, 2, 3], conn)
-    # id=1 has the higher overall_score so it wins as rep; id=2 is absorbed.
-    assert set(reps) == {1, 3}
-    assert sorted(merged[1]) == [1, 2]
+    # id=2 has the higher overall_score so it wins as rep; id=1 is absorbed.
+    assert set(reps) == {2, 3}
+    assert sorted(merged[2]) == [1, 2]
     assert merged[3] == [3]
     conn.close()
 
