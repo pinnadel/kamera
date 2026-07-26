@@ -271,6 +271,18 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
           : t))
       }
     } catch (err) {
+      if (err.message === 'Analysis already running') {
+        // The backend batch never actually stopped (reload, or "Resume
+        // analysis" clicked on a tab whose 'analyzing' status this frontend
+        // session never learned about) — this 409 means "reattach," not
+        // "fail." Keep the tab in 'analyzing' so the /analyze-progress
+        // poller's folderPath fallback (usePolling.js) picks the live batch
+        // back up and the progress bar reappears on its own.
+        setTabs(prev => prev.map(t => t.id === tabId
+          ? { ...t, status: 'analyzing', analyzeResult: null, progress: null }
+          : t))
+        return
+      }
       setTabs(prev => prev.map(t => t.id === tabId
         ? { ...t, status: 'error', analyzeResult: { error: err.message }, progress: null }
         : t))

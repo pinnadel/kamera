@@ -66,6 +66,27 @@ _LAP_SCALE = 12.0      # p90 of per-tile Laplacian variance
 _TEN_SCALE = 1200.0    # p90 of per-tile Tenengrad (Sobel² mean)
 _MLAP_SCALE = 7.0      # p90 of per-tile Modified Laplacian
 
+# Micro-texture false-sharp guard (2026-07-26).
+# The Laplacian/Tenengrad focus measures fire on per-pixel contrast, which a
+# defocused frame full of fine, dense micro-texture (fabric weave, dotted
+# pattern, sensor noise) produces *everywhere* — so the p90 tile aggregation,
+# meant to rescue a sharp subject from bokeh, instead reads the uniform texture
+# as uniform sharpness and saturates the score. DSCF0976.JPG (a completely
+# out-of-focus string-lights shot) fused to 18.1 (≈8× threshold → score 100)
+# purely on this artifact; its TOPIQ-NR IQA was 25.6.
+#
+# Fingerprint: real focus keeps structure after a 4× box-downsample; fooling
+# micro-texture collapses (its energy lives entirely in the finest band). We
+# measure the ratio of fine-scale (full-res) to coarse-scale (¼-res) p90
+# Tenengrad. Calibrated on the user's library (2026-07-26): the worst
+# false-sharp cases land at ratio 8.5–20.4, while every genuinely-sharp photo
+# (high IQA) stays ≤ 4.9 — so a 6.0 cutoff catches the extreme micro-texture
+# tail with zero true-sharp collateral. Deliberately conservative: the
+# decision-layer low-IQA guard (Settings → Model) is the primary safety net;
+# this only rescues the metric itself from the most egregious inflation.
+_MICROTEXTURE_RATIO = 6.0     # fine/coarse p90-Tenengrad above this = suspect
+_MICROTEXTURE_CAP   = 1.4     # cap normalized_score here (maps to ~30/100 "Blurry")
+
 
 def _per_tile(arr: np.ndarray, reducer) -> np.ndarray:
     """
@@ -130,6 +151,82 @@ def _compute_focus_measures(gray: np.ndarray) -> dict:
     }
 
 
+def _microtexture_ratio(gray: np.ndarray) -> float:
+    """
+    Fine-to-coarse Tenengrad ratio — the micro-texture false-sharp fingerprint.
+
+    Genuine focus survives a 4× box-downsample (real edges are multi-pixel);
+    fine, dense micro-texture / noise collapses because its energy lives only
+    in the finest band. So a high ratio of full-res p90 Tenengrad to ¼-res p90
+    Tenengrad flags a frame whose "sharpness" is per-pixel texture, not focus.
+    See _MICROTEXTURE_RATIO for calibration. Returns 0.0 on any failure so the
+    caller falls back to the uncapped score (fail-open — never lose a photo to
+    a guard bug).
+    """
+    try:
+        gray64 = gray.astype(np.float64)
+        gx = cv2.Sobel(gray64, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray64, cv2.CV_64F, 0, 1, ksize=3)
+        fine = float(np.percentile(gx * gx + gy * gy, _TILE_PERCENTILE))
+
+        small = cv2.resize(
+            gray64,
+            (max(1, gray64.shape[1] // 4), max(1, gray64.shape[0] // 4)),
+            interpolation=cv2.INTER_AREA,
+        )
+        gxc = cv2.Sobel(small, cv2.CV_64F, 1, 0, ksize=3)
+        gyc = cv2.Sobel(small, cv2.CV_64F, 0, 1, ksize=3)
+        coarse = float(np.percentile(gxc * gxc + gyc * gyc, _TILE_PERCENTILE))
+        return fine / max(coarse, 1.0)
+    except Exception:
+        return 0.0
+
+
+def _score_from_gray(gray: np.ndarray) -> dict:
+    """
+    Shared sharpness scoring on a grayscale image — the common tail of both
+    detect_sharpness() (file path) and detect_sharpness_array() (pre-decoded
+    RGB). Computes the tile-based p90 fusion, then applies the micro-texture
+    cap so a defocused frame full of fine texture can't saturate the score.
+    """
+    height, width = gray.shape
+    tile_measures = _compute_focus_measures(gray)
+
+    p90_lap  = float(np.percentile(tile_measures['laplacian_variance'],  _TILE_PERCENTILE))
+    p90_ten  = float(np.percentile(tile_measures['tenengrad'],           _TILE_PERCENTILE))
+    p90_mlap = float(np.percentile(tile_measures['modified_laplacian'],  _TILE_PERCENTILE))
+
+    normalized_score = float(np.cbrt(
+        (p90_lap  / _LAP_SCALE)
+        * (p90_ten  / _TEN_SCALE)
+        * (p90_mlap / _MLAP_SCALE)
+    ))
+
+    # Micro-texture guard: cap an inflated score when the frame's apparent
+    # sharpness is fine per-pixel texture rather than real focus. Only ever
+    # lowers a score, and only when it's already above the cap — a genuinely
+    # sharp photo (ratio ≤ ~5) is never touched.
+    microtexture_ratio = _microtexture_ratio(gray)
+    microtexture_capped = (
+        microtexture_ratio >= _MICROTEXTURE_RATIO
+        and normalized_score > _MICROTEXTURE_CAP
+    )
+    if microtexture_capped:
+        normalized_score = _MICROTEXTURE_CAP
+
+    return {
+        'raw_score': p90_lap,
+        'normalized_score': normalized_score,
+        'p90_laplacian_variance': p90_lap,
+        'p90_tenengrad': p90_ten,
+        'p90_modified_laplacian': p90_mlap,
+        'microtexture_ratio': round(microtexture_ratio, 2),
+        'microtexture_capped': microtexture_capped,
+        'width': width,
+        'height': height,
+    }
+
+
 def get_threshold(image_path, thresholds=None):
     """Return the sharpness threshold for a given file format."""
     ext = image_path.suffix.lstrip('.').upper()
@@ -154,6 +251,8 @@ def detect_sharpness(image_path):
             'p90_laplacian_variance'    — p90 of per-tile Laplacian variance
             'p90_tenengrad'             — p90 of per-tile Tenengrad
             'p90_modified_laplacian'    — p90 of per-tile Modified Laplacian
+            'microtexture_ratio'        — fine/coarse Tenengrad (false-sharp fingerprint)
+            'microtexture_capped'       — True if the micro-texture guard fired
             'width', 'height'           — image dimensions
         or None on error.
     """
@@ -187,36 +286,9 @@ def detect_sharpness(image_path):
                 rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        height, width = gray.shape
-
-        tile_measures = _compute_focus_measures(gray)
-
-        # p90 across all 256 tiles for each measure. Percentile (not max)
-        # because max is fooled by a single noisy tile; p90 needs ~25 tiles to
-        # be in focus, matching the minimum realistic subject-in-focus area.
-        p90_lap = float(np.percentile(tile_measures['laplacian_variance'], _TILE_PERCENTILE))
-        p90_ten = float(np.percentile(tile_measures['tenengrad'], _TILE_PERCENTILE))
-        p90_mlap = float(np.percentile(tile_measures['modified_laplacian'], _TILE_PERCENTILE))
-
-        # Geometric mean of scale-normalized p90 values. Geometric mean still
-        # penalizes any single weak measure, but since all three are now
-        # computed on the same sharp-region tiles, a truly sharp subject
-        # pushes all three up together — they no longer fight each other.
-        normalized_score = float(np.cbrt(
-            (p90_lap / _LAP_SCALE)
-            * (p90_ten / _TEN_SCALE)
-            * (p90_mlap / _MLAP_SCALE)
-        ))
-
-        return {
-            'raw_score': p90_lap,
-            'normalized_score': normalized_score,
-            'p90_laplacian_variance': p90_lap,
-            'p90_tenengrad': p90_ten,
-            'p90_modified_laplacian': p90_mlap,
-            'width': width,
-            'height': height,
-        }
+        # Tile-based p90 fusion + micro-texture cap — shared with the
+        # pre-decoded path in detect_sharpness_array via _score_from_gray.
+        return _score_from_gray(gray)
     except Exception as e:
         print(f"   ⚠️  Error processing {image_path.name}: {e}")
         return None
@@ -232,29 +304,8 @@ def detect_sharpness_array(rgb: np.ndarray) -> dict | None:
     """
     try:
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        height, width = gray.shape
-
-        tile_measures = _compute_focus_measures(gray)
-
-        p90_lap  = float(np.percentile(tile_measures['laplacian_variance'],   _TILE_PERCENTILE))
-        p90_ten  = float(np.percentile(tile_measures['tenengrad'],            _TILE_PERCENTILE))
-        p90_mlap = float(np.percentile(tile_measures['modified_laplacian'],   _TILE_PERCENTILE))
-
-        normalized_score = float(np.cbrt(
-            (p90_lap  / _LAP_SCALE)
-            * (p90_ten  / _TEN_SCALE)
-            * (p90_mlap / _MLAP_SCALE)
-        ))
-
-        return {
-            'raw_score': p90_lap,
-            'normalized_score': normalized_score,
-            'p90_laplacian_variance': p90_lap,
-            'p90_tenengrad': p90_ten,
-            'p90_modified_laplacian': p90_mlap,
-            'width': width,
-            'height': height,
-        }
+        # Same tile-based p90 fusion + micro-texture cap as the file path.
+        return _score_from_gray(gray)
     except Exception as e:
         print(f"   ⚠️  Sharpness array analysis error: {e}")
         return None

@@ -102,6 +102,7 @@ export function FilterPill({
     <div className="relative" data-dropdown="true">
       <div className={`inline-flex items-center rounded-lg border whitespace-nowrap transition-colors ${containerActive}`}>
         <button
+          onMouseDown={(e) => e.preventDefault()}
           onClick={() => (open ? closeAll() : onOpen())}
           title="Filter"
           aria-label="Filter"

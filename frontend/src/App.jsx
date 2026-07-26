@@ -1153,9 +1153,23 @@ export default function App() {
   // Only steal focus when it's already inside the grid — never from search,
   // settings, modals, or any other surface. preventScroll avoids the browser
   // double-scrolling on top of our explicit scrollIntoView.
+  //
+  // Gate on the selected photo's ID actually changing (real navigation), not
+  // on `selectedGridIdx` drifting — /images returns newest-first, so a batch
+  // landing new rows shifts the selected photo's grid POSITION underneath it
+  // every poll tick even though selectedIdx still id-tracks the same photo.
+  // Without this gate, every mid-batch arrival re-fired scrollIntoView and
+  // stole DOM focus, yanking the viewport off whatever the user was looking
+  // at. Also skip entirely while a batch is running on the active tab —
+  // belt-and-suspenders so no arrival-triggered re-render can nudge scroll.
+  const lastScrolledIdRef = useRef(null)
   useEffect(() => {
     if (!gridRef.current || selectedGridIdx < 0) return
     if (!userHasNavigatedRef.current) return
+    if (analyzing) return
+    const currentId = images[selectedIdx]?.id ?? null
+    if (currentId != null && currentId === lastScrolledIdRef.current) return
+    lastScrolledIdRef.current = currentId
     const el = gridRef.current.querySelector(`[data-grid-idx="${selectedGridIdx}"]`)
     if (!el) return
     el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
@@ -1170,7 +1184,7 @@ export default function App() {
     if (gridRef.current.contains(active) || focusUnowned) {
       el.focus({ preventScroll: true })
     }
-  }, [selectedIdx, selectedGridIdx])
+  }, [selectedIdx, selectedGridIdx, images, analyzing])
 
   // Flip the navigation-gate on the first real user interaction with the grid
   // (pointer down on a tile or any cursor-moving key while focus is in the
@@ -1734,6 +1748,13 @@ export default function App() {
   }, [])
 
   const amendLastDecision = useCallback(async (decision) => {
+    // Amend is a single-photo "fix my last press" gesture keyed off whatever
+    // landed on top of the shared undo stack. It has no concept of the
+    // current selection, so while multi-select is active it must never fire —
+    // otherwise a double-press mid-bulk-action silently re-targets just the
+    // last decision's photo(s) instead of running bulkSendDecision on the
+    // whole selection.
+    if (gridMultiSelect.isSelectMode) return false
     const intent = lastDecisionIntentRef.current
     if (!intent) return false
     if (Date.now() - intent.timestamp > AMEND_WINDOW_MS) return false
@@ -1807,7 +1828,7 @@ export default function App() {
 
     loadModelInfo()
     return true
-  }, [undoStack, setImages, addToast, loadModelInfo])
+  }, [undoStack, setImages, addToast, loadModelInfo, gridMultiSelect.isSelectMode])
 
   const bulkCompareFromSelection = useCallback(() => {
     const ids = Array.from(gridMultiSelect.selected)
@@ -2586,8 +2607,12 @@ export default function App() {
             DB's analysis_status='done' set; if the delta is > 0 we show
             a one-click resume. analyze_folder already skips done files,
             so resume == "re-POST analyze," nothing fancier. Hidden while
-            analyzing so the progress bar takes precedence. */}
+            analyzing so the progress bar takes precedence. Also hidden while
+            liveAnalyzing (watch-live import running against this same
+            folder) — otherwise a stale unfinishedCount snapshot offers to
+            "resume" a folder that's actively importing right now. */}
         {!analyzing
+          && !liveAnalyzing
           && activeTab
           && activeTab.status === 'ready'
           && activeTab.folderPath
@@ -2599,6 +2624,7 @@ export default function App() {
               </div>
               <button
                 type="button"
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => runAnalysisForTab(activeTab.id, activeTab.folderPath, activeTab.includeSubfolders)}
                 className="px-2.5 py-1 rounded-md text-xs font-medium bg-[rgba(232,184,74,0.20)] text-[#E8B84A] border border-[rgba(232,184,74,0.40)] hover:opacity-80 transition-opacity whitespace-nowrap"
                 title="Re-run analysis on this folder. Already-analyzed photos skip; only the unfinished ones get processed."
@@ -2799,6 +2825,7 @@ export default function App() {
             ].map(({ key, label, count, color, Icon }) => (
               <button
                 key={key ?? 'all'}
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => setDecisionFilter(prev => prev === key ? null : key)}
                 className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[14px] font-medium transition-colors whitespace-nowrap ${
                   decisionFilter === key ? 'bg-[#1b1c1e]' : 'hover:bg-[rgba(255,255,255,0.03)]'
@@ -2834,6 +2861,7 @@ export default function App() {
                   const disabled = n < 2 || overCap
                   return (
                     <button
+                      onMouseDown={(e) => e.preventDefault()}
                       onClick={bulkCompareFromSelection}
                       disabled={disabled}
                       title={
@@ -2848,6 +2876,7 @@ export default function App() {
                   )
                 })()}
                 <button
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => setMoveModalOpen(true)}
                   disabled={gridMultiSelect.size === 0}
                   title="Move the selection into an existing group"
@@ -2856,6 +2885,7 @@ export default function App() {
                   <FolderInputIcon size={14} /> Move into group…
                 </button>
                 <button
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => {
                     const ids = Array.from(gridMultiSelect.selected)
                     if (ids.length < 2) return
@@ -2869,6 +2899,7 @@ export default function App() {
                   <Plus size={14} /> New group
                 </button>
                 <button
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => gridMultiSelect.exit()}
                   className="px-2 py-1 rounded text-xs text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.05)] transition-colors"
                 >
@@ -2914,18 +2945,18 @@ export default function App() {
             {bulkConfirm === 'mark-all-reviewed' ? (
               <div className="ml-auto flex items-center gap-2">
                 <span className="text-[#7DB89A]">Mark {needsReviewIds.length} reviewed?</span>
-                <button onClick={() => bulkMarkReviewed(needsReviewIds)} disabled={bulkRunning}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => bulkMarkReviewed(needsReviewIds)} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.20)] border border-[rgba(255,255,255,0.10)] text-[#7DB89A] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
                   {bulkRunning ? 'Marking…' : 'Confirm'}
                 </button>
-                <button onClick={() => setBulkConfirm(null)}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
                   <X size={14} /> Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setBulkConfirm('mark-all-reviewed')}
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('mark-all-reviewed')}
                 className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.12)] border border-[rgba(125,184,154,0.30)] text-[#7DB89A] hover:opacity-70 transition-opacity">
                 <Check size={14} /> Mark all reviewed
               </button>
@@ -2945,18 +2976,18 @@ export default function App() {
             {bulkConfirm === 'reject-maybes' ? (
               <div className="ml-auto flex items-center gap-2">
                 <span className="text-[#E8B84A]">Reject all {decisionCounts.maybe}?</span>
-                <button onClick={rejectAllMaybes} disabled={bulkRunning}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={rejectAllMaybes} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.20)] border border-[rgba(255,255,255,0.10)] text-[#C97B7B] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
                   {bulkRunning ? 'Moving…' : 'Confirm'}
                 </button>
-                <button onClick={() => setBulkConfirm(null)}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
                   <X size={14} /> Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setBulkConfirm('reject-maybes')}
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('reject-maybes')}
                 className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(232,184,74,0.12)] border border-[rgba(232,184,74,0.30)] text-[#E8B84A] hover:opacity-70 transition-opacity">
                 <Trash2 size={14} /> Reject maybes
               </button>
@@ -2973,18 +3004,18 @@ export default function App() {
             {bulkConfirm === 'trash-rejects' ? (
               <div className="ml-auto flex items-center gap-2">
                 <span className="text-[#C97B7B]">Move {decisionCounts.reject} {decisionCounts.reject === 1 ? 'photo' : 'photos'} to Trash?</span>
-                <button onClick={trashAllRejects} disabled={bulkRunning}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={trashAllRejects} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.20)] border border-[rgba(255,255,255,0.10)] text-[#C97B7B] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
                   {bulkRunning ? 'Trashing…' : 'Confirm'}
                 </button>
-                <button onClick={() => setBulkConfirm(null)}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
                   <X size={14} /> Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setBulkConfirm('trash-rejects')}
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('trash-rejects')}
                 className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.12)] border border-[rgba(201,123,123,0.30)] text-[#C97B7B] hover:opacity-70 transition-opacity">
                 <Trash2 size={14} /> Move to system trash
               </button>
@@ -3627,6 +3658,7 @@ export default function App() {
                   >
                     <span className="font-medium">{chip.label}</span>
                     <button
+                      onMouseDown={(e) => e.preventDefault()}
                       onClick={() => setFilters(chip.next)}
                       title={`Remove ${chip.label} filter`}
                       aria-label={`Remove ${chip.label} filter`}
@@ -3638,6 +3670,7 @@ export default function App() {
                 ))}
                 {chips.length > 1 && (
                   <button
+                    onMouseDown={(e) => e.preventDefault()}
                     onClick={() => setFilters(EMPTY_FILTER)}
                     className="px-1.5 h-[22px] rounded-md text-[11px] text-[#9c9c9d] hover:text-[#f0f0f0] hover:bg-[rgba(255,255,255,0.05)] transition-colors"
                   >
@@ -3680,6 +3713,7 @@ export default function App() {
           {activeView === 'grid' && !detailOpen && (
             <>
               <button
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => gridMultiSelect.isSelectMode ? gridMultiSelect.exit() : gridMultiSelect.enter()}
                 className={`px-2 py-1 rounded-lg text-xs transition-colors border border-transparent whitespace-nowrap inline-flex items-center gap-1.5 ${gridMultiSelect.isSelectMode ? ACTIVE_TOGGLE : 'text-[#cecece] hover:opacity-70'}`}
                 title="Multi-select photos to act on as a batch"

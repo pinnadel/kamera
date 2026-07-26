@@ -105,6 +105,8 @@ const DECISION_DEFAULTS = {
   // PR3 boundary routing.
   auto_cull_uncertain_to_maybe: true,
   uncertainty_threshold:        8.0,
+  // Burst keep-cap post-pass.
+  auto_cull_cap_burst_keeps:    true,
 }
 
 export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onExportModel, onImportModel, importingModel, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
@@ -170,6 +172,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     iso_ceiling:                settings?.iso_ceiling                ?? DECISION_DEFAULTS.iso_ceiling,
     auto_cull_uncertain_to_maybe: settings?.auto_cull_uncertain_to_maybe ?? DECISION_DEFAULTS.auto_cull_uncertain_to_maybe,
     uncertainty_threshold:        settings?.uncertainty_threshold        ?? DECISION_DEFAULTS.uncertainty_threshold,
+    auto_cull_cap_burst_keeps:    settings?.auto_cull_cap_burst_keeps    ?? DECISION_DEFAULTS.auto_cull_cap_burst_keeps,
   })
   const [decision, setDecision]               = useState(initDecision)
   const [savedDecision, setSavedDecision]     = useState(initDecision)
@@ -653,6 +656,13 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     indent
                   />
                 )}
+
+                <ToggleRow
+                  label="Cap Keep at one photo per burst"
+                  tooltip="Auto-cull scores each photo independently, so several near-identical frames in the same burst (same pose, seconds apart) can each clear the Keep cutoff and all land in _Keeps/. When on, only the single best-scoring photo per similarity burst is allowed to auto-cull to Keep — every other member that scored Keep demotes to Maybe instead, so you still get to review the alternates."
+                  enabled={decision.auto_cull_cap_burst_keeps}
+                  onChange={v => updField('auto_cull_cap_burst_keeps', v)}
+                />
               </div>
 
               {/* Fallback cutoffs — collapsed behind Advanced accordion */}

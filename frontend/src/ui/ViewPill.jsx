@@ -78,6 +78,7 @@ export function ViewPill({
           visual difference). Behaviour stays identical: any click toggles
           the overlay. */}
       <button
+        onMouseDown={(e) => e.preventDefault()}
         onClick={toggle}
         title="View"
         aria-label="View"

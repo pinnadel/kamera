@@ -220,6 +220,38 @@ def test_auto_cull_scores_each_side_of_a_pair_independently(
     assert _decision(patched, 2) == "keep"
 
 
+def test_auto_cull_still_mirrors_to_skipped_jpeg_priority_stub(
+    patched: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for a bug where the fix above (_mirror=False in
+    run_auto_cull) was too blunt: it also silenced mirroring onto
+    analysis_mode=jpeg_priority's unscored 'skipped' RAW stub rows (see
+    test_analysis_mode_jpeg_priority.py). Those rows never reach
+    analysis_status='done', so run_auto_cull's own SELECT never picks them up
+    and they never get an entry in `decisions`/`reasons` — mirroring is the
+    ONLY way they're ever decided and moved. Real-world case: a whole batch of
+    JPEGs got auto-culled and moved while their RAF twins sat undecided in the
+    source folder, because the skipped-stub mirror path was collateral damage
+    of the independent-scoring fix above."""
+    _set_mode(monkeypatch, "both")
+    _insert_image(patched, image_id=1, uuid="jpg-6", filename="DSCF6000.JPG",
+                  fmt="JPG", overall_score=99.0, sharpness_score=99.0)  # → keep
+    with get_db(patched) as conn:
+        conn.execute(
+            """
+            INSERT INTO images (id, file_path, filename, uuid, source_folder,
+                                format, overall_score, sharpness_score, analysis_status)
+            VALUES (2, '/fake/source/DSCF6000.RAF', 'DSCF6000.RAF', 'raw-6',
+                    '/fake/source', 'RAF', NULL, NULL, 'skipped')
+            """
+        )
+
+    decisions_mod.run_auto_cull()
+
+    assert _decision(patched, 1) == "keep"
+    assert _decision(patched, 2) == "keep"
+
+
 def test_mirror_only_pairs_within_same_source_folder(
     patched: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

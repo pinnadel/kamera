@@ -248,10 +248,13 @@ def _load_preview_pil(image_id: int) -> PilImage.Image:
     """
     Resolve image_id → an RGB PIL image of the displayed preview.
 
-    Reaches for the on-disk cached preview first (instant), falls back to
-    generating one for RAW formats, or thumbnailing the source for JPEG/PNG.
-    Used by both the histogram endpoint and the clipping-mask endpoint so the
-    pixels they analyze are exactly the pixels DetailView shows.
+    Reaches for the on-disk cached preview first (instant); on a miss,
+    generates one via _generate_preview (RAW demosaic or plain decode
+    depending on format) AND persists it to data/previews/, same as
+    GET /previews/{id} — every format is cached unconditionally now (see
+    that endpoint's docstring for why HIF needed this too). Used by both
+    the histogram endpoint and the clipping-mask endpoint so the pixels
+    they analyze are exactly the pixels DetailView shows.
 
     Raises HTTPException(404) if the image_id is unknown or the source file
     is missing from disk.
@@ -274,15 +277,18 @@ def _load_preview_pil(image_id: int) -> PilImage.Image:
         return PilImage.open(str(cached_path)).convert("RGB")
 
     fmt = (row["format"] or "").upper()
-    if fmt in RAW_FORMATS:
-        jpeg_bytes = _generate_preview(file_path, fmt)
-        return PilImage.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+    jpeg_bytes = _generate_preview(file_path, fmt)
 
-    from PIL import ImageOps
-    img = PilImage.open(str(file_path))
-    img = ImageOps.exif_transpose(img)
-    img.thumbnail(PREVIEW_SIZE, PilImage.LANCZOS)
-    return img.convert("RGB")
+    PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = PREVIEW_CACHE_DIR / f"{image_id}.jpg"
+    cache_file.write_bytes(jpeg_bytes)
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE images SET preview_path = ? WHERE id = ?",
+            (str(cache_file), image_id),
+        )
+
+    return PilImage.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
 
 def _warm_models() -> None:
@@ -684,8 +690,51 @@ def _run_batch(
     # so the previous "fresh DB connection per photo per setting" pattern
     # was pure overhead (~10ms × 741 = ~7s on a typical batch).
     from phase1_technical.quality_analyzer import get_sharpness_weight as _get_sharpness_weight
+    from phase1_technical.quality_analyzer import decode_raw as _decode_raw, RAW_DECODE_SUFFIXES
+    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
     sharpness_weight = _get_sharpness_weight()
     jpeg_priority = get_analysis_mode() == "jpeg_priority"
+
+    def _needs_full_raw_decode(p: Path) -> bool:
+        # Mirrors the skip_scoring gate below: only a RAW file that will
+        # actually reach analyze_photo_quality's expensive decode qualifies
+        # for prefetch. Paired RAWs under jpeg_priority take the lightweight
+        # EXIF-only path and never decode at all.
+        if p.suffix.lower() not in RAW_DECODE_SUFFIXES:
+            return False
+        if jpeg_priority and is_raw_format(p.suffix.lstrip(".").upper()) and has_processed_sibling(p):
+            return False
+        return True
+
+    # One-ahead RAW decode prefetch: while photo N's scorers are running,
+    # decode photo N+1's RAW data on this single background worker so the
+    # ~17s rawpy.postprocess() cost (GIL-releasing, CPU-bound) overlaps with
+    # scoring instead of stalling the loop. Bounded to exactly one photo
+    # ahead — each decoded RAF is tens of MB, and decode already outlasts
+    # scoring per photo, so a deeper queue would only add memory pressure
+    # without shortening the batch further. Scoped to orphan RAWs only
+    # (jpeg_priority already skips paired ones before they'd ever decode).
+    _prefetch_pool = _ThreadPoolExecutor(max_workers=1)
+    _prefetch: dict[str, Any] = {"path": None, "future": None}
+
+    def _submit_prefetch(p: Path) -> None:
+        if _needs_full_raw_decode(p):
+            _prefetch["path"] = str(p)
+            _prefetch["future"] = _prefetch_pool.submit(_decode_raw, str(p))
+        else:
+            _prefetch["path"] = None
+            _prefetch["future"] = None
+
+    def _take_predecoded(path_str: str):
+        if _prefetch["path"] == path_str and _prefetch["future"] is not None:
+            fut = _prefetch["future"]
+            _prefetch["path"] = None
+            _prefetch["future"] = None
+            return fut.result()
+        return None
+
+    if to_analyze:
+        _submit_prefetch(to_analyze[0])
 
     try:
         with get_db() as conn:
@@ -696,6 +745,17 @@ def _run_batch(
                 # Top-of-loop stop check — catches a Stop pressed between files.
                 if _progress.get("stop_requested") or _stop_event.is_set():
                     break
+
+                # Claim this photo's predecoded RAW data (if any) BEFORE
+                # submitting the next photo's prefetch — _submit_prefetch
+                # overwrites the single prefetch slot, so reading it first
+                # avoids losing the current photo's already-finished decode.
+                predecoded = _take_predecoded(str(file_path))
+
+                # Kick off next photo's RAW decode now, before this photo's
+                # scoring starts, so the two overlap on separate threads.
+                if i < len(to_analyze):
+                    _submit_prefetch(to_analyze[i])
 
                 # Periodically rescan the folder for files that arrived after
                 # the batch started (or after the last rescan) — e.g. a card
@@ -759,6 +819,7 @@ def _run_batch(
                             path_str,
                             stop_event=_stop_event,
                             sharpness_weight=sharpness_weight,
+                            predecoded=predecoded,
                         )
                         _progress["_current_step"] = "exif"
                         exif   = extract_exif(path_str)
@@ -824,6 +885,10 @@ def _run_batch(
                 _progress["done"] += 1
 
     finally:
+        # Drop any in-flight prefetch immediately on Stop/error rather than
+        # blocking batch teardown on a decode whose result nothing will use.
+        _prefetch_pool.shutdown(wait=False, cancel_futures=True)
+
         # Write final counts so the last /analyze-progress poll can report totals.
         # elapsed is computed from the monotonic started_at stamp so it is
         # immune to wall-clock drift / NTP corrections during long batches.
@@ -1038,9 +1103,20 @@ def get_preview(image_id: int):
     """
     Serve a high-quality preview for the UI.
 
-    RAW files are demosaiced at half-resolution on first request and cached
-    to data/previews/ so every subsequent load is instant. JPEG/PNG files
-    are served directly without caching (they're already compressed).
+    Every format is demosaiced/decoded on first request and cached to
+    data/previews/ so every subsequent load — including after an app
+    reload — is instant. This used to be RAW-only (JPEG/PNG were re-decoded
+    on every request on the assumption that "already compressed" meant
+    "cheap to decode"), but .HIF (HEIF) breaks that assumption: pillow-heif
+    decode is comparably expensive to a RAW demosaic, so a folder full of
+    HIF-only shots (X100VI/X Half) re-paid that cost on every single reload.
+    Caching is unconditional now — cheap formats just get a near-instant
+    first write, expensive ones get the same speedup RAW already had.
+
+    Cache lifecycle: cleared alongside the DB row by clear-folder (tab
+    close), clear-analysis, and sync-folder (file moved/deleted outside the
+    app) — see _delete_image_rows(). A same-content move (K/M/R decision)
+    leaves preview_path untouched since the cached bytes are still valid.
 
     Raises 404 if the image_id doesn't exist or the file has been moved.
     """
@@ -1057,24 +1133,12 @@ def get_preview(image_id: int):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File missing from disk: {file_path}")
 
-    fmt = (row["format"] or "").upper()
-
-    # Serve non-RAW files directly — no cache needed.
-    if fmt not in RAW_FORMATS:
-        from PIL import ImageOps
-        img = PilImage.open(str(file_path))
-        img = ImageOps.exif_transpose(img)
-        img.thumbnail(PREVIEW_SIZE, PilImage.LANCZOS)
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=PREVIEW_QUALITY)
-        return Response(content=buf.getvalue(), media_type="image/jpeg")
-
-    # RAW: check the disk cache first.
     cached_path = Path(row["preview_path"]) if row["preview_path"] else None
     if cached_path and cached_path.exists():
         return Response(content=cached_path.read_bytes(), media_type="image/jpeg")
 
     # Cache miss — generate and persist.
+    fmt = (row["format"] or "").upper()
     jpeg_bytes = _generate_preview(file_path, fmt)
 
     PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)

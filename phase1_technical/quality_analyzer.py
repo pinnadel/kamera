@@ -35,6 +35,17 @@ DEFAULT_FACE_SHARP_FLOOR       = 20.0  # face-soft instant reject when frame is 
 DEFAULT_REJECT_SOFT_FACE       = True
 DEFAULT_REJECT_BLURRY_FRAME    = True
 DEFAULT_REJECT_CLOSED_EYES     = True
+# Low-IQA instant reject (2026-07-26). TOPIQ-NR IQA is a whole-frame perceptual
+# quality score that correctly flags the false-sharp failure mode the Phase-1
+# sharpness metric misses (e.g. DSCF0976.JPG: sharpness 100 but IQA 25.6, a
+# completely out-of-focus frame). `overall_score` is Phase-1 only, so IQA never
+# reached the auto-decision until now. On by default because it's the primary
+# safety net for the micro-texture false-sharp bug; the floor is set well below
+# where genuinely-sharp-but-noisy shots land (the user's true-sharp photos sit
+# at IQA 74–78; the false-sharp cluster is all < 30), so it only fires on the
+# clearly-bad tail. Applies in BOTH personal-model and threshold-fallback modes.
+DEFAULT_REJECT_LOW_IQA         = True
+DEFAULT_IQA_FLOOR              = 30.0   # iqa_score below this → instant reject
 # When True, the closed-eyes reject only fires when EVERY detected face has
 # closed eyes. The legacy `eyes_open` column stores only the primary face's
 # state, so we conservatively scope this to single-face shots — group photos
@@ -67,6 +78,17 @@ DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE = True
 # Default 8.0 = roughly one "tier" of disagreement among ensemble members
 # on the personal_score scale.
 DEFAULT_UNCERTAINTY_THRESHOLD: float = 8.0
+
+# Burst keep-cap post-pass (2026-07-25): each member of a similarity burst is
+# scored independently, so a run of near-identical frames (same pose, same
+# scene, seconds apart) can each individually clear the Keep cutoff and all
+# land in _Keeps/ — the grouping/dedup step users expect never actually
+# fires for auto-cull. When on, run_auto_cull() (and its preview) demote
+# every burst member past the single best-by-priority photo from keep →
+# maybe, so only one hero per moment survives to Keep automatically. Inverse
+# of the existing burst_keep_guarantee floor pass (which rescues a burst from
+# zero keeps); this one caps a burst at one.
+DEFAULT_AUTO_CULL_CAP_BURST_KEEPS = True
 
 # How often analyze_photo_quality should call torch.mps.empty_cache().
 # Every photo costs ~5-20ms and 741 calls = 3.7-14.8s of pure cache flush
@@ -109,6 +131,50 @@ def get_sharpness_weight() -> float:
     return _read_float("sharpness_weight", DEFAULT_SHARPNESS_WEIGHT, 0.0, 1.0)
 
 
+# Soft-saturation knee for the sharpness score (2026-07-26). The old mapping
+# `min(100, ratio * 50)` clipped hard at ratio ≥ 2× threshold, so ~half the
+# library (338/664 photos) read *exactly* 100 and the top half of the 0-100
+# scale carried no information — a genuinely tack-sharp shot and a merely-fine
+# one were indistinguishable, and Phase 3 lost that gradient as a feature.
+#
+# The old score was `ratio * 50` (slope 50), clipped at 100 when ratio ≥ 2.
+# We keep that exact slope-50 line UNCHANGED below the knee, so every score up
+# to the knee is bit-for-bit identical to before — critically the label cuts
+# (Sharp ≥ 70 at ratio 1.4, Borderline ≥ 40 at ratio 0.8) and the threshold
+# anchor (50 at ratio 1.0) do not move at all. Only the *clipped* region
+# (ratio > 1.8, which used to pile up on 100) is replaced with a log knee that
+# spreads it across the last 10 points.
+_SHARP_KNEE_RATIO = 1.8   # below this: unchanged linear slope-50 (→ score 90)
+_SHARP_KNEE_SCORE = 90.0  # ratio 1.8 * 50 = 90 — the two pieces meet here
+_SHARP_TAIL_K     = 1.2   # log-compression rate for the ratio > knee tail
+
+
+def sharpness_score_from_ratio(ratio: float) -> int:
+    """
+    Map a normalized-sharpness / threshold ratio to a 0-100 score.
+
+    Piecewise: the original linear `ratio * 50` up to the knee at ratio 1.8
+    (→ 90), then a saturating log curve compresses the previously-clipped
+    ratio>1.8 tail into 90-100. Continuous and monotonic at the knee. Replaces
+    the old hard `min(100, ratio * 50)` clip that pinned ~half the library to
+    exactly 100. See the _SHARP_* constants for why the knee sits at 1.8/90.
+    """
+    import math
+    if ratio <= _SHARP_KNEE_RATIO:
+        # Unchanged from the legacy formula in the region that matters for
+        # labels and the threshold anchor.
+        score = ratio * 50.0
+    else:
+        # Log compression above the knee: excess maps through 1 - e^(-k*excess)
+        # into the final 10-point band. Approaches 100 asymptotically — a ratio
+        # of ~5 lands near 99, only the extreme tail (ratio 7+) rounds to 100.
+        excess = ratio - _SHARP_KNEE_RATIO
+        score = _SHARP_KNEE_SCORE + (100.0 - _SHARP_KNEE_SCORE) * (
+            1.0 - math.exp(-_SHARP_TAIL_K * excess)
+        )
+    return min(100, round(score))
+
+
 def compute_overall_score(
     sharpness_score: float,
     exposure_score: float,
@@ -137,6 +203,8 @@ def get_decision_thresholds() -> dict:
         "face_sharpness_floor":      _read_float("face_sharpness_floor",      DEFAULT_FACE_SHARP_FLOOR,       0.0, 100.0),
         "reject_soft_face":           _read_bool ("reject_soft_face",           DEFAULT_REJECT_SOFT_FACE),
         "reject_blurry_frame":        _read_bool ("reject_blurry_frame",        DEFAULT_REJECT_BLURRY_FRAME),
+        "reject_low_iqa":             _read_bool ("reject_low_iqa",             DEFAULT_REJECT_LOW_IQA),
+        "iqa_floor":                  _read_float("iqa_floor",                  DEFAULT_IQA_FLOOR, 0.0, 100.0),
         "reject_closed_eyes":         _read_bool ("reject_closed_eyes",         DEFAULT_REJECT_CLOSED_EYES),
         "reject_closed_eyes_all_faces": _read_bool ("reject_closed_eyes_all_faces", DEFAULT_REJECT_CLOSED_EYES_ALL_FACES),
         "reject_reciprocal_rule":     _read_bool ("reject_reciprocal_rule",     DEFAULT_REJECT_RECIPROCAL_RULE),
@@ -151,6 +219,9 @@ def get_decision_thresholds() -> dict:
             "auto_cull_uncertain_to_maybe", DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE),
         "uncertainty_threshold":        _read_float(
             "uncertainty_threshold", DEFAULT_UNCERTAINTY_THRESHOLD, 0.0, 50.0),
+        # Burst keep-cap post-pass.
+        "auto_cull_cap_burst_keeps": _read_bool(
+            "auto_cull_cap_burst_keeps", DEFAULT_AUTO_CULL_CAP_BURST_KEEPS),
     }
 
 
@@ -169,7 +240,7 @@ def calculate_sharpness(image_path: str) -> dict:
 
     threshold = get_threshold(path)
     ratio = result['normalized_score'] / threshold
-    sharpness_score = min(100, round(ratio * 50))
+    sharpness_score = sharpness_score_from_ratio(ratio)
 
     if sharpness_score >= 70:
         sharpness_label = "Sharp"
@@ -188,10 +259,47 @@ def calculate_sharpness(image_path: str) -> dict:
     }
 
 
+RAW_DECODE_SUFFIXES = (".raf", ".nef", ".3fr", ".cr2", ".arw", ".dng")
+
+
+def decode_raw(image_path: str) -> tuple:
+    """
+    Demosaic a RAW file into (rgb_full, pil_full) — the shared inputs every
+    Phase 1/2 scorer needs. Split out of analyze_photo_quality so the batch
+    loop can prefetch this (GIL-releasing, CPU-bound) step for the next photo
+    while the current photo's scorers are still running. Pure decode, no
+    scoring — safe to run off the main analysis thread.
+    """
+    import rawpy
+    from PIL import Image as _PILImage
+    import io as _io
+
+    path = Path(image_path)
+    try:
+        with rawpy.imread(str(path)) as raw:
+            rgb_full = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)
+        pil_full = _PILImage.fromarray(rgb_full)
+    except rawpy.LibRawFileUnsupportedError:
+        # Nikon Z6 III / Z8 / Z9 write NEFs with "High Efficiency*" compression
+        # that current LibRaw can't demosaic. The full-resolution embedded
+        # JPEG (extracted via extract_thumb) is fine for culling — same
+        # 6048×4032 dimensions, just baked colors. Sharpness/exposure/face/
+        # IQA/aesthetic/embedding all work on JPEG input.
+        with rawpy.imread(str(path)) as raw:
+            thumb = raw.extract_thumb()
+        if thumb.format != rawpy.ThumbFormat.JPEG:
+            raise
+        pil_full = _PILImage.open(_io.BytesIO(thumb.data)).convert("RGB")
+        import numpy as _np
+        rgb_full = _np.asarray(pil_full)
+    return rgb_full, pil_full
+
+
 def analyze_photo_quality(
     image_path: str,
     stop_event: threading.Event | None = None,
     sharpness_weight: float | None = None,
+    predecoded: tuple | None = None,
 ) -> dict:
     """
     Run full technical analysis on a photo (Phase 1 + Phase 2 face signals).
@@ -209,41 +317,20 @@ def analyze_photo_quality(
       down the worker pool with cancel_futures=True so queued work dies fast.
       Already-running futures still finish (Python can't preempt threads). The
       RAW decode itself is uncancellable — stop is honored after the decode.
+    predecoded: optional (rgb_full, pil_full) tuple from a prior decode_raw()
+      call (e.g. the batch loop's one-ahead prefetch). Skips the decode below
+      entirely when supplied.
     """
     def _check_stop():
         if stop_event is not None and stop_event.is_set():
             raise StopRequested()
 
     path = Path(image_path)
-    if path.suffix.lower() in (".raf", ".nef", ".3fr", ".cr2", ".arw", ".dng"):
-        import rawpy
-        import numpy as _np
-        from PIL import Image as _PILImage
-        import io as _io
-
-        # One decode for everything. Previously the pipeline paid postprocess()
-        # twice (once in calculate_sharpness via batch_sharpness_analyzer, once
-        # here for the ML scorers). Each call on a 24 MP RAF costs 2–5 s.
-        # Now: decode once → share the numpy array with sharpness + face,
-        # and a PIL view with iqa + aesthetic + embedding. Exposure still uses
-        # the fast embedded JPEG thumbnail via load_as_gray(), so it stays on
-        # its own path and doesn't need the decoded array.
-        try:
-            with rawpy.imread(str(path)) as raw:
-                rgb_full = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)
-            pil_full = _PILImage.fromarray(rgb_full)
-        except rawpy.LibRawFileUnsupportedError:
-            # Nikon Z6 III / Z8 / Z9 write NEFs with "High Efficiency*" compression
-            # that current LibRaw can't demosaic. The full-resolution embedded
-            # JPEG (extracted via extract_thumb) is fine for culling — same
-            # 6048×4032 dimensions, just baked colors. Sharpness/exposure/face/
-            # IQA/aesthetic/embedding all work on JPEG input.
-            with rawpy.imread(str(path)) as raw:
-                thumb = raw.extract_thumb()
-            if thumb.format != rawpy.ThumbFormat.JPEG:
-                raise
-            pil_full = _PILImage.open(_io.BytesIO(thumb.data)).convert("RGB")
-            rgb_full = _np.asarray(pil_full)
+    if path.suffix.lower() in RAW_DECODE_SUFFIXES:
+        if predecoded is not None:
+            rgb_full, pil_full = predecoded
+        else:
+            rgb_full, pil_full = decode_raw(image_path)
 
         # Stop check: RAW decode just finished (uncancellable). If the user
         # pressed Stop while we were demosaicing, bail before launching scorers.
@@ -307,7 +394,7 @@ def analyze_photo_quality(
 
         threshold = get_threshold(path)
         ratio = raw_sharpness['normalized_score'] / threshold
-        sharpness_score = min(100, round(ratio * 50))
+        sharpness_score = sharpness_score_from_ratio(ratio)
         sharpness_label = "Sharp" if sharpness_score >= 70 else "Borderline" if sharpness_score >= 40 else "Blurry"
         sharpness_result = {
             'sharpness_score': sharpness_score,

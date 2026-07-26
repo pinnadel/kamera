@@ -28,8 +28,10 @@ class SettingsRequest(BaseModel):
     fallback_maybe:           float | None = None
     fallback_sharpness_floor: float | None = None
     face_sharpness_floor:     float | None = None
+    iqa_floor:                float | None = None
     reject_soft_face:         bool  | None = None
     reject_blurry_frame:      bool  | None = None
+    reject_low_iqa:           bool  | None = None
     reject_closed_eyes:           bool  | None = None
     reject_closed_eyes_all_faces: bool  | None = None
     prefer_sidecar_preview:     bool  | None = None
@@ -40,6 +42,9 @@ class SettingsRequest(BaseModel):
     # PR3 boundary routing — high-variance near-boundary photos route to Maybe.
     auto_cull_uncertain_to_maybe: bool  | None = None
     uncertainty_threshold:        float | None = None
+    # Burst keep-cap post-pass — only the best photo per similarity burst
+    # can auto-cull to Keep; the rest demote to Maybe.
+    auto_cull_cap_burst_keeps:    bool  | None = None
     # RAW+JPEG pair visibility — 'raw' | 'processed' | 'both'.
     raw_jpeg_display_mode:        str   | None = None
     # Analysis scope — 'full' | 'jpeg_priority'.
@@ -95,6 +100,8 @@ def _init_setting_specs() -> None:
         DEFAULT_REJECT_BLURRY_FRAME,
         DEFAULT_REJECT_CLOSED_EYES,
         DEFAULT_REJECT_CLOSED_EYES_ALL_FACES,
+        DEFAULT_REJECT_LOW_IQA,
+        DEFAULT_IQA_FLOOR,
         DEFAULT_REJECT_SOFT_FACE,
         DEFAULT_SHARPNESS_WEIGHT,
         DEFAULT_ISO_CEILING,
@@ -102,6 +109,7 @@ def _init_setting_specs() -> None:
         DEFAULT_REJECT_HIGH_BACKGROUND_DISTRACTION,
         DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE,
         DEFAULT_UNCERTAINTY_THRESHOLD,
+        DEFAULT_AUTO_CULL_CAP_BURST_KEEPS,
     )
     _NUMERIC_SETTINGS.update({
         "sharpness_weight":         (DEFAULT_SHARPNESS_WEIGHT,         0.0, 1.0),
@@ -112,6 +120,10 @@ def _init_setting_specs() -> None:
         "fallback_sharpness_floor": (DEFAULT_FALLBACK_SHARPNESS_FLOOR, 0.0, 100.0),
         "iso_ceiling":              (DEFAULT_ISO_CEILING,              0.0, 204800.0),
         "face_sharpness_floor":     (DEFAULT_FACE_SHARP_FLOOR,         0.0, 100.0),
+        # TOPIQ-NR perceptual-quality floor (0-100). iqa_score below this →
+        # instant reject (catches the false-sharp failure mode). Fires only
+        # when reject_low_iqa is on.
+        "iqa_floor":                (DEFAULT_IQA_FLOOR,                0.0, 100.0),
         # SigLIP zero-shot content axis ceiling (0.0–1.0). Fires only when the
         # toggle below is on AND the photo has a detected face.
         "background_distraction_ceiling": (DEFAULT_BACKGROUND_DISTRACTION_CEILING, 0.5, 0.99),
@@ -123,6 +135,9 @@ def _init_setting_specs() -> None:
     _BOOL_SETTINGS.update({
         "reject_soft_face":       DEFAULT_REJECT_SOFT_FACE,
         "reject_blurry_frame":    DEFAULT_REJECT_BLURRY_FRAME,
+        # Low perceptual-quality (TOPIQ-NR) instant reject — primary safety net
+        # for the false-sharp bug. On by default; floor is iqa_floor above.
+        "reject_low_iqa":         DEFAULT_REJECT_LOW_IQA,
         "reject_closed_eyes":     DEFAULT_REJECT_CLOSED_EYES,
         "reject_closed_eyes_all_faces": DEFAULT_REJECT_CLOSED_EYES_ALL_FACES,
         "prefer_sidecar_preview": False,
@@ -138,6 +153,9 @@ def _init_setting_specs() -> None:
         # PR3 boundary routing — master toggle for routing uncertain
         # near-boundary photos to Maybe instead of a hard auto-decision.
         "auto_cull_uncertain_to_maybe": DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE,
+        # Burst keep-cap post-pass — caps auto-cull Keep at one photo per
+        # similarity burst; the rest demote to Maybe.
+        "auto_cull_cap_burst_keeps": DEFAULT_AUTO_CULL_CAP_BURST_KEEPS,
     })
 
 
@@ -188,11 +206,6 @@ def _is_sidecar_preview_preferred() -> bool:
     if raw is None:
         return False
     return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-# RAW_FORMATS needed for the sidecar-pref invalidation logic.
-# Source of truth: backend.constants.RAW_FORMATS (zero-dep module).
-from backend.constants import RAW_FORMATS as _RAW_FORMATS
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +371,15 @@ def update_settings(request: SettingsRequest):
         _personal_model.clear_cache()
 
     if sidecar_pref_changed:
+        # The toggle only changes how RAW files render (sidecar vs. demosaic),
+        # so only RAW previews are semantically stale. But the on-disk wipe
+        # below is a blanket glob("*.jpg") (simplest + safe), and now that
+        # EVERY format is cached (not just RAW), nulling only RAW preview_paths
+        # would leave non-RAW rows pointing at deleted cache files. Null all of
+        # them to keep the DB and disk consistent — non-RAW rows just
+        # regenerate an identical preview on next request.
         with get_db() as conn:
-            raw_format_list = ",".join("?" * len(_RAW_FORMATS))
-            conn.execute(
-                f"UPDATE images SET preview_path = NULL WHERE UPPER(format) IN ({raw_format_list})",
-                tuple(_RAW_FORMATS),
-            )
+            conn.execute("UPDATE images SET preview_path = NULL")
         if PREVIEW_CACHE_DIR.exists():
             for f in PREVIEW_CACHE_DIR.glob("*.jpg"):
                 try:

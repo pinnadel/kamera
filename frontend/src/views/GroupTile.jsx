@@ -15,7 +15,8 @@ import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 // Chrome: stacked-paper edges behind the tile + a top-left image overlay (the
 // Layers "this is a group" identifier, plus an AI marker while the burst is
 // being ranked). The footer is a single optional block ("Group · N undecided"
-// + hero filename), gated by the F filename toggle — mirroring ImageCard's
+// + "Best: <hero filename>", labeled so it reads as the top pick rather than
+// the group's name), gated by the F filename toggle — mirroring ImageCard's
 // structure exactly so photo and group tiles are the same height, and both
 // grow when filenames are hidden.
 //
@@ -127,8 +128,8 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
                 <p className="text-xs text-[#cecece] truncate leading-tight">
                   <span className="text-[#9c9c9d]">Group · </span>{undecidedCount} undecided
                 </p>
-                <p className="text-[10px] text-[#6a6b6c] truncate font-mono leading-tight" title={hero.filename}>
-                  {middleTruncate(hero.filename)}
+                <p className="text-[10px] text-[#6a6b6c] truncate font-mono leading-tight" title={`Best pick: ${hero.filename}`}>
+                  <span className="text-[#9c9c9d] font-sans">Best: </span>{middleTruncate(hero.filename)}
                 </p>
               </div>
             </div>

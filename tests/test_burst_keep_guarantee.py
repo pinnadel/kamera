@@ -45,14 +45,16 @@ def _row(id: int, **overrides) -> dict:
 
 # ---------------------------------------------------------------------------
 # Physical-reject set: stable so we don't accidentally start rescuing photos
-# that are genuinely unrecoverable. Only iso_ceiling, reciprocal_rule, and
-# blurry_frame should sit here — closed_eyes / soft_face / cluttered_bg are
-# subjective and the burst context can change the call.
+# that are genuinely unrecoverable. Only iso_ceiling, reciprocal_rule,
+# blurry_frame, and low_iqa should sit here — closed_eyes / soft_face /
+# cluttered_bg are subjective and the burst context can change the call.
+# low_iqa (2026-07-26) is a heavily-degraded / out-of-focus frame per TOPIQ-NR;
+# rescuing the "best" of an all-low-IQA burst just surfaces the least-bad blur.
 # ---------------------------------------------------------------------------
 
 
 def test_physical_reject_reasons_contains_only_unrecoverable_signals():
-    assert _PHYSICAL_REJECT_REASONS == {"iso_ceiling", "reciprocal_rule", "blurry_frame"}
+    assert _PHYSICAL_REJECT_REASONS == {"iso_ceiling", "reciprocal_rule", "blurry_frame", "low_iqa"}
 
 
 # ---------------------------------------------------------------------------
