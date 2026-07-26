@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from backend.constants import is_raw_format, companion_stem_matches
+from backend.constants import is_raw_format, companion_stem_matches, shot_at_to_unix as _shot_at_to_unix
 from backend.database import get_db, get_folder_overrides, get_setting
 from backend.file_mover import (
     _KEEPS_REVIEWED_SUBFOLDER,
@@ -131,7 +131,7 @@ def _compute_auto_decision(
     Map stored scores for one image → ('keep' | 'maybe' | 'reject', reason).
 
     `reason` names the rule that fired:
-      closed_eyes · soft_face · iso_ceiling · reciprocal_rule ·
+      closed_eyes · soft_face · low_iqa · iso_ceiling · reciprocal_rule ·
       cluttered_background · personal_keep · personal_maybe ·
       personal_reject · blurry_frame · threshold_keep ·
       threshold_maybe · threshold_reject
@@ -168,6 +168,16 @@ def _compute_auto_decision(
                 return "reject", "closed_eyes"
         if t["reject_soft_face"] and face_sharp < t["face_sharpness_floor"] and sharpness >= t["fallback_sharpness_floor"]:
             return "reject", "soft_face"
+
+    # Low-IQA instant reject — catches the false-sharp failure mode the Phase-1
+    # sharpness metric misses (a defocused frame full of fine micro-texture
+    # scores high on sharpness but low on TOPIQ-NR perceptual quality). Fires in
+    # both personal-model and threshold mode. Skipped when iqa_score is NULL
+    # (older rows / analysis errors) so a missing signal never culls a photo.
+    if t.get("reject_low_iqa"):
+        iqa = row.get("iqa_score")
+        if iqa is not None and iqa < t.get("iqa_floor", 30.0):
+            return "reject", "low_iqa"
 
     # EXIF-based instant rejects — opt-in, off by default.
     if t.get("reject_above_iso_ceiling") and t.get("iso_ceiling", 0) > 0:
@@ -264,21 +274,32 @@ def _find_companion_image_id(image_row: dict) -> int | None:
     return matches[0]["id"]
 
 
-def _companion_is_hidden(companion_id: int) -> bool:
+def _companion_is_skipped_stub(companion_id: int) -> bool:
     """
-    True if `companion_id` isn't independently visible/reviewable, so a
-    decision/undo on its sibling should mirror onto it instead of leaving it
-    untouched. Two cases: raw_jpeg_display_mode is hiding it from the grid,
-    or it's an unscored analysis_mode=jpeg_priority row (analysis_status=
-    'skipped') that can never be independently judged in the first place.
+    True if `companion_id` is an unscored analysis_mode=jpeg_priority row
+    (analysis_status='skipped') — a RAW whose processed sibling got the full
+    analysis and whose own row exists only so a decision can mirror onto it
+    and move it. It never reaches analysis_status='done', so it never gets an
+    independent verdict of its own; mirroring is the only path to a decision.
     """
-    if get_raw_jpeg_display_mode() != "both":
-        return True
     with get_db() as conn:
         row = conn.execute(
             "SELECT analysis_status FROM images WHERE id = ?", (companion_id,)
         ).fetchone()
     return row is not None and row["analysis_status"] == "skipped"
+
+
+def _companion_is_hidden(companion_id: int) -> bool:
+    """
+    True if `companion_id` isn't independently visible/reviewable, so a
+    decision/undo on its sibling should mirror onto it instead of leaving it
+    untouched. Two cases: raw_jpeg_display_mode is hiding it from the grid,
+    or it's a skipped analysis_mode=jpeg_priority stub (see
+    _companion_is_skipped_stub) that can never be independently judged.
+    """
+    if get_raw_jpeg_display_mode() != "both":
+        return True
+    return _companion_is_skipped_stub(companion_id)
 
 
 def _apply_decision(
@@ -915,6 +936,10 @@ def auto_cull_preview(source_folder: str | None = None):
         "closed_eyes":          "closed_eyes",
         "soft_face":            "soft_face",
         "blurry_frame":         "blurry_frame",
+        # A low-IQA reject is a poor/soft frame — folds into the blurry bucket
+        # so the preview's "blurry" count reflects it and the modal copy stays
+        # simple (no separate category for what reads to the user as blur).
+        "low_iqa":              "blurry_frame",
         "cluttered_background": "cluttered_background",
         "iso_ceiling":          "low_score",
         "reciprocal_rule":      "low_score",
@@ -941,9 +966,16 @@ def auto_cull_preview(source_folder: str | None = None):
         decisions[row["id"]] = decision
         preview_reasons[row["id"]] = reason
 
+    bursts_preview = _group_undecided_into_bursts(rows_dicts)
+
+    # Same keep-cap pass as run_auto_cull, ahead of the keep-guarantee pass
+    # below, so the preview counts match what the real run would produce.
+    demotions_count = 0
+    if thresholds.get("auto_cull_cap_burst_keeps"):
+        demotions_count = len(_cap_burst_keeps(bursts_preview, decisions, preview_reasons))
+
     from backend.group_scoring import top_n_candidates
     promotions_count = 0
-    bursts_preview = _group_undecided_into_bursts(rows_dicts)
     for burst in bursts_preview:
         if len(burst) < 2:
             continue
@@ -995,6 +1027,8 @@ def auto_cull_preview(source_folder: str | None = None):
         # maybe by the keep-guarantee post-pass. Surfaces "your burst would
         # otherwise have lost the moment" so the AutoCullModal can flag it.
         "promotions": promotions_count,
+        # Count of extra burst keeps demoted to maybe by the keep-cap pass.
+        "demotions": demotions_count,
     }
 
 
@@ -1003,8 +1037,53 @@ def auto_cull_preview(source_folder: str | None = None):
 # would just put a guaranteed-bad photo in front of the user. Subjective
 # reasons (closed_eyes, soft_face, cluttered_background) DO get rescued
 # because they can be salvageable in context (one photo of the group might
-# be the only frame the moment happened in).
-_PHYSICAL_REJECT_REASONS = frozenset({"iso_ceiling", "reciprocal_rule", "blurry_frame"})
+# be the only frame the moment happened in). low_iqa joins this set: a frame
+# TOPIQ-NR scores below the floor is out-of-focus / heavily degraded, and
+# rescuing the "best" of an all-low-IQA burst just surfaces the least-bad blur.
+_PHYSICAL_REJECT_REASONS = frozenset({"iso_ceiling", "reciprocal_rule", "blurry_frame", "low_iqa"})
+
+
+def _cap_burst_keeps(
+    bursts: list[list[dict]],
+    decisions: dict[int, str],
+    reasons: dict[int, str],
+) -> list[dict]:
+    """Burst keep-cap post-pass: mutates `decisions`/`reasons` in place so at
+    most one member of each similarity burst keeps an auto-cull "keep"
+    decision. Each burst member is scored independently by
+    _compute_auto_decision, so a run of near-identical frames (same pose,
+    seconds apart) can each individually clear the Keep cutoff — the
+    grouping/dedup users expect never fires for auto-cull without this pass.
+
+    For every burst with ≥2 members and ≥2 "keep" decisions, keeps the
+    single best-by-priority member (top_n_candidates — same priority as the
+    group hero selector) as "keep" and demotes every other keep to "maybe"
+    with reason "burst_keep_cap". Non-keep decisions in the burst are left
+    untouched. Runs BEFORE the burst_keep_guarantee floor pass so a burst
+    that loses its extra keeps here always retains exactly one keep —
+    it can never trigger the zero-keeps rescue condition that pass checks for.
+
+    Returns the list of demotions applied: [{"image_id", "burst_size"}, ...].
+    """
+    from backend.group_scoring import top_n_candidates
+
+    demotions: list[dict] = []
+    for burst in bursts:
+        if len(burst) < 2:
+            continue
+        burst_ids = [m["id"] for m in burst]
+        keep_ids = [i for i in burst_ids if decisions.get(i) == "keep"]
+        if len(keep_ids) < 2:
+            continue
+        keep_members = [m for m in burst if m["id"] in keep_ids]
+        winner_id = top_n_candidates(keep_members, 1)[0]["id"]
+        for image_id in keep_ids:
+            if image_id == winner_id:
+                continue
+            decisions[image_id] = "maybe"
+            reasons[image_id] = "burst_keep_cap"
+            demotions.append({"image_id": image_id, "burst_size": len(burst)})
+    return demotions
 
 
 def _group_undecided_into_bursts(rows: list[dict], time_gap_seconds: float = 60.0,
@@ -1044,25 +1123,6 @@ def _group_undecided_into_bursts(rows: list[dict], time_gap_seconds: float = 60.
         if members:
             grouped.append(members)
     return grouped + singletons
-
-
-def _shot_at_to_unix(shot_at) -> float | None:
-    """Tiny copy of the helper in routers/model.py so this module isn't
-    forced into a circular import. Returns a unix timestamp or None when the
-    field is missing / unparseable."""
-    if shot_at is None:
-        return None
-    try:
-        from datetime import datetime
-        # Accept ISO 8601 with or without microseconds. SQLite stores
-        # "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS"; both parse via
-        # fromisoformat after a tiny tolerance fix.
-        s = str(shot_at).strip()
-        if " " in s and "T" not in s:
-            s = s.replace(" ", "T", 1)
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return None
 
 
 @router.post("/auto-cull")
@@ -1119,6 +1179,17 @@ def run_auto_cull(source_folder: str | None = None):
         decisions[row["id"]] = decision
         reasons[row["id"]] = reason
 
+    bursts = _group_undecided_into_bursts(rows_dicts)
+
+    # Phase 1.5: burst keep-cap post-pass. Runs BEFORE the keep-guarantee
+    # floor pass below — see _cap_burst_keeps docstring for why the ordering
+    # is safe (a burst can never end up with zero keeps as a result of this
+    # pass, since it always leaves exactly one). Opt-out via the
+    # auto_cull_cap_burst_keeps setting.
+    demotions: list[dict] = []
+    if thresholds.get("auto_cull_cap_burst_keeps"):
+        demotions = _cap_burst_keeps(bursts, decisions, reasons)
+
     # Phase 2: burst keep-guarantee post-pass. Walks each similarity group;
     # if it has ≥2 members, zero Keeps, and at least one member has a
     # subjective reject reason (not iso_ceiling / reciprocal_rule /
@@ -1126,7 +1197,6 @@ def run_auto_cull(source_folder: str | None = None):
     # the promotions so the response surfaces them for any future UI nudge.
     from backend.group_scoring import top_n_candidates
     promotions: list[dict] = []
-    bursts = _group_undecided_into_bursts(rows_dicts)
     for burst in bursts:
         if len(burst) < 2:
             continue
@@ -1164,7 +1234,7 @@ def run_auto_cull(source_folder: str | None = None):
 
     # Phase 3: apply the decisions (now post-promotion).
     #
-    # _mirror=False here is deliberate: every row (RAW and processed alike)
+    # Mirroring is OFF by default here: every row (RAW and processed alike)
     # already went through _compute_auto_decision independently above, using
     # its own scores. Letting _apply_decision mirror one side's decision onto
     # its companion would silently overwrite that independent verdict with
@@ -1174,12 +1244,27 @@ def run_auto_cull(source_folder: str | None = None):
     # were correctly scored on their own. Manual K/M/X from the UI still
     # mirrors (see POST /decision) because there the user only ever judges
     # one visible tile and both files should follow that single verdict.
+    #
+    # Exception: analysis_mode=jpeg_priority gives a RAW-with-processed-sibling
+    # an unscored analysis_status='skipped' stub row (see analyze_folder in
+    # backend/routers/analysis.py) that never reaches this query's `WHERE
+    # analysis_status = 'done'` filter and never gets its own entry in
+    # `decisions`/`reasons`. That stub has no independent verdict to protect —
+    # mirroring is the ONLY way it ever gets decided and moved. Skipping this
+    # would leave every such RAW behind in the source folder while its JPEG
+    # twin moves on its own (see _companion_is_hidden, which encodes this same
+    # skipped-stub case for the manual K/M/X path).
     counts: dict[str, int] = {"keep": 0, "maybe": 0, "reject": 0}
     errors: list[dict] = []
     for row in rows_dicts:
         decision = decisions[row["id"]]
+        companion_id = _find_companion_image_id(row)
+        mirror_to_skipped_stub = companion_id is not None and _companion_is_skipped_stub(companion_id)
         try:
-            _apply_decision(row["id"], decision, is_auto=True, reason=reasons.get(row["id"]), _mirror=False)
+            _apply_decision(
+                row["id"], decision, is_auto=True, reason=reasons.get(row["id"]),
+                _mirror=mirror_to_skipped_stub,
+            )
             counts[decision] += 1
         except HTTPException as exc:
             errors.append({"id": row["id"], "error": exc.detail})
@@ -1194,4 +1279,7 @@ def run_auto_cull(source_folder: str | None = None):
         # New: surfaces how many bursts had their best photo rescued from
         # all-reject to maybe. Frontend can use this for a one-line toast.
         "promotions": promotions,
+        # Surfaces how many extra burst keeps were demoted to maybe by the
+        # keep-cap pass. Frontend can use this for a one-line toast.
+        "demotions": demotions,
     }

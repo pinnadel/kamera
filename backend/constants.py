@@ -134,6 +134,38 @@ def companion_stem_matches(filename_a: str, filename_b: str) -> bool:
     return _Path(filename_a).stem.lower() == _Path(filename_b).stem.lower()
 
 
+def shot_at_to_unix(value) -> float | None:
+    """
+    Normalise a SQLite shot_at column to Unix seconds for burst clustering.
+
+    Accepts either an integer/float epoch or an ISO-8601 string. Handles the
+    two string shapes SQLite actually stores — 'YYYY-MM-DDTHH:MM:SS' and
+    'YYYY-MM-DD HH:MM:SS' (space separator) — and a trailing 'Z' UTC marker.
+    Returns None if the value is missing or unparseable.
+
+    Canonical home for what used to be two subtly-divergent copies: one in
+    routers/model.py (handled int epochs + 'Z' but not the space separator)
+    and a "tiny copy" in routers/decisions.py (handled the space separator but
+    silently returned None for 'Z'-suffixed and epoch values). Consolidated
+    here — stdlib-only, importable from either router without a circular
+    import — so the two clustering call sites can never drift apart again.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    from datetime import datetime
+    s = str(value).strip().replace("Z", "+00:00")
+    # SQLite may store a space between date and time; fromisoformat wants 'T'
+    # on older Pythons. Normalise only the first separator.
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
 # Subfolder names a photo is moved INTO once a keep/maybe/reject decision is
 # made (see file_mover.resolve_dest_folder). Files here are post-decision and
 # must never be (re)analyzed: the watcher skips them, so an external archiver

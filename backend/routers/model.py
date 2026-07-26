@@ -9,6 +9,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
+from backend.constants import shot_at_to_unix as _shot_at_to_unix
 from backend.database import get_db, set_setting
 from backend.group_scoring import compute_best_reason
 from backend.routers.settings import tunable_setting_keys
@@ -528,27 +529,6 @@ async def import_taste_model(request: Request, mode: str = "merge"):
     }
 
 
-def _shot_at_to_unix(value) -> float | None:
-    """
-    Normalise a SQLite shot_at column to Unix seconds for clustering.
-
-    Stored either as ISO-8601 string ('2026-04-12T14:33:21') or as an integer
-    epoch — handle both. Returns None if the value is missing or unparseable.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        from datetime import datetime
-        s = value.replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(s).timestamp()
-        except ValueError:
-            return None
-    return None
-
-
 @router.get("/similarity-groups")
 def similarity_groups(threshold: float = 0.90, time_gap_seconds: float = 60.0):
     """
@@ -808,6 +788,39 @@ def set_group_hero(request: GroupHeroRequest):
     return {"status": "ok", "hero_image_id": request.hero_image_id}
 
 
+def _reclaim_stale_singleton_anchors(conn, anchors: set[str]) -> None:
+    """Null out manual_group_id for any of `anchors` left with exactly one
+    member after a mutation.
+
+    A manual anchor bucket only means something as a *group* — the ≥2 rule
+    in group_by_similarity() already hides size-1 buckets from
+    /similarity-groups. Without this sweep, moving one photo out of a
+    2-member anchored group (e.g. GroupLoupe's "Remove from group") leaves
+    the other member pinned to the old anchor forever: it can't be seen
+    (size 1 never renders) and it can't rejoin auto-clustering either
+    (a non-NULL manual_group_id always short-circuits into the anchor
+    phase). Clearing it restores normal auto-cluster behaviour, matching
+    what already happens to an auto-cluster member that ends up alone.
+    """
+    anchors = {a for a in anchors if a}
+    if not anchors:
+        return
+    placeholders = ",".join("?" * len(anchors))
+    rows = conn.execute(
+        f"SELECT manual_group_id, COUNT(*) AS n FROM images "
+        f"WHERE manual_group_id IN ({placeholders}) GROUP BY manual_group_id",
+        list(anchors),
+    ).fetchall()
+    stale = [r["manual_group_id"] for r in rows if r["n"] == 1]
+    if stale:
+        placeholders2 = ",".join("?" * len(stale))
+        conn.execute(
+            f"UPDATE images SET manual_group_id = NULL "
+            f"WHERE manual_group_id IN ({placeholders2})",
+            stale,
+        )
+
+
 @router.post("/set-manual-group")
 def set_manual_group(request: SetManualGroupRequest):
     """Move photos in/out of manually-anchored groups. See
@@ -845,6 +858,17 @@ def set_manual_group(request: SetManualGroupRequest):
         )
 
     with get_db() as conn:
+        # Snapshot the anchors image_ids currently belong to BEFORE mutating.
+        # Every mode below can pull photos out of whatever bucket they were
+        # previously in, so these are the buckets that need a post-mutation
+        # stale-singleton sweep (see _reclaim_stale_singleton_anchors).
+        placeholders0 = ",".join("?" * len(image_ids))
+        prior_anchor_rows = conn.execute(
+            f"SELECT manual_group_id FROM images WHERE id IN ({placeholders0})",
+            image_ids,
+        ).fetchall()
+        prior_anchors = {r["manual_group_id"] for r in prior_anchor_rows}
+
         if mode == "new_group":
             anchor = _uuid.uuid4().hex
             placeholders = ",".join("?" * len(image_ids))
@@ -852,6 +876,7 @@ def set_manual_group(request: SetManualGroupRequest):
                 f"UPDATE images SET manual_group_id = ? WHERE id IN ({placeholders})",
                 [anchor, *image_ids],
             )
+            _reclaim_stale_singleton_anchors(conn, prior_anchors)
             conn.commit()
             return {"updated": len(image_ids), "manual_group_id": anchor}
 
@@ -863,6 +888,7 @@ def set_manual_group(request: SetManualGroupRequest):
                     "UPDATE images SET manual_group_id = ? WHERE id = ?",
                     (anchor, image_id),
                 )
+            _reclaim_stale_singleton_anchors(conn, prior_anchors)
             conn.commit()
             return {"updated": len(image_ids), "manual_group_id": None}
 
@@ -897,6 +923,7 @@ def set_manual_group(request: SetManualGroupRequest):
                 f"UPDATE images SET manual_group_id = ? WHERE id IN ({placeholders})",
                 [anchor, *all_ids],
             )
+            _reclaim_stale_singleton_anchors(conn, prior_anchors)
             conn.commit()
             return {"updated": len(all_ids), "manual_group_id": anchor}
 
@@ -906,6 +933,7 @@ def set_manual_group(request: SetManualGroupRequest):
             f"UPDATE images SET manual_group_id = NULL WHERE id IN ({placeholders})",
             image_ids,
         )
+        _reclaim_stale_singleton_anchors(conn, prior_anchors)
         conn.commit()
         return {"updated": len(image_ids), "manual_group_id": None}
 
