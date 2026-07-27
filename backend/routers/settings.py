@@ -42,9 +42,15 @@ class SettingsRequest(BaseModel):
     # PR3 boundary routing — high-variance near-boundary photos route to Maybe.
     auto_cull_uncertain_to_maybe: bool  | None = None
     uncertainty_threshold:        float | None = None
-    # Burst keep-cap post-pass — only the best photo per similarity burst
-    # can auto-cull to Keep; the rest demote to Maybe.
+    # Burst keep-cap / multi-keep post-pass — the best photo per similarity
+    # burst always keeps; extra strong frames may also keep (up to
+    # max_burst_keeps), the rest demote graded to Maybe or Reject.
     auto_cull_cap_burst_keeps:    bool  | None = None
+    max_burst_keeps:              float | None = None
+    burst_keep_margin:            float | None = None
+    burst_keep_winner_delta:      float | None = None
+    burst_keep_reject_delta:      float | None = None
+    max_burst_maybes:             float | None = None
     # RAW+JPEG pair visibility — 'raw' | 'processed' | 'both'.
     raw_jpeg_display_mode:        str   | None = None
     # Analysis scope — 'full' | 'jpeg_priority'.
@@ -53,9 +59,9 @@ class SettingsRequest(BaseModel):
 
 class FolderSettingsRequest(BaseModel):
     source_folder: str
-    keeps_folder:  str | None = None
-    maybes_folder: str | None = None
-    trash_folder:  str | None = None
+    keeps_folder:   str | None = None
+    maybes_folder:  str | None = None
+    rejects_folder: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +116,11 @@ def _init_setting_specs() -> None:
         DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE,
         DEFAULT_UNCERTAINTY_THRESHOLD,
         DEFAULT_AUTO_CULL_CAP_BURST_KEEPS,
+        DEFAULT_MAX_BURST_KEEPS,
+        DEFAULT_BURST_KEEP_MARGIN,
+        DEFAULT_BURST_KEEP_WINNER_DELTA,
+        DEFAULT_BURST_KEEP_REJECT_DELTA,
+        DEFAULT_MAX_BURST_MAYBES,
     )
     _NUMERIC_SETTINGS.update({
         "sharpness_weight":         (DEFAULT_SHARPNESS_WEIGHT,         0.0, 1.0),
@@ -131,6 +142,16 @@ def _init_setting_specs() -> None:
         # above which a near-boundary photo is routed to Maybe. Range matches
         # get_thresholds()'s _read_float bounds in quality_analyzer.
         "uncertainty_threshold":    (DEFAULT_UNCERTAINTY_THRESHOLD,    0.0, 50.0),
+        # Burst multi-keep tuning. Ranges mirror get_decision_thresholds()'s
+        # _read_float bounds in quality_analyzer. max_burst_keeps=1 reproduces
+        # the original cap-at-one behaviour.
+        "max_burst_keeps":          (DEFAULT_MAX_BURST_KEEPS,          1.0, 10.0),
+        "burst_keep_margin":        (DEFAULT_BURST_KEEP_MARGIN,        0.0, 50.0),
+        "burst_keep_winner_delta":  (DEFAULT_BURST_KEEP_WINNER_DELTA,  0.0, 50.0),
+        "burst_keep_reject_delta":  (DEFAULT_BURST_KEEP_REJECT_DELTA,  0.0, 100.0),
+        # Review budget — max Maybe alternates kept per burst before further
+        # redundant frames reject (reason burst_redundant).
+        "max_burst_maybes":         (DEFAULT_MAX_BURST_MAYBES,         0.0, 10.0),
     })
     _BOOL_SETTINGS.update({
         "reject_soft_face":       DEFAULT_REJECT_SOFT_FACE,
@@ -142,7 +163,7 @@ def _init_setting_specs() -> None:
         "reject_closed_eyes_all_faces": DEFAULT_REJECT_CLOSED_EYES_ALL_FACES,
         "prefer_sidecar_preview": False,
         # Rejected photos go to the OS Trash bin instead of the per-folder
-        # _Trash/ subfolder. Off by default to preserve current behaviour.
+        # _Rejects/ subfolder. Off by default to preserve current behaviour.
         "reject_to_system_trash":     False,
         # EXIF-based instant rejects — off by default (opt-in).
         "reject_reciprocal_rule":     False,
@@ -406,12 +427,12 @@ def get_folder_settings(source_folder: str):
     overrides = get_folder_overrides(src)
     return {
         "source_folder":     src,
-        "keeps_folder":      overrides.get("keeps_folder")  or f"{src}/_Keeps",
-        "maybes_folder":     overrides.get("maybes_folder") or f"{src}/_Maybes",
-        "trash_folder":      overrides.get("trash_folder")  or f"{src}/_Trash",
-        "keeps_is_default":  "keeps_folder"  not in overrides,
-        "maybes_is_default": "maybes_folder" not in overrides,
-        "trash_is_default":  "trash_folder"  not in overrides,
+        "keeps_folder":       overrides.get("keeps_folder")   or f"{src}/_Keeps",
+        "maybes_folder":      overrides.get("maybes_folder")  or f"{src}/_Maybes",
+        "rejects_folder":     overrides.get("rejects_folder") or f"{src}/_Rejects",
+        "keeps_is_default":   "keeps_folder"   not in overrides,
+        "maybes_is_default":  "maybes_folder"  not in overrides,
+        "rejects_is_default": "rejects_folder" not in overrides,
     }
 
 
@@ -427,9 +448,9 @@ def update_folder_settings(request: FolderSettingsRequest):
 
     fields_set = request.model_fields_set
     decision_for_field = {
-        "keeps_folder":  "keep",
-        "maybes_folder": "maybe",
-        "trash_folder":  "reject",
+        "keeps_folder":   "keep",
+        "maybes_folder":  "maybe",
+        "rejects_folder": "reject",
     }
     for field, decision in decision_for_field.items():
         if field not in fields_set:

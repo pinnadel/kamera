@@ -20,13 +20,13 @@ logger = logging.getLogger(__name__)
 _DECISION_FOLDERS: dict[str, str] = {
     "keep":   "_Keeps",
     "maybe":  "_Maybes",
-    "reject": "_Trash",
+    "reject": "_Rejects",
 }
 
 _DECISION_SETTING_KEY: dict[str, str] = {
     "keep":   "keeps_folder",
     "maybe":  "maybes_folder",
-    "reject": "trash_folder",
+    "reject": "rejects_folder",
 }
 
 # Nested under whatever the "keep" folder currently resolves to (default
@@ -47,7 +47,7 @@ def resolve_dest_folder(
     """
     Return the absolute destination folder for a decision.
 
-    overrides is a dict with optional keys: keeps_folder, maybes_folder, trash_folder.
+    overrides is a dict with optional keys: keeps_folder, maybes_folder, rejects_folder.
     If the key for this decision is present and non-empty, use it as an absolute path.
     Otherwise create the default subfolder inside source_folder.
 

@@ -132,7 +132,7 @@ def test_manual_maybe_and_reject_unaffected(patched: Path, tmp_path: Path) -> No
     r_reject = decisions_mod._apply_decision(5, "reject", is_auto=False)
 
     assert Path(r_maybe["new_path"]) == Path(source) / "_Maybes" / "M.RAF"
-    assert Path(r_reject["new_path"]) == Path(source) / "_Trash" / "R.RAF"
+    assert Path(r_reject["new_path"]) == Path(source) / "_Rejects" / "R.RAF"
 
 
 # ---------------------------------------------------------------------------

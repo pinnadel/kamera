@@ -568,6 +568,14 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
          "CREATE INDEX IF NOT EXISTS idx_auto_decision_log_uuid ON auto_decision_log(sample_uuid)"),
     (50, "Index on auto_decision_log.decided_at",
          "CREATE INDEX IF NOT EXISTS idx_auto_decision_log_decided_at ON auto_decision_log(decided_at)"),
+    # v51: Reject destination folder renamed _Trash → _Rejects so the folder on
+    # disk matches the "Reject" verb in the UI. Rewrite any persisted reject
+    # override whose path still ends in the old default subfolder; a genuinely
+    # custom reject destination (anything not ending in /_Trash) is left alone.
+    (51, "Rename reject override paths _Trash → _Rejects",
+         "UPDATE folder_settings SET dest_folder = "
+         "substr(dest_folder, 1, length(dest_folder) - length('/_Trash')) || '/_Rejects' "
+         "WHERE decision = 'reject' AND dest_folder LIKE '%/_Trash'"),
 ]
 
 
@@ -689,15 +697,15 @@ def write_shooting_log(
 _DECISION_TO_OVERRIDE_KEY: dict[str, str] = {
     "keep":   "keeps_folder",
     "maybe":  "maybes_folder",
-    "reject": "trash_folder",
+    "reject": "rejects_folder",
 }
 
 
 def get_folder_overrides(source_folder: str, db_path: Path = DEFAULT_DB_PATH) -> dict[str, str]:
     """Return active per-decision overrides for one source folder.
 
-    Result keys are the legacy override names (`keeps_folder`, `maybes_folder`,
-    `trash_folder`) so this slots straight into `resolve_dest_folder`. Missing
+    Result keys are the override names (`keeps_folder`, `maybes_folder`,
+    `rejects_folder`) so this slots straight into `resolve_dest_folder`. Missing
     keys mean "use default subfolder."
     """
     with get_db(db_path) as conn:
@@ -872,7 +880,7 @@ CREATE TABLE IF NOT EXISTS training_samples (
 -- ============================================================
 -- folder_settings
 -- Per-source_folder overrides for K/M/X destination paths.
--- Missing row = use default subfolder (_Keeps / _Maybes / _Trash)
+-- Missing row = use default subfolder (_Keeps / _Maybes / _Rejects)
 -- inside the source_folder. Keyed by (source_folder, decision) so
 -- each analysis carries its own routing without affecting others.
 -- ============================================================

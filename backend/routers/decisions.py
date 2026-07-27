@@ -115,7 +115,7 @@ def _all_faces_eyes_closed(row: dict, face_count: int) -> bool:
 
 def _reject_to_system_trash_enabled() -> bool:
     """Read the `reject_to_system_trash` toggle. Default False — preserve the
-    existing _Trash/ folder behaviour for users who want their rejects on
+    existing _Rejects/ folder behaviour for users who want their rejects on
     disk. When True, rejected photos go to the OS system Trash via
     send2trash instead, and can be recovered from the Trash / Recycle Bin."""
     raw = get_setting("reject_to_system_trash")
@@ -891,12 +891,20 @@ def trash_rejects():
 
 
 @router.get("/auto-cull/preview")
-def auto_cull_preview(source_folder: str | None = None):
+def auto_cull_preview(
+    source_folder: str | None = None,
+    threshold: float = 0.90,
+):
     """
     Dry-run: compute which K/M/X each undecided photo would receive.
 
     Uses the personal model when trained (≥20 decisions); falls back to
     the built-in threshold logic. No files are moved and no DB rows are written.
+
+    `threshold` is the cosine-similarity cutoff the burst-dedup post-pass groups
+    on — the Similarity knob (the frontend passes its current value). Auto-cull
+    dedup deliberately does NOT use the grouping time-gap (see
+    _group_undecided_into_bursts); grouping here is visual-similarity only.
     """
     with get_db() as conn:
         if source_folder is not None:
@@ -945,6 +953,14 @@ def auto_cull_preview(source_folder: str | None = None):
         "reciprocal_rule":      "low_score",
         "personal_reject":      "low_score",
         "threshold_reject":     "low_score",
+        # Burst-redundancy rejects — decent frames that lost to a clearly-better
+        # sibling in the same burst (graded demotion), were near-pixel-identical
+        # to a better frame (Stage A collapse), or overflowed the burst's Maybe
+        # review budget (Stage B). Not low-quality photos — their own bucket so
+        # the modal can say "redundant burst frame", not "low score".
+        "burst_keep_reject":    "burst_duplicate",
+        "burst_near_duplicate": "burst_duplicate",
+        "burst_redundant":      "burst_duplicate",
     }
     rule_counts: dict[str, int] = {
         "closed_eyes": 0,
@@ -952,6 +968,9 @@ def auto_cull_preview(source_folder: str | None = None):
         "blurry_frame": 0,
         "cluttered_background": 0,
         "low_score": 0,
+        # Frames rejected only because a near-identical burst sibling scored
+        # clearly better (multi-keep graded demotion).
+        "burst_duplicate": 0,
         # PR3: uncertain photos are routed to "maybe" (not rejected) so we
         # count them outside the reject-only bucket below.
         "uncertain": 0,
@@ -966,13 +985,17 @@ def auto_cull_preview(source_folder: str | None = None):
         decisions[row["id"]] = decision
         preview_reasons[row["id"]] = reason
 
-    bursts_preview = _group_undecided_into_bursts(rows_dicts)
+    bursts_preview = _group_undecided_into_bursts(rows_dicts, threshold=threshold)
 
-    # Same keep-cap pass as run_auto_cull, ahead of the keep-guarantee pass
+    # Same multi-keep pass as run_auto_cull, ahead of the keep-guarantee pass
     # below, so the preview counts match what the real run would produce.
     demotions_count = 0
+    reject_demotions_count = 0
     if thresholds.get("auto_cull_cap_burst_keeps"):
-        demotions_count = len(_cap_burst_keeps(bursts_preview, decisions, preview_reasons))
+        burst_demotions = _cap_burst_keeps(
+            bursts_preview, decisions, preview_reasons, thresholds)
+        demotions_count = len(burst_demotions)
+        reject_demotions_count = sum(1 for d in burst_demotions if d["to"] == "reject")
 
     from backend.group_scoring import top_n_candidates
     promotions_count = 0
@@ -1027,8 +1050,11 @@ def auto_cull_preview(source_folder: str | None = None):
         # maybe by the keep-guarantee post-pass. Surfaces "your burst would
         # otherwise have lost the moment" so the AutoCullModal can flag it.
         "promotions": promotions_count,
-        # Count of extra burst keeps demoted to maybe by the keep-cap pass.
+        # Count of extra burst keeps demoted by the multi-keep pass (to Maybe
+        # or Reject). `reject_demotions` is the subset sent all the way to
+        # Reject (clearly-weak near-duplicates); the rest went to Maybe.
         "demotions": demotions_count,
+        "reject_demotions": reject_demotions_count,
     }
 
 
@@ -1043,29 +1069,202 @@ def auto_cull_preview(source_folder: str | None = None):
 _PHYSICAL_REJECT_REASONS = frozenset({"iso_ceiling", "reciprocal_rule", "blurry_frame", "low_iqa"})
 
 
+# Auto-decision reasons that mean "the personal model made this call" — for
+# those members the multi-keep gates read personal_score against the personal
+# cutoffs; every other keep reason came from the threshold-fallback path and
+# reads overall_score against the fallback cutoffs. Mirrors the two branches of
+# _compute_auto_decision so the gates use the same number the Keep verdict did.
+_PERSONAL_KEEP_REASONS = frozenset({"personal_keep"})
+
+
+def _burst_member_score(row: dict, reason: str | None) -> float | None:
+    """The score the auto-decision was actually made on for this member:
+    personal_score for personal-mode keeps, overall_score otherwise. None when
+    the relevant field is missing (older rows / analysis gaps) — the caller
+    treats a None-scored extra keep as non-qualifying (never double-kept)."""
+    if reason in _PERSONAL_KEEP_REASONS:
+        return row.get("personal_score")
+    return row.get("overall_score")
+
+
+# Cosine threshold that separates distinct visual sub-scenes WITHIN one burst.
+# Deliberately STRICTER than the 0.90 the grouping algorithm uses to FORM a
+# burst: a burst is already a single 0.90-connected component (transitively —
+# a chain A~B~C at 0.92 each is one burst even if A~C is only 0.85), so
+# sub-clustering at 0.90 would just re-merge it and never fire. We need a higher
+# bar to isolate a genuinely-different framing that got chained into the burst.
+# 0.94 sits between burst formation (0.90) and near-dup collapse (0.97): shoot
+# angle A, pan, shoot angle B seconds apart → two sub-scenes, each with its own
+# Keep/Maybe budget, so a real second POV earns its own keeps instead of being
+# budget-rejected as a redundant copy of angle A. A slight recompose of the same
+# shot stays ≥ 0.94 and remains one scene. Tunable later if real bursts show
+# 0.94 splits too eagerly or too rarely; kept a constant for now (no new knob).
+_SCENE_SPLIT_COSINE = 0.94
+
+
+def _scene_subclusters(ordered_members: list[dict]) -> list[list[dict]]:
+    """Split a burst's members into distinct visual sub-scenes by cosine
+    union-find at _SCENE_SPLIT_COSINE, preserving each member's priority order
+    within its sub-cluster. Members without an embedding can't be clustered —
+    each becomes its own singleton sub-cluster (conservative: a frame we can't
+    place visually gets its own keep budget rather than being lumped in and
+    possibly budget-rejected against an unrelated scene).
+
+    Returns a list of sub-clusters; concatenated they contain every input member
+    exactly once. When every member shares one scene this returns a single
+    sub-cluster == the input, so the budget behaves exactly as the pre-sub-
+    cluster code did for single-scene bursts.
+    """
+    import numpy as _np
+    from phase2_quality.similarity_scorer import json_to_embedding as _emb
+
+    vecs: dict[int, "_np.ndarray"] = {}
+    for m in ordered_members:
+        vec = _emb(m.get("embedding"))
+        if vec is not None:
+            vecs[m["id"]] = _np.asarray(vec, dtype=_np.float32)
+
+    # Union-find over members that have embeddings.
+    parent: dict[int, int] = {m["id"]: m["id"] for m in ordered_members}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    ids_with_vec = [m["id"] for m in ordered_members if m["id"] in vecs]
+    for i, a in enumerate(ids_with_vec):
+        for b in ids_with_vec[i + 1:]:
+            if float(_np.dot(vecs[a], vecs[b])) >= _SCENE_SPLIT_COSINE:
+                union(a, b)
+
+    # Bucket members by root, preserving input (priority) order both across and
+    # within sub-clusters: first-seen root ordering keeps the best sub-cluster
+    # (the one containing the burst winner) first.
+    order: list[int] = []
+    buckets: dict[int, list[dict]] = {}
+    for m in ordered_members:
+        root = find(m["id"])
+        if root not in buckets:
+            buckets[root] = []
+            order.append(root)
+        buckets[root].append(m)
+    return [buckets[r] for r in order]
+
+
+def _near_duplicate_losers(ordered_members: list[dict]) -> set[int]:
+    """Greedy near-duplicate collapse over an already-priority-ordered burst.
+
+    Walks members best→worst; the higher-priority frame of each cosine-near-
+    identical pair (cosine ≥ _NEAR_DUP_COSINE) is the surviving representative,
+    and every lower-priority frame within that radius is a redundant duplicate.
+    Returns the set of image_ids that are duplicates of some better frame — the
+    caller rejects those as `burst_near_duplicate`.
+
+    Same 0.97 threshold and greedy-rep logic as burst_ranker._collapse_near_
+    duplicates, but operates purely on the embeddings already on the in-memory
+    rows (no DB round-trip). Embeddings are L2-normalised, so dot product IS
+    cosine. A frame with no embedding can never be collapsed (can't prove it's
+    a dup) and never absorbs others — it falls through to the score gates.
+    """
+    import numpy as _np
+    from phase2_quality.similarity_scorer import json_to_embedding as _emb
+    from phase2_quality.burst_ranker import _NEAR_DUP_COSINE
+
+    vecs: dict[int, "_np.ndarray"] = {}
+    for m in ordered_members:
+        vec = _emb(m.get("embedding"))
+        if vec is not None:
+            vecs[m["id"]] = _np.asarray(vec, dtype=_np.float32)
+    if len(vecs) < 2:
+        return set()
+
+    losers: set[int] = set()
+    ordered_ids = [m["id"] for m in ordered_members]
+    for i, rep_id in enumerate(ordered_ids):
+        if rep_id in losers or rep_id not in vecs:
+            continue
+        rep_vec = vecs[rep_id]
+        # Only lower-priority frames can be absorbed by this rep.
+        for other_id in ordered_ids[i + 1:]:
+            if other_id in losers or other_id not in vecs:
+                continue
+            if float(_np.dot(rep_vec, vecs[other_id])) >= _NEAR_DUP_COSINE:
+                losers.add(other_id)
+    return losers
+
+
 def _cap_burst_keeps(
     bursts: list[list[dict]],
     decisions: dict[int, str],
     reasons: dict[int, str],
+    thresholds: dict | None = None,
 ) -> list[dict]:
-    """Burst keep-cap post-pass: mutates `decisions`/`reasons` in place so at
-    most one member of each similarity burst keeps an auto-cull "keep"
-    decision. Each burst member is scored independently by
-    _compute_auto_decision, so a run of near-identical frames (same pose,
-    seconds apart) can each individually clear the Keep cutoff — the
-    grouping/dedup users expect never fires for auto-cull without this pass.
+    """Burst multi-keep post-pass: mutates `decisions`/`reasons` in place so a
+    similarity burst auto-keeps its best-by-priority member plus any additional
+    frames that are genuinely strong — the rest demote, graded to Maybe or
+    Reject. Each burst member is scored independently by _compute_auto_decision,
+    so a run of near-identical frames (same pose, seconds apart) can each clear
+    the Keep cutoff; the grouping/dedup users expect never fires for auto-cull
+    without this pass.
 
-    For every burst with ≥2 members and ≥2 "keep" decisions, keeps the
-    single best-by-priority member (top_n_candidates — same priority as the
-    group hero selector) as "keep" and demotes every other keep to "maybe"
-    with reason "burst_keep_cap". Non-keep decisions in the burst are left
-    untouched. Runs BEFORE the burst_keep_guarantee floor pass so a burst
-    that loses its extra keeps here always retains exactly one keep —
-    it can never trigger the zero-keeps rescue condition that pass checks for.
+    For every burst with ≥2 members and ≥2 "keep" decisions:
 
-    Returns the list of demotions applied: [{"image_id", "burst_size"}, ...].
+      Stage A — near-duplicate collapse (burst-wide). The lower-priority frame
+      of any pair that is cosine-near-identical (≥ 0.97, same threshold as the
+      LLM burst ranker's dedup) is redundant regardless of score → "reject" with
+      reason "burst_near_duplicate". The higher-priority frame survives as rep.
+
+      Scene split. The burst is split into distinct visual sub-scenes by cosine
+      union-find at _SCENE_SPLIT_COSINE (0.90, the same threshold the grouping
+      algorithm uses to form bursts within a time segment). A 30s time-gap burst
+      can contain several genuinely-different framings — shoot angle A, pan,
+      shoot angle B seconds apart — and the time-gap glue makes them one burst.
+      Each sub-scene gets its OWN Keep/Maybe budget below, so a real second POV
+      earns its own keeps instead of being rejected as a redundant copy of the
+      first. A single-scene burst yields one sub-cluster → identical to the
+      per-burst budget.
+
+      Stage B — score gates + review budget, applied PER SUB-SCENE (see
+      _apply_burst_budget). The best member of each sub-scene always keeps; the
+      rest stay "keep" only if BOTH gates hold and we're under max_burst_keeps
+      (margin above the mode's Keep cutoff + closeness to the sub-scene winner),
+      else demote: "burst_keep_reject" when clearly weak (far below the sub-scene
+      winner or under the Maybe cutoff), "burst_keep_cap"→Maybe while that sub-
+      scene's Maybe budget has room, "burst_redundant"→reject once it's spent. A
+      scoreless frame never counts as clearly weak (no auto-trash on missing
+      data) — Maybe slot if free, else redundant-reject.
+
+    max_burst_keeps=1 + max_burst_maybes large reproduces the original cap-at-one
+    behaviour PER SUB-SCENE; max_burst_maybes=0 rejects every non-surviving frame
+    in each sub-scene. Non-keep decisions in the burst are left untouched. Runs
+    BEFORE the burst_keep_guarantee floor pass so a burst always retains ≥1 keep
+    here (each sub-scene keeps its winner) — it can never trigger the zero-keeps
+    rescue the floor pass checks.
+
+    Returns the list of demotions applied:
+    [{"image_id", "burst_size", "to"}, ...] where "to" is "maybe" | "reject".
     """
     from backend.group_scoring import top_n_candidates
+    from phase1_technical.quality_analyzer import get_decision_thresholds
+
+    t = thresholds or get_decision_thresholds()
+    max_keeps = int(t.get("max_burst_keeps", 2))
+    max_maybes = int(t.get("max_burst_maybes", 2))
+    margin = t.get("burst_keep_margin", 8.0)
+    winner_delta = t.get("burst_keep_winner_delta", 6.0)
+    reject_delta = t.get("burst_keep_reject_delta", 20.0)
+
+    budget = {
+        "max_keeps": max_keeps, "max_maybes": max_maybes,
+        "margin": margin, "winner_delta": winner_delta, "reject_delta": reject_delta,
+    }
 
     demotions: list[dict] = []
     for burst in bursts:
@@ -1075,21 +1274,134 @@ def _cap_burst_keeps(
         keep_ids = [i for i in burst_ids if decisions.get(i) == "keep"]
         if len(keep_ids) < 2:
             continue
-        keep_members = [m for m in burst if m["id"] in keep_ids]
-        winner_id = top_n_candidates(keep_members, 1)[0]["id"]
-        for image_id in keep_ids:
-            if image_id == winner_id:
-                continue
-            decisions[image_id] = "maybe"
-            reasons[image_id] = "burst_keep_cap"
-            demotions.append({"image_id": image_id, "burst_size": len(burst)})
+
+        by_id = {m["id"]: m for m in burst}
+        keep_members = [by_id[i] for i in keep_ids]
+        # Priority order (best→worst) drives every stage: the winner, the
+        # near-dup reps, and which frames fill the Keep/Maybe budgets.
+        ordered = top_n_candidates(keep_members, len(keep_members))
+
+        # Stage A — near-duplicate collapse, applied ACROSS the whole burst: a
+        # near-pixel-dup is redundant no matter which sub-scene it lands in
+        # (and two ≥0.97 frames are always in the same ≥0.90 sub-cluster anyway,
+        # so scoping this burst-wide changes nothing but is clearer).
+        near_dup_losers = _near_duplicate_losers(ordered)
+
+        # Split the burst into distinct visual sub-scenes. A 30s time-gap burst
+        # can contain several genuinely-different framings (pan to a new POV
+        # mid-window); each sub-scene gets its OWN Keep/Maybe budget so a real
+        # second scene isn't budget-rejected as a redundant copy of the first.
+        subclusters = _scene_subclusters(ordered)
+
+        # Stage B — score gates + review budget, applied per sub-scene.
+        for sub in subclusters:
+            demotions.extend(
+                _apply_burst_budget(
+                    sub, near_dup_losers, decisions, reasons, t, budget,
+                    burst_size=len(burst),
+                )
+            )
     return demotions
 
 
-def _group_undecided_into_bursts(rows: list[dict], time_gap_seconds: float = 60.0,
+def _apply_burst_budget(
+    ordered_sub: list[dict],
+    near_dup_losers: set[int],
+    decisions: dict[int, str],
+    reasons: dict[int, str],
+    t: dict,
+    budget: dict,
+    burst_size: int,
+) -> list[dict]:
+    """Apply the Keep/Maybe review budget to ONE visual sub-scene of a burst.
+
+    `ordered_sub` is priority-ordered (best first). Its best member is the
+    sub-scene winner and always keeps; the rest run the near-dup / score-gate /
+    graded-demotion logic with a fresh Keep+Maybe budget scoped to this sub-
+    scene. Mutates `decisions`/`reasons` in place; returns the demotions list.
+
+    A single-scene burst produces one sub-cluster, so this reproduces the prior
+    burst-wide budget exactly. `burst_size` is passed through unchanged for the
+    demotion records (callers/telemetry still think in whole-burst sizes).
+    """
+    demotions: list[dict] = []
+    winner_id = ordered_sub[0]["id"]
+    winner_score = _burst_member_score(ordered_sub[0], reasons.get(winner_id))
+
+    kept_count = 1   # the sub-scene winner always keeps
+    maybe_count = 0
+    for member in ordered_sub:
+        image_id = member["id"]
+        if image_id == winner_id:
+            continue
+
+        if image_id in near_dup_losers:
+            decisions[image_id] = "reject"
+            reasons[image_id] = "burst_near_duplicate"
+            demotions.append(
+                {"image_id": image_id, "burst_size": burst_size, "to": "reject"}
+            )
+            continue
+
+        reason = reasons.get(image_id)
+        score = _burst_member_score(member, reason)
+
+        personal_mode = reason in _PERSONAL_KEEP_REASONS
+        keep_cutoff = t["keep_threshold"] if personal_mode else t["fallback_keep"]
+        maybe_cutoff = t["maybe_threshold"] if personal_mode else t["fallback_maybe"]
+
+        qualifies = (
+            kept_count < budget["max_keeps"]
+            and score is not None
+            and winner_score is not None
+            and score >= keep_cutoff + budget["margin"]
+            and (winner_score - score) <= budget["winner_delta"]
+        )
+        if qualifies:
+            kept_count += 1
+            continue  # survives as keep; decision/reason untouched
+
+        # Graded demotion. Reject when clearly-weak (far below the sub-scene
+        # winner, or under the mode's Maybe cutoff) OR when this sub-scene's
+        # review budget is spent. A missing score can't be judged weak, so it
+        # only rejects via the budget path, never the clearly-weak path.
+        clearly_weak = score is not None and (
+            (winner_score is not None and (winner_score - score) > budget["reject_delta"])
+            or score < maybe_cutoff
+        )
+        if clearly_weak:
+            target, reason_out = "reject", "burst_keep_reject"
+        elif maybe_count < budget["max_maybes"]:
+            target, reason_out = "maybe", "burst_keep_cap"
+            maybe_count += 1
+        else:
+            target, reason_out = "reject", "burst_redundant"
+
+        decisions[image_id] = target
+        reasons[image_id] = reason_out
+        demotions.append(
+            {"image_id": image_id, "burst_size": burst_size, "to": target}
+        )
+    return demotions
+
+
+def _group_undecided_into_bursts(rows: list[dict],
+                                 time_gap_seconds: float | None = None,
                                  threshold: float = 0.90) -> list[list[dict]]:
-    """Cluster the rows the same way /similarity-groups does so the burst
-    keep-guarantee operates on the same groupings the user sees in the UI.
+    """Cluster the rows for the auto-cull burst post-passes.
+
+    Auto-cull groups by VISUAL SIMILARITY only — `time_gap_seconds` defaults to
+    None (time split disabled). Rationale: the grouping time-gap can only split
+    bursts *coarser* than the camera's inter-frame spacing, and continuous
+    bursts fire several frames within one EXIF second (second-resolution
+    timestamps), so no gap can separate them — the slider was inert for
+    auto-cull dedup on fast bursts. Cosine similarity *can* discriminate those
+    frames. The risk of pure-similarity grouping (distinct moments minutes apart
+    collapsing into one giant burst) is handled downstream by _cap_burst_keeps'
+    per-scene split at _SCENE_SPLIT_COSINE, which re-separates them and gives
+    each moment its own keep budget. So the real auto-cull dedup levers are the
+    Similarity `threshold` + the keep/maybe budgets, NOT the time gap. Callers
+    may still pass an explicit time_gap_seconds (tests do) to force a time split.
 
     Photos without an embedding (Phase 2 hasn't completed for them yet) are
     returned as singleton groups so the caller can still iterate uniformly.
@@ -1126,18 +1438,32 @@ def _group_undecided_into_bursts(rows: list[dict], time_gap_seconds: float = 60.
 
 
 @router.post("/auto-cull")
-def run_auto_cull(source_folder: str | None = None):
+def run_auto_cull(
+    source_folder: str | None = None,
+    threshold: float = 0.90,
+):
     """
     Assign K/M/X to every undecided analyzed photo and move their files.
 
-    Uses the same scoring logic as GET /auto-cull/preview, with one
-    burst-aware post-pass: when an entire similarity group ends up with
-    zero Keeps AND none of the rejects were physical-unrecoverable
-    (ISO ceiling / reciprocal-rule / blurry-frame), the best photo in
-    the burst is promoted to Maybe so the user always has a chance to
-    rescue a moment. Promotion uses the same priority as the group hero
-    selector (face_sharpness → eyes_open → sharpness → IQA → aesthetic
-    → overall_score). See backend.group_scoring.top_n_candidates.
+    Uses the same scoring logic as GET /auto-cull/preview, with two
+    burst-aware post-passes over the similarity groups:
+
+      1. Multi-keep cap (_cap_burst_keeps, opt-out): the best-by-priority
+         member of a burst always keeps; additional in-burst Keeps survive
+         only if genuinely strong (up to max_burst_keeps), and the rest demote
+         graded to Maybe (near-alternates) or Reject (clearly-weak duplicates).
+      2. Keep-guarantee floor: when an entire group ends up with zero Keeps AND
+         none of the rejects were physical-unrecoverable (ISO ceiling /
+         reciprocal-rule / blurry-frame / low-IQA), the best photo is promoted
+         to Maybe so the user always has a chance to rescue a moment.
+
+    Both passes rank with the same priority as the group hero selector
+    (face_sharpness → eyes_open → sharpness → IQA → aesthetic → overall_score);
+    see backend.group_scoring.top_n_candidates.
+
+    `threshold` is the cosine-similarity cutoff the burst grouping uses. Auto-cull
+    dedup groups by visual similarity ONLY, not the grouping time-gap (see
+    _group_undecided_into_bursts for why the time-gap was inert on fast bursts).
     """
     with get_db() as conn:
         if source_folder is not None:
@@ -1179,7 +1505,7 @@ def run_auto_cull(source_folder: str | None = None):
         decisions[row["id"]] = decision
         reasons[row["id"]] = reason
 
-    bursts = _group_undecided_into_bursts(rows_dicts)
+    bursts = _group_undecided_into_bursts(rows_dicts, threshold=threshold)
 
     # Phase 1.5: burst keep-cap post-pass. Runs BEFORE the keep-guarantee
     # floor pass below — see _cap_burst_keeps docstring for why the ordering
@@ -1188,7 +1514,7 @@ def run_auto_cull(source_folder: str | None = None):
     # auto_cull_cap_burst_keeps setting.
     demotions: list[dict] = []
     if thresholds.get("auto_cull_cap_burst_keeps"):
-        demotions = _cap_burst_keeps(bursts, decisions, reasons)
+        demotions = _cap_burst_keeps(bursts, decisions, reasons, thresholds)
 
     # Phase 2: burst keep-guarantee post-pass. Walks each similarity group;
     # if it has ≥2 members, zero Keeps, and at least one member has a
@@ -1279,7 +1605,8 @@ def run_auto_cull(source_folder: str | None = None):
         # New: surfaces how many bursts had their best photo rescued from
         # all-reject to maybe. Frontend can use this for a one-line toast.
         "promotions": promotions,
-        # Surfaces how many extra burst keeps were demoted to maybe by the
-        # keep-cap pass. Frontend can use this for a one-line toast.
+        # Surfaces how many extra burst keeps were demoted by the multi-keep
+        # pass. Each entry carries "to": "maybe" | "reject" so the frontend can
+        # split near-alternates (Maybe) from clearly-weak duplicates (Reject).
         "demotions": demotions,
     }

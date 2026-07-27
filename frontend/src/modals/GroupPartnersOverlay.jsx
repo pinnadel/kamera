@@ -305,7 +305,35 @@ function MemberRow({ image, onDecide, onInspect }) {
   )
 }
 
-export function GroupPartnersOverlay({ members, viewDecision, onDecide, onClose }) {
+// SectionBulkBar — per-section "move this whole bucket at once" control, shown
+// in a section header. Offers the target decisions that aren't this section's
+// own kind (Keeps section → Maybe all / Reject all, etc.). Acts on the section's
+// members in one call via onBulkDecide.
+function SectionBulkBar({ sectionKind, imageIds, onBulkDecide }) {
+  const targets = ['keep', 'maybe', 'reject'].filter(k => k !== sectionKind)
+  return (
+    <div className="flex items-center gap-1.5">
+      {targets.map(kind => {
+        const tone = KIND_TONE[kind]
+        const label = { keep: 'Keep all', maybe: 'Maybe all', reject: 'Reject all' }[kind]
+        return (
+          <button
+            key={kind}
+            type="button"
+            onClick={() => onBulkDecide(imageIds, kind)}
+            className="px-2 py-0.5 rounded-md text-[11px] font-medium border opacity-70 hover:opacity-100 transition-opacity"
+            style={{ color: tone, borderColor: 'rgba(255,255,255,0.10)' }}
+            title={`Move all ${imageIds.length} ${KIND_LABEL[sectionKind]} to ${label.replace(' all', '')}`}
+          >
+            {label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+export function GroupPartnersOverlay({ members, viewDecision, onDecide, onBulkDecide, onClose }) {
   // Which member (if any) is open in the full-screen inspect layer, by its
   // index into `order` (below). null = inspect closed.
   const [inspectIdx, setInspectIdx] = useState(null)
@@ -397,9 +425,18 @@ export function GroupPartnersOverlay({ members, viewDecision, onDecide, onClose 
           <div className="px-4 py-2 overflow-y-auto">
             {survivorSections.map(kind => (
               <section key={kind} className="py-1">
-                <h3 className="text-[11px] font-semibold uppercase tracking-wider pt-2 pb-1" style={{ color: KIND_TONE[kind] }}>
-                  {KIND_LABEL[kind]} <span className="text-[#6b6b6c]">({byKind[kind].length})</span>
-                </h3>
+                <div className="flex items-center justify-between pt-2 pb-1">
+                  <h3 className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: KIND_TONE[kind] }}>
+                    {KIND_LABEL[kind]} <span className="text-[#6b6b6c]">({byKind[kind].length})</span>
+                  </h3>
+                  {onBulkDecide && byKind[kind].length >= 2 && (
+                    <SectionBulkBar
+                      sectionKind={kind}
+                      imageIds={byKind[kind].map(m => m.id)}
+                      onBulkDecide={onBulkDecide}
+                    />
+                  )}
+                </div>
                 <div className="divide-y divide-[rgba(255,255,255,0.04)]">
                   {byKind[kind].map(m => (
                     <MemberRow key={m.id} image={m} onDecide={onDecide} onInspect={() => openInspect(m.id)} />
@@ -412,9 +449,18 @@ export function GroupPartnersOverlay({ members, viewDecision, onDecide, onClose 
               <>
                 <div className="my-2 border-t border-[rgba(255,255,255,0.10)]" />
                 <section className="py-1">
-                  <h3 className="text-[11px] font-semibold uppercase tracking-wider pt-1 pb-1" style={{ color: KIND_TONE[viewDecision] }}>
-                    {KIND_LABEL[viewDecision]} <span className="text-[#6b6b6c]">({currentSection.length}) · this view</span>
-                  </h3>
+                  <div className="flex items-center justify-between pt-1 pb-1">
+                    <h3 className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: KIND_TONE[viewDecision] }}>
+                      {KIND_LABEL[viewDecision]} <span className="text-[#6b6b6c]">({currentSection.length}) · this view</span>
+                    </h3>
+                    {onBulkDecide && currentSection.length >= 2 && (
+                      <SectionBulkBar
+                        sectionKind={viewDecision}
+                        imageIds={currentSection.map(m => m.id)}
+                        onBulkDecide={onBulkDecide}
+                      />
+                    )}
+                  </div>
                   <div className="divide-y divide-[rgba(255,255,255,0.04)]">
                     {currentSection.map(m => (
                       <MemberRow key={m.id} image={m} onDecide={onDecide} onInspect={() => openInspect(m.id)} />

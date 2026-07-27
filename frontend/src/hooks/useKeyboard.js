@@ -44,6 +44,7 @@ export function useKeyboard({
   loupeOpen,
   multiSelectActive,
   bulkSendDecision,
+  bulkSendUndo,
   runUndo,
   amendLastDecision,
   registerDecisionIntent,
@@ -216,13 +217,17 @@ export function useKeyboard({
   // cell is a group (group has no single decision to revert) or when the
   // photo has no decision yet.
 
-  // U / Cmd+Z pops the app-global undo stack (last K/M/R or group action,
-  // single or bulk, from any surface). When the stack is empty, fall back
-  // to per-photo undo for whatever's currently focused — preserves the
-  // "I just decided this photo, take it back" gesture for users who
-  // didn't realise there's a stack now.
+  // Priority order mirrors decideOrAmend so U/Cmd+Z stays consistent with
+  // K/M/R:
+  //  1. Multi-selection active → revert EVERY selected photo to undecided.
+  //     This is an explicit "these photos" instruction and must win over the
+  //     stack, exactly as bulk K/M/R wins over the single-photo path.
+  //  2. Otherwise pop the app-global undo stack (last K/M/R or group action).
+  //  3. Stack empty → per-photo undo for whatever's currently focused,
+  //     preserving the "I just decided this photo, take it back" gesture.
   const runUndoGated = async () => {
     if (loupeOpen || activeView !== 'grid') return
+    if (multiSelectActive) { bulkSendUndo?.(); return }
     if (runUndo) {
       const handled = await runUndo()
       if (handled) return
@@ -233,8 +238,8 @@ export function useKeyboard({
     undoImage(img.id)
   }
 
-  useHotkeys('meta+z', runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo])
-  useHotkeys('u',      runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo])
+  useHotkeys('meta+z', runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
+  useHotkeys('u',      runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
 
   // ── Thumbnail size (= / -) ───────────────────────────────────────────────
 

@@ -254,7 +254,7 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
         "unfinished":     int   # total_on_disk - done_count
       }
 
-    Skips conventional decision subfolders (_Keeps / _Maybes / _Trash) to
+    Skips conventional decision subfolders (_Keeps / _Maybes / _Rejects) to
     match analyze_folder's walk semantics — otherwise a freshly-moved photo
     would count as "unfinished" forever.
     """

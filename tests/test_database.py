@@ -138,11 +138,11 @@ def test_folder_overrides_roundtrip(tmp_path: Path, tmp_db: Path) -> None:
 
     overrides = get_folder_overrides(source, db_path=tmp_db)
 
-    # get_folder_overrides translates decision names to the legacy key names
+    # get_folder_overrides translates decision names to the override key names
     # that resolve_dest_folder expects.
-    assert overrides.get("keeps_folder")  == keeps
-    assert overrides.get("maybes_folder") == maybes
-    assert overrides.get("trash_folder")  == trash
+    assert overrides.get("keeps_folder")   == keeps
+    assert overrides.get("maybes_folder")  == maybes
+    assert overrides.get("rejects_folder") == trash
 
 
 def test_folder_override_delete(tmp_path: Path, tmp_db: Path) -> None:

@@ -77,7 +77,7 @@ import { ConfirmModal } from './modals/ConfirmModal'
 import { AutoCullModal } from './modals/AutoCullModal'
 import { SettingsModal } from './modals/SettingsModal'
 import { GroupPartnersOverlay } from './modals/GroupPartnersOverlay'
-import { PartnerCountChips } from './ui/TileChips'
+import { PartnerCountChips, GroupBulkBar } from './ui/TileChips'
 import { ImageCard } from './views/ImageCard'
 import { DetailView } from './views/DetailView'
 import { GroupTile } from './views/GroupTile'
@@ -361,6 +361,10 @@ export default function App() {
   // Without this gate the page autoscrolls to a "random" deep tile on open.
   // Flipped to true by the first real cursor movement (arrow nav, click, etc.).
   const userHasNavigatedRef = useRef(false)
+  // Tracks the last decisionFilter the grid-focus effect acted on, so that
+  // effect fires only on an actual filter *switch* (enter Keeps view), not on
+  // every displayGridItems recompute (which churns constantly during a batch).
+  const lastFocusedFilterRef = useRef(null)
 
   // Reveal-on-scroll-up header. Hides the App bar + TabBar (and the filter
   // bar nested inside) when scrolling down, slides them back into view on
@@ -1099,6 +1103,14 @@ export default function App() {
         const groupChip = chipCounts
           ? { counts: chipCounts, members: firstSummary.members, viewDecision: decisionFilter }
           : null
+        // Image ids of the members actually rendered in this run — i.e. the
+        // current view's bucket for this group. Hung on the first tile so the
+        // hover bulk-action bar can move the whole visible run in one call
+        // (survivors culled into other buckets are untouched). Only meaningful
+        // when the run draws a shared border (≥2 adjacent members).
+        const runImageIds = drawBorder
+          ? run.filter(it => it.type === 'image').map(it => it.image.id)
+          : null
         run.forEach((it, i) => {
           const position = !drawBorder
             ? 'solo'
@@ -1112,6 +1124,7 @@ export default function App() {
             ...it,
             groupRun: { id: key, position, index: i, length: run.length },
             groupChip: i === 0 ? groupChip : null,
+            runImageIds: i === 0 ? runImageIds : null,
           })
         })
       }
@@ -1185,6 +1198,46 @@ export default function App() {
       el.focus({ preventScroll: true })
     }
   }, [selectedIdx, selectedGridIdx, images, analyzing])
+
+  // Move keyboard focus into the grid when the decision filter switches (e.g.
+  // clicking the Keeps/Maybes/Rejects pill). The filter pills decline focus
+  // (onMouseDown preventDefault) to preserve grid focus, but if focus was
+  // *unowned* (document.body, common after a fresh load or scroll) nothing
+  // put it into the grid — so K/M/X, which require gridHasFocus(), silently
+  // no-op until the user clicks a photo. Selecting + DOM-focusing the first
+  // visible photo cell here makes decision keys work the moment you land in a
+  // filtered view. Fires only on an actual filter change (guarded by
+  // lastFocusedFilterRef), never on the constant displayGridItems churn during
+  // a batch. Never steals focus from search/settings/modals — only claims it
+  // when the grid is the active surface and focus is unowned or already inside.
+  useEffect(() => {
+    if (lastFocusedFilterRef.current === decisionFilter) return
+    lastFocusedFilterRef.current = decisionFilter
+    if (activeView !== 'grid') return
+    if (detailOpen || loupeGroup || settingsOpen || filterOpen ||
+        tabSettingsOpen || autoCullOpen || compareOpen || viewOpen) return
+    if (!gridRef.current) return
+    // Only claim focus when nothing else holds it (or the grid already does) —
+    // matches the focus-reclaim tolerance in the scrollIntoView effect above.
+    const active = document.activeElement
+    if (!(gridRef.current.contains(active) || !active || active === document.body)) return
+    const firstPhotoIdx = displayGridItems.findIndex(it => it.type === 'image')
+    if (firstPhotoIdx < 0) return
+    const firstPhoto = displayGridItems[firstPhotoIdx]
+    setSelectedGroupId(null)
+    const i = images.findIndex(img => img.id === firstPhoto.image.id)
+    if (i >= 0) setSelectedIdx(i)
+    // Focus the cell so gridHasFocus() passes for the next K/M/X. Deferred to
+    // the next frame so the roving-tabIndex / data-grid-idx for the new
+    // selection has committed to the DOM before we query for it.
+    userHasNavigatedRef.current = true
+    requestAnimationFrame(() => {
+      const el = gridRef.current?.querySelector(`[data-grid-idx="${firstPhotoIdx}"]`)
+      el?.focus({ preventScroll: true })
+    })
+  }, [decisionFilter, activeView, detailOpen, loupeGroup, settingsOpen,
+      filterOpen, tabSettingsOpen, autoCullOpen, compareOpen, viewOpen,
+      displayGridItems, images, setSelectedGroupId, setSelectedIdx])
 
   // Flip the navigation-gate on the first real user interaction with the grid
   // (pointer down on a tile or any cursor-moving key while focus is in the
@@ -1654,6 +1707,48 @@ export default function App() {
     }
   }, [gridMultiSelect.selected, images, setImages, loadModelInfo, addToast, undoStack])
 
+  // bulkSendUndo — revert every selected photo to undecided in one keystroke.
+  // The undo counterpart to bulkSendDecision: same "act on the whole selection"
+  // contract that K/M/R already honour, so U / Cmd+Z is consistent with them.
+  // Mirrors undoImage per-photo (parallel /undo-decision calls) rather than the
+  // global stack, because a multi-selection is an explicit "these photos"
+  // instruction, not "the last thing I did". Undecided members are skipped
+  // (nothing to reverse); failures are reported the same way as bulk decide.
+  const bulkSendUndo = useCallback(async () => {
+    const ids = Array.from(gridMultiSelect.selected).filter(id => {
+      const img = images.find(i => i.id === id)
+      return img && img.decision
+    })
+    if (ids.length === 0) return
+    const results = await Promise.allSettled(ids.map(id =>
+      fetch(`${API}/undo-decision`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_id: id }),
+      }).then(async r => {
+        const data = await r.json().catch(() => ({}))
+        if (!r.ok) throw new Error(data.detail || `${r.status}`)
+        return { id, new_path: data.new_path }
+      })
+    ))
+    const patches = results.filter(r => r.status === 'fulfilled').map(r => r.value)
+    const failures = results.filter(r => r.status === 'rejected').length
+    if (patches.length > 0) {
+      const patchMap = new Map(patches.map(p => [p.id, p]))
+      setImages(prevImgs => prevImgs.map(img => {
+        const p = patchMap.get(img.id)
+        return p ? { ...img, decision: null, file_path: p.new_path } : img
+      }))
+    }
+    loadModelInfo()
+    if (failures > 0) {
+      addToast({
+        type: 'error',
+        message: `${patches.length} reverted, ${failures} failed`,
+        duration: 5000,
+      })
+    }
+  }, [gridMultiSelect.selected, images, setImages, loadModelInfo, addToast])
+
   // runUndo — pops the top of the undo stack and replays the inverse.
   // Called by U / Cmd+Z from any surface (grid, loupe, detail, compare).
   // Returns true if an entry was consumed, false if the stack was empty.
@@ -1926,7 +2021,7 @@ export default function App() {
       await loadImages()
       loadModelInfo()
       setDecisionFilter('reject')
-      addToast({ type: 'info', message: `${ids.length} photos moved to _Trash` })
+      addToast({ type: 'info', message: `${ids.length} photos moved to _Rejects` })
     } catch (e) {
       console.error('Bulk reject failed:', e)
     } finally {
@@ -1997,10 +2092,11 @@ export default function App() {
     // owns K/M/X/arrows/Enter/S/Z/Esc while open.
     loupeOpen: !!loupeGroup,
     // Bulk multi-select hooks — when isSelectMode && size>0, K/M/R hit the
-    // whole selection and U undoes the whole bulk action. Otherwise the
-    // per-photo handlers fire as before.
+    // whole selection and U reverts every selected photo to undecided.
+    // Otherwise the per-photo handlers fire as before.
     multiSelectActive: gridMultiSelect.isSelectMode && gridMultiSelect.size > 0,
     bulkSendDecision,
+    bulkSendUndo,
     runUndo,
     amendLastDecision,
     registerDecisionIntent,
@@ -2071,6 +2167,7 @@ export default function App() {
             members={summary.members}
             viewDecision={partnersOverlay.viewDecision}
             onDecide={sendGroupDecision}
+            onBulkDecide={bulkDecide}
             onClose={() => setPartnersOverlay(null)}
           />
         )
@@ -2165,6 +2262,7 @@ export default function App() {
       {autoCullOpen && (
         <AutoCullModal
           folderPath={activeTab?.folderPath || ''}
+          groupThreshold={threshold}
           onClose={() => setAutoCullOpen(false)}
           onComplete={handleAutoCullComplete}
           onToast={addToast}
@@ -3208,7 +3306,7 @@ export default function App() {
                         Decisions immediately move files into{' '}
                         <span className="text-[#9c9c9d] font-mono text-[11px]">_Keeps</span>{' '}/{' '}
                         <span className="text-[#9c9c9d] font-mono text-[11px]">_Maybes</span>{' '}/{' '}
-                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Trash</span>.
+                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Rejects</span>.
                       </span>
                       </p>
                     </div>
@@ -3372,7 +3470,7 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative' : ''}${
+                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative group/run' : ''}${
                     // Selection must win visually over the group-run border overlay
                     // below (z-10, amber/coral) — otherwise the cyan ring is painted
                     // first and gets covered on 3 of 4 edges, leaving only the
@@ -3538,6 +3636,22 @@ export default function App() {
                       <PartnerCountChips
                         counts={item.groupChip.counts}
                         onOpen={() => setPartnersOverlay({ imageId: item.image.id, viewDecision: item.groupChip.viewDecision })}
+                      />
+                    </div>
+                  )}
+                  {/* Group bulk-action bar — hover-revealed at the run's top-left.
+                      Moves every member rendered in this run (this view's bucket)
+                      to a target decision in one call, leaving survivors culled
+                      into other buckets alone. Only on the first tile (where the
+                      run's ids are hung), and only while not multi-selecting so
+                      it never competes with the select flow. group-hover/run keys
+                      off the named group on the cell wrapper above. */}
+                  {item.runImageIds && item.runImageIds.length > 0 && !gridMultiSelect.isSelectMode && (
+                    <div className="absolute top-1.5 left-1.5 z-20 opacity-0 group-hover/run:opacity-100 transition-opacity">
+                      <GroupBulkBar
+                        count={item.runImageIds.length}
+                        viewDecision={decisionFilter}
+                        onDecide={(decision) => bulkDecide(item.runImageIds, decision)}
                       />
                     </div>
                   )}

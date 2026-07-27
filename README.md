@@ -39,7 +39,7 @@ Built by a senior UX designer learning to code, for personal use with three came
 
 **Helps you cull faster:**
 
-- `K` / `M` / `R` decisions on every screen — files move into `_Keeps/` / `_Maybes/` / `_Trash/` inside the source folder. RAW files are never modified.
+- `K` / `M` / `R` decisions on every screen — files move into `_Keeps/` / `_Maybes/` / `_Rejects/` inside the source folder. RAW files are never modified.
 - Writes XMP sidecars with `XMP:Rating` and `XMP:Label` — Lightroom, Capture One, Bridge, and Luminar Neo all pick these up automatically. The keepers land in your editor already starred.
 - Group loupe with synchronized zoom for burst comparison.
 - Optional AI-generated one-paragraph explanation per pick (via local Ollama).
@@ -163,7 +163,7 @@ Sprint-level history is in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 |---|---|
 | `K` | Keep — moves file to `_Keeps/` |
 | `M` | Maybe — moves file to `_Maybes/` |
-| `R` | Reject — moves file to `_Trash/` |
+| `R` | Reject — moves file to `_Rejects/` |
 | `U` / `Cmd+Z` | Undo the selected photo's decision |
 | `C` | Add/remove photo from Compare set (max 4) |
 | `Space` | Open Compare (when 2+ staged) · otherwise open focused photo or group |

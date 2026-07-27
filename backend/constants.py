@@ -172,4 +172,4 @@ def shot_at_to_unix(value) -> float | None:
 # (Provenance) moving a keeper out of _Keeps can't race the watcher into a
 # "Could not load image" error. Canonical home — previously duplicated as
 # inline literals in routers/images.py, routers/analysis.py, file_mover.py.
-DECISION_SUBFOLDERS: frozenset[str] = frozenset({"_Keeps", "_Maybes", "_Trash"})
+DECISION_SUBFOLDERS: frozenset[str] = frozenset({"_Keeps", "_Maybes", "_Rejects"})

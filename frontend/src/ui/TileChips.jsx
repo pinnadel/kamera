@@ -52,6 +52,48 @@ export function PartnerCountChips({ counts, onOpen }) {
   )
 }
 
+// GroupBulkBar — a hover-revealed action row for a group run in the Rejects /
+// Maybes grid. Answers "move this whole visible group at once" without opening
+// the overlay: one button per target decision that ISN'T the current view
+// (Maybes view → Keep all / Reject all; Rejects view → Keep all / Maybe all).
+// Acts on the run's visible members only (this view's bucket) — survivors culled
+// into other buckets are left alone. Buttons are tinted to their target
+// decision, matching the canonical palette. Rendered above the group border
+// (z-20) and only interactive on hover so it adds no permanent chrome.
+const BULK_BTN_STYLES = {
+  keep:   { bg: 'rgba(125,184,154,0.22)', fg: '#7DB89A', label: 'Keep all' },
+  maybe:  { bg: 'rgba(232,184,74,0.22)',  fg: '#E8B84A', label: 'Maybe all' },
+  reject: { bg: 'rgba(201,123,123,0.22)', fg: '#C97B7B', label: 'Reject all' },
+}
+
+export function GroupBulkBar({ count, viewDecision, onDecide }) {
+  // Targets = the two survivor/cull buckets other than the one we're viewing.
+  const targets = ['keep', 'maybe', 'reject'].filter(kind => kind !== viewDecision)
+  return (
+    <div
+      className="flex items-center gap-1"
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+    >
+      {targets.map(kind => {
+        const s = BULK_BTN_STYLES[kind]
+        return (
+          <button
+            key={kind}
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onDecide(kind) }}
+            className="inline-flex items-center h-[22px] px-2 rounded-md bg-[rgba(7,8,10,0.72)] backdrop-blur-sm text-[11px] font-semibold leading-none hover:opacity-80 transition-opacity"
+            style={{ color: s.fg, boxShadow: `inset 0 0 0 1px ${s.bg}` }}
+            title={`Move all ${count} photos in this group to ${s.label.replace(' all', '')}`}
+          >
+            {s.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 // GroupOverlayChips — top-left image overlay for a group tile. Dark translucent
 // backing so it reads on any photo. Layers icon is always shown; the AI pill
 // (rainbow "AI" + cyan pulse) appears only while `prerankState === 'in_progress'`,

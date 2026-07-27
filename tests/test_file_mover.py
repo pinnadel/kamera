@@ -27,10 +27,10 @@ def test_resolve_dest_folder_default_keep() -> None:
 
 
 def test_resolve_dest_folder_default_reject() -> None:
-    """With no overrides, reject destination ends in _Trash."""
+    """With no overrides, reject destination ends in _Rejects."""
     result = resolve_dest_folder("reject", SOURCE_FOLDER, overrides=None)
-    assert result == Path(SOURCE_FOLDER) / "_Trash"
-    assert result.name == "_Trash"
+    assert result == Path(SOURCE_FOLDER) / "_Rejects"
+    assert result.name == "_Rejects"
 
 
 def test_resolve_dest_folder_default_maybe() -> None:
@@ -58,7 +58,7 @@ def test_resolve_dest_folder_override_keep(tmp_path: Path) -> None:
 def test_resolve_dest_folder_override_reject(tmp_path: Path) -> None:
     """Override for reject returns the custom absolute path."""
     custom = str(tmp_path / "NAS" / "Trash")
-    overrides = {"trash_folder": custom}
+    overrides = {"rejects_folder": custom}
     result = resolve_dest_folder("reject", SOURCE_FOLDER, overrides=overrides)
     assert result == Path(custom)
 
@@ -75,7 +75,7 @@ def test_resolve_dest_folder_partial_override_fallback(tmp_path: Path) -> None:
     """If only keep is overridden, reject still falls back to default subfolder."""
     overrides = {"keeps_folder": str(tmp_path / "NAS" / "Keeps")}
     result = resolve_dest_folder("reject", SOURCE_FOLDER, overrides=overrides)
-    assert result == Path(SOURCE_FOLDER) / "_Trash"
+    assert result == Path(SOURCE_FOLDER) / "_Rejects"
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ def test_resolve_dest_folder_reviewed_ignored_for_non_keep() -> None:
     maybe_result = resolve_dest_folder("maybe", SOURCE_FOLDER, overrides=None, reviewed=True)
     reject_result = resolve_dest_folder("reject", SOURCE_FOLDER, overrides=None, reviewed=True)
     assert maybe_result == Path(SOURCE_FOLDER) / "_Maybes"
-    assert reject_result == Path(SOURCE_FOLDER) / "_Trash"
+    assert reject_result == Path(SOURCE_FOLDER) / "_Rejects"
 
 
 def test_resolve_dest_folder_returns_path_type() -> None:

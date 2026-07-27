@@ -79,7 +79,7 @@ def test_unfinished_when_batch_interrupted(patched_db, tmp_path):
 
 
 def test_unfinished_skips_decision_subfolders(patched_db, tmp_path):
-    """_Keeps/_Maybes/_Trash files must not count — they're moved
+    """_Keeps/_Maybes/_Rejects files must not count — they're moved
     photos, already analyzed pre-move. Without this skip, a folder
     finishes analysis and then permanently flags itself as 'has
     unfinished work' because the moved files now live in subdirs."""
@@ -88,7 +88,7 @@ def test_unfinished_skips_decision_subfolders(patched_db, tmp_path):
     (folder / "A.jpg").touch()
     keeps = folder / "_Keeps"; keeps.mkdir()
     (keeps / "old_kept.jpg").touch()
-    trash = folder / "_Trash"; trash.mkdir()
+    trash = folder / "_Rejects"; trash.mkdir()
     (trash / "old_rejected.RAF").touch()
     _seed_done(patched_db, [str(folder / "A.jpg")], str(folder))
 
@@ -97,7 +97,7 @@ def test_unfinished_skips_decision_subfolders(patched_db, tmp_path):
     assert out["total_on_disk"] == 1
     assert out["unfinished"] == 0
 
-    # Recursive: walks subdirs but the _Keeps/_Trash filter excludes them.
+    # Recursive: walks subdirs but the _Keeps/_Rejects filter excludes them.
     out_rec = images_mod.folder_unfinished(folder_path=str(folder), include_subfolders=True)
     assert out_rec["total_on_disk"] == 1
     assert out_rec["unfinished"] == 0

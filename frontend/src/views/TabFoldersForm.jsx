@@ -10,7 +10,7 @@ import { FolderInput } from '../ui/FolderInput'
 const ROWS = [
   { key: 'keeps_folder',  decision: 'keep',   label: 'Keep',   borderColor: 'bg-[#7DB89A]', defaultSubfolder: '_Keeps'  },
   { key: 'maybes_folder', decision: 'maybe',  label: 'Maybe',  borderColor: 'bg-[#E8B84A]', defaultSubfolder: '_Maybes' },
-  { key: 'trash_folder',  decision: 'reject', label: 'Reject', borderColor: 'bg-[#C97B7B]', defaultSubfolder: '_Trash'  },
+  { key: 'rejects_folder', decision: 'reject', label: 'Reject', borderColor: 'bg-[#C97B7B]', defaultSubfolder: '_Rejects' },
 ]
 
 export function TabFoldersForm({ sourceFolder, onToast, autoLoad = true }) {
@@ -96,7 +96,7 @@ export function TabFoldersForm({ sourceFolder, onToast, autoLoad = true }) {
   }
   if (!data) return null
 
-  const customCount = [data.keeps_is_default, data.maybes_is_default, data.trash_is_default].filter(d => !d).length
+  const customCount = [data.keeps_is_default, data.maybes_is_default, data.rejects_is_default].filter(d => !d).length
 
   return (
     <div>

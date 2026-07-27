@@ -1,7 +1,7 @@
 """FolderWatcher live-progress counters + decision-folder skip guard.
 
 These cover the watch-progress signal (GET /watch-progress), the fix for the
-"Could not load image" toast (files moved into _Keeps/_Maybes/_Trash must never
+"Could not load image" toast (files moved into _Keeps/_Maybes/_Rejects must never
 be (re)analyzed), and the queued single-worker pipeline (the fix for the
 thread-per-file meltdown: a bulk card drop must not spawn hundreds of
 concurrent analyses). No real photos / cv2 needed.
@@ -49,7 +49,7 @@ def test_handle_skips_decision_subfolder_files():
     h = _PhotoEventHandler(Path("/tmp/x.db"), owner=w)
     h._handle("/card/folder/_Keeps/DSCF0856.JPG")   # decided → skip
     h._handle("/card/folder/_Maybes/DSCF0857.RAF")  # decided → skip
-    h._handle("/card/folder/_Trash/DSCF0858.JPG")   # decided → skip
+    h._handle("/card/folder/_Rejects/DSCF0858.JPG")   # decided → skip
     assert w.in_flight == 0 and w._queue.qsize() == 0
 
 

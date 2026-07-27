@@ -105,6 +105,105 @@ routed. The routing only fires when the personal model is in "Ready" state
 ([decisions.py:208](backend/routers/decisions.py#L208)). Below readiness the
 ensemble isn't consulted.
 
+### Why did auto-cull keep several near-identical photos from one burst — or send some to Reject?
+
+Auto-cull scores every photo **independently**, so a run of near-identical
+frames (same pose, seconds apart) can each clear the Keep cutoff on their own.
+The **Deduplicate Keeps within a burst** pass (Settings → Model → Decision
+thresholds, on by default) reconciles that against the burst grouping you see
+in the UI. For each burst it:
+
+- Always keeps the single best photo (same priority as the group's amber-star
+  hero pick).
+- Lets a few **extra** frames also Keep — but only genuinely strong ones: each
+  must clear the Keep cutoff by a margin *and* score close to the burst's best
+  frame, up to a maximum number of Keeps per burst.
+- **Rejects near-pixel-identical duplicates** outright: if two frames are
+  visually near-identical (cosine ≥ 0.97, the same test the AI burst ranker
+  uses), the lower-scoring one is redundant regardless of its score and goes
+  straight to Reject.
+- Demotes the rest, **graded**: a close alternate goes to **Maybe**; a clearly
+  weaker frame (well below the best, or under the Maybe cutoff) goes to
+  **Reject**. And once the burst has already kept a few Maybe alternates, every
+  *further* redundant frame is Rejected too — this is what stops a 30-frame
+  burst from dumping 29 Maybes on you. A big tight burst ends up roughly *1
+  Keep + 2 Maybes + the rest Reject* instead of *1 Keep + 29 Maybes*.
+
+**Distinct scenes within one burst keep their own budget.** The time-gap
+grouping can lump *visually different* shots into one burst — you shoot one
+angle, pan, and shoot a completely different angle a few seconds later, still
+inside the burst's time window. The dedup pass detects those distinct sub-scenes
+(cosine union-find at 0.94, stricter than the 0.90 that forms the burst) and
+gives **each scene its own Keep/Maybe budget**. So a burst that's really two
+different framings can auto-Keep two photos — one per scene — instead of
+rejecting the second as a "redundant" copy of the first. A burst that's genuinely
+one moment still collapses to a single Keep. A frame the model can't place
+visually (missing embedding) gets its own scene and is kept, never auto-rejected.
+
+Five knobs sit under the toggle. The score-based ones read `personal_score`
+points once the model is Ready, `overall_score` points before that:
+
+- **Max Keeps per burst** (default `2`) — how many photos from one burst may
+  auto-Keep, counting the best. **Set to `1`** to keep only the single best
+  photo per burst (the original behaviour).
+- **Max Maybe alternates per burst** (default `2`) — after the Keeps, how many
+  more frames may stay as Maybe for review before the rest auto-Reject. **Set
+  to `0`** to reject every non-kept frame; raise it for a wider safety net.
+- **Extra-keep margin above cutoff** (default `8`) — how far over the Keep
+  cutoff an extra frame must score to survive. Higher = pickier.
+- **Extra-keep closeness to best** (default `6`) — how close to the best frame
+  an extra frame must be. Lower = only near-identical-quality frames double-keep.
+- **Reject when this far below best** (default `20`) — a non-surviving frame
+  more than this far below the best (or below the Maybe cutoff) is Rejected
+  instead of routed to Maybe. Raise it to make this specific Reject rarer.
+
+The pass uses whichever score drove each photo's Keep verdict —
+`personal_score` once the model is Ready, `overall_score` in threshold-fallback
+mode. It runs in both the live preview and the committed run, so the counts you
+see before committing match what happens. See
+[`_cap_burst_keeps`](backend/routers/decisions.py) and the burst keep-guarantee
+floor pass, which still rescues a burst that would otherwise end up with zero
+Keeps.
+
+### Does the grouping Time-gap slider affect auto-cull?
+
+**No — auto-cull dedup ignores the Time-gap entirely.** That slider (Settings →
+Grouping) only shapes the groups you *browse* in Bursts / GroupLoupe. Auto-cull's
+burst dedup groups by **visual similarity only**.
+
+This is deliberate. The Time-gap can only ever split bursts *coarser* than the
+camera's inter-frame spacing — and continuous shooting fires several frames
+within one EXIF second (timestamps are second-resolution), so those frames share
+a timestamp and **no gap can separate them**. On a library of fast bursts the
+slider was effectively inert for auto-cull. Cosine similarity, by contrast, *can*
+tell those frames apart. So auto-cull forms its groups with the **Similarity**
+threshold and decides how many survive within each group via the **Max Keeps /
+Max Maybe alternates per burst** budgets. Those are the real levers.
+
+("But won't similarity-only grouping merge two separate moments minutes apart
+into one giant burst?" — no: the dedup pass then splits each group into distinct
+visual sub-scenes at cosine 0.94 and budgets each scene separately, so distinct
+moments each keep their own photos. See the burst-dedup FAQ above.)
+
+### Why does the auto-cull Keep/Maybe/Reject count barely move when I change grouping?
+
+Because burst dedup can only re-decide photos that were **already Keeps**. The
+Auto-cull preview's Rejects come from two independent sources:
+
+1. **Per-photo quality rejects** (the personal model's own call, or the quality
+   thresholds below readiness) — usually the large majority. These are decided
+   photo-by-photo and **no grouping change can touch them**. If the model
+   already rejected a soft or badly-exposed frame, it stays rejected.
+2. **Redundant burst-frame rejects** — the only ones grouping affects. Raise the
+   **Similarity** threshold or lower the **Max Keeps / Max Maybe** budgets → more
+   redundant frames demoted; loosen them → fewer.
+
+The Auto-cull modal shows this split explicitly (a line like *"12 rejected as
+redundant burst frames · 281 from per-photo quality"*), plus a "Redundant burst
+frame" row in **Why rejected?**. If the counts barely move, it's telling you your
+model is doing most of the culling on its own — the burst dedup is a small
+top-up, and the lever to make it more aggressive is Similarity + the budgets.
+
 ### Does auto-cull teach the personal model?
 
 No. The personal model learns **only** from your manual K/M/X decisions —
@@ -130,7 +229,7 @@ touched contributes nothing to training.
 
 ### What gets written to disk on every K/M/X decision?
 
-1. **The RAW + sidecar move** to `_Keeps/`, `_Maybes/`, or `_Trash/` (or
+1. **The RAW + sidecar move** to `_Keeps/`, `_Maybes/`, or `_Rejects/` (or
    per-folder overrides). The Fuji `.HIF` companion moves with the RAW when
    present.
 2. **`XMP:Rating` (5/3/1) and `XMP:Label` (Green/Yellow/Red)** to a `.xmp`
@@ -145,8 +244,39 @@ touched contributes nothing to training.
    below.
 
 If `reject_to_system_trash` is enabled, the reject branch routes through
-`send2trash` instead of `_Trash/` and skips the XMP write (the file is no
+`send2trash` instead of `_Rejects/` and skips the XMP write (the file is no
 longer addressable).
+
+### How do I re-test auto-cull on an already-analysed group without re-analysing?
+
+**Short answer:** Multi-select the group's photos, press **U** (or **Cmd+Z**)
+to send them all back to undecided in one keystroke, then run **Auto cull**
+again. Undo only reverses the *decision* — it never touches the analysis, so
+no photos get re-decoded.
+
+Why it's safe to loop: undo (`/undo-decision` →
+[`_apply_undo`](backend/routers/decisions.py#L622)) moves the file back home
+out of `_Keeps`/`_Maybes`/`_Rejects`, deletes the `decisions` row, and drops the
+`training_samples` row for that photo — but it leaves the `images` row
+completely intact. Every score, feature, and embedding stays frozen from the
+original analysis, so the next auto-cull run re-decides from the *same*
+numbers. That's exactly what you want when tuning thresholds or testing a new
+auto-cull rule: change the setting, revert the group, re-cull, compare.
+
+**Bulk undo acts on the whole selection, in every view.** This mirrors K/M/R:
+once a multi-selection is active, one keystroke acts on all selected photos.
+In the grid the multi-select branch runs *before* the undo stack
+([useKeyboard.js:230](frontend/src/hooks/useKeyboard.js#L230) →
+[`bulkSendUndo`](frontend/src/App.jsx#L1664)); the GroupLoupe binds the same
+selection-aware undo. Already-undecided members in the selection are skipped
+(nothing to reverse).
+
+One quirk to expect: a **group tile only ever shows *undecided* members**, so
+once auto-cull has decided a group the photos split out into individual cards
+in the Keep / Maybe / Reject (and All) views. You select *those cards* to
+revert — and because group membership is merged from live state
+([`enrichedGroups`](frontend/src/hooks/useGroups.js#L154)), the reverted photos
+rejoin their group tile immediately, with no folder reload.
 
 ### What happens if I move my photos in Finder after analyzing?
 
@@ -272,6 +402,28 @@ of cosine. See [backend/routers/model.py](../backend/routers/model.py)
 `set_manual_group` and
 [phase2_quality/similarity_scorer.py](../phase2_quality/similarity_scorer.py)
 `group_by_similarity` (manual-anchor reconciliation phase).
+
+### How do I move a whole group of Maybes (or Rejects) at once?
+
+Two places, both acting on the group members *you can currently see* — a
+survivor culled into a different bucket is left alone:
+
+- **In the grid** (Maybes or Rejects view): hover the amber/coral-bordered
+  run and a small action bar appears at its top-left — "Keep all" and
+  "Reject all" on the Maybes view, "Keep all" / "Maybe all" on the Rejects
+  view (it only offers the two decisions that aren't the one you're
+  looking at). One click moves every visible member of that run.
+- **In the "Group members" overlay** (opened by clicking the survivor chip,
+  e.g. "1 Keep"): each section header (Keeps / Maybes / Rejects) with two or
+  more photos gets the same "…all" buttons, so you can move a whole bucket
+  without touching each row.
+
+Both route through the same undoable `bulkDecide` batch path (one round-trip,
+one Undo entry), so `U` / Cmd+Z reverses the whole move. The grid bar hangs on
+the run's first tile via `runImageIds`; controls live in
+[frontend/src/ui/TileChips.jsx](../frontend/src/ui/TileChips.jsx) `GroupBulkBar`
+and [frontend/src/modals/GroupPartnersOverlay.jsx](../frontend/src/modals/GroupPartnersOverlay.jsx)
+`SectionBulkBar`.
 
 ### The grouping defaults look wrong on my library. Can I tune them?
 
@@ -491,4 +643,4 @@ picture pane) or Esc close DetailView.
 
 ---
 
-*Last updated: 2026-05-15*
+*Last updated: 2026-07-27*

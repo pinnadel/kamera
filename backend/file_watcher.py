@@ -218,7 +218,7 @@ class _PhotoEventHandler(FileSystemEventHandler):
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             return
         # Skip files that already live in a decision subfolder (_Keeps/_Maybes/
-        # _Trash). A keep/maybe/reject MOVE into _Keeps fires on_moved with that
+        # _Rejects). A keep/maybe/reject MOVE into _Keeps fires on_moved with that
         # destination; re-analyzing it is both pointless (already decided) and
         # racy — an external archiver (Provenance) may move the keeper out of
         # _Keeps before our 2s settle elapses, making cv2.imread fail and toast
@@ -241,7 +241,7 @@ class _PhotoEventHandler(FileSystemEventHandler):
         # Fired when a file is deleted from the watched folder. Drop its row so
         # the grid stays in sync. Non-recursive observer → only top-level
         # deletes fire, which is what we want (K/X/M moves into _Keeps/_Maybes/
-        # _Trash subfolders are tracked separately as decisions, not deletes).
+        # _Rejects subfolders are tracked separately as decisions, not deletes).
         if event.is_directory:
             return
         path = Path(event.src_path)

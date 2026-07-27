@@ -83,12 +83,37 @@ DEFAULT_UNCERTAINTY_THRESHOLD: float = 8.0
 # scored independently, so a run of near-identical frames (same pose, same
 # scene, seconds apart) can each individually clear the Keep cutoff and all
 # land in _Keeps/ — the grouping/dedup step users expect never actually
-# fires for auto-cull. When on, run_auto_cull() (and its preview) demote
-# every burst member past the single best-by-priority photo from keep →
-# maybe, so only one hero per moment survives to Keep automatically. Inverse
-# of the existing burst_keep_guarantee floor pass (which rescues a burst from
-# zero keeps); this one caps a burst at one.
+# fires for auto-cull. When on, run_auto_cull() (and its preview) run the
+# multi-keep pass: the best-by-priority photo per burst always keeps, and
+# each additional in-burst Keep survives only if it's genuinely strong (see
+# the four knobs below); the rest demote — graded to Maybe (near-alternates)
+# or Reject (clearly weak). Inverse of the existing burst_keep_guarantee floor
+# pass (which rescues a burst from zero keeps).
 DEFAULT_AUTO_CULL_CAP_BURST_KEEPS = True
+
+# Multi-keep tuning (2026-07-26). All read live by _cap_burst_keeps.
+# Max auto-cull Keeps allowed per similarity burst, counting the winner.
+# 1 reproduces the original cap-at-one behaviour exactly (only the hero keeps).
+DEFAULT_MAX_BURST_KEEPS: float = 2.0
+# An extra in-burst Keep must clear its own mode's Keep cutoff by at least this
+# many points to survive as Keep — "not barely over the line". In personal-model
+# points (or overall_score points in fallback mode).
+DEFAULT_BURST_KEEP_MARGIN: float = 8.0
+# An extra in-burst Keep must be within this many points of the burst winner's
+# score to survive — a genuine alternate, not a weaker straggler.
+DEFAULT_BURST_KEEP_WINNER_DELTA: float = 6.0
+# A non-surviving in-burst Keep more than this many points below the winner
+# (or under its mode's Maybe cutoff) is demoted to Reject rather than Maybe —
+# it only reached "keep" scoring independently, and it's clearly the weak one.
+DEFAULT_BURST_KEEP_REJECT_DELTA: float = 20.0
+# Review budget (2026-07-26): a big tight burst of near-identical frames scores
+# them all so close together that none is far enough below the winner to reject
+# under the winner-relative rule above — the whole tail routes to Maybe and
+# floods the review pile. Once a burst has already produced its Keep(s) PLUS
+# this many Maybe alternates, every further redundant frame is rejected
+# (reason "burst_redundant") instead of adding yet another Maybe. 0 = reject
+# every non-surviving frame (no Maybe alternates kept).
+DEFAULT_MAX_BURST_MAYBES: float = 2.0
 
 # How often analyze_photo_quality should call torch.mps.empty_cache().
 # Every photo costs ~5-20ms and 741 calls = 3.7-14.8s of pure cache flush
@@ -219,9 +244,19 @@ def get_decision_thresholds() -> dict:
             "auto_cull_uncertain_to_maybe", DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE),
         "uncertainty_threshold":        _read_float(
             "uncertainty_threshold", DEFAULT_UNCERTAINTY_THRESHOLD, 0.0, 50.0),
-        # Burst keep-cap post-pass.
+        # Burst keep-cap / multi-keep post-pass.
         "auto_cull_cap_burst_keeps": _read_bool(
             "auto_cull_cap_burst_keeps", DEFAULT_AUTO_CULL_CAP_BURST_KEEPS),
+        "max_burst_keeps": _read_float(
+            "max_burst_keeps", DEFAULT_MAX_BURST_KEEPS, 1.0, 10.0),
+        "burst_keep_margin": _read_float(
+            "burst_keep_margin", DEFAULT_BURST_KEEP_MARGIN, 0.0, 50.0),
+        "burst_keep_winner_delta": _read_float(
+            "burst_keep_winner_delta", DEFAULT_BURST_KEEP_WINNER_DELTA, 0.0, 50.0),
+        "burst_keep_reject_delta": _read_float(
+            "burst_keep_reject_delta", DEFAULT_BURST_KEEP_REJECT_DELTA, 0.0, 100.0),
+        "max_burst_maybes": _read_float(
+            "max_burst_maybes", DEFAULT_MAX_BURST_MAYBES, 0.0, 10.0),
     }
 
 

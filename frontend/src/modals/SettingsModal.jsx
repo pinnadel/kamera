@@ -46,6 +46,8 @@ const PRESETS = {
     face_sharpness_floor:     15,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                25,
     reject_closed_eyes:       true,
   },
   balanced: {
@@ -58,6 +60,8 @@ const PRESETS = {
     face_sharpness_floor:     20,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                30,
     reject_closed_eyes:       true,
   },
   review_heavy: {
@@ -70,6 +74,8 @@ const PRESETS = {
     face_sharpness_floor:     20,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                25,
     reject_closed_eyes:       true,
   },
   aggressive: {
@@ -82,6 +88,8 @@ const PRESETS = {
     face_sharpness_floor:     25,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                35,
     reject_closed_eyes:       true,
   },
 }
@@ -97,6 +105,8 @@ const DECISION_DEFAULTS = {
   face_sharpness_floor:       20,
   reject_soft_face:           true,
   reject_blurry_frame:        true,
+  reject_low_iqa:             true,
+  iqa_floor:                  30,
   reject_closed_eyes:         true,
   reject_closed_eyes_all_faces: false,
   reject_reciprocal_rule:     false,
@@ -105,8 +115,48 @@ const DECISION_DEFAULTS = {
   // PR3 boundary routing.
   auto_cull_uncertain_to_maybe: true,
   uncertainty_threshold:        8.0,
-  // Burst keep-cap post-pass.
+  // Burst keep-cap / multi-keep post-pass.
   auto_cull_cap_burst_keeps:    true,
+  max_burst_keeps:              2,
+  max_burst_maybes:             2,
+  burst_keep_margin:            8.0,
+  burst_keep_winner_delta:      6.0,
+  burst_keep_reject_delta:      20.0,
+}
+
+// Non-linear value ladder for the burst "Time gap" slider. A native range
+// input can only do a uniform step, so the slider runs over the ARRAY INDEX
+// (uniform step 1) and each index maps to a gap value with finer granularity
+// at the short end where it matters most:
+//   1–30s  in 1s steps · 30–60s in 10s steps · 60–300s (5min) in 15s steps.
+const TIME_GAP_STEPS = (() => {
+  const steps = []
+  for (let s = 1; s <= 30; s += 1) steps.push(s)      // 1..30 @ 1s
+  for (let s = 40; s <= 60; s += 10) steps.push(s)    // 40,50,60 @ 10s
+  for (let s = 75; s <= 300; s += 15) steps.push(s)   // 75..300 @ 15s
+  return steps
+})()
+
+// Snap an arbitrary gap (seconds) to the nearest ladder index — used to place
+// the slider handle for a value that may predate this ladder (e.g. a stored 45).
+function timeGapToIndex(seconds) {
+  const target = seconds ?? 60
+  let best = 0
+  let bestDist = Infinity
+  for (let i = 0; i < TIME_GAP_STEPS.length; i += 1) {
+    const d = Math.abs(TIME_GAP_STEPS[i] - target)
+    if (d < bestDist) { bestDist = d; best = i }
+  }
+  return best
+}
+
+// Format a gap in seconds as "N seconds" or "M:SS minutes".
+function formatTimeGap(seconds) {
+  const total = Math.round(seconds ?? 60)
+  if (total < 60) return `${total} ${total === 1 ? 'second' : 'seconds'}`
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  return `${m}:${String(s).padStart(2, '0')} minutes`
 }
 
 export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onExportModel, onImportModel, importingModel, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
@@ -163,8 +213,10 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     fallback_maybe:           settings?.fallback_maybe           ?? DECISION_DEFAULTS.fallback_maybe,
     fallback_sharpness_floor: settings?.fallback_sharpness_floor ?? DECISION_DEFAULTS.fallback_sharpness_floor,
     face_sharpness_floor:     settings?.face_sharpness_floor     ?? DECISION_DEFAULTS.face_sharpness_floor,
+    iqa_floor:                settings?.iqa_floor                ?? DECISION_DEFAULTS.iqa_floor,
     reject_soft_face:           settings?.reject_soft_face           ?? DECISION_DEFAULTS.reject_soft_face,
     reject_blurry_frame:        settings?.reject_blurry_frame        ?? DECISION_DEFAULTS.reject_blurry_frame,
+    reject_low_iqa:             settings?.reject_low_iqa             ?? DECISION_DEFAULTS.reject_low_iqa,
     reject_closed_eyes:         settings?.reject_closed_eyes         ?? DECISION_DEFAULTS.reject_closed_eyes,
     reject_closed_eyes_all_faces: settings?.reject_closed_eyes_all_faces ?? DECISION_DEFAULTS.reject_closed_eyes_all_faces,
     reject_reciprocal_rule:     settings?.reject_reciprocal_rule     ?? DECISION_DEFAULTS.reject_reciprocal_rule,
@@ -173,6 +225,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     auto_cull_uncertain_to_maybe: settings?.auto_cull_uncertain_to_maybe ?? DECISION_DEFAULTS.auto_cull_uncertain_to_maybe,
     uncertainty_threshold:        settings?.uncertainty_threshold        ?? DECISION_DEFAULTS.uncertainty_threshold,
     auto_cull_cap_burst_keeps:    settings?.auto_cull_cap_burst_keeps    ?? DECISION_DEFAULTS.auto_cull_cap_burst_keeps,
+    max_burst_keeps:              settings?.max_burst_keeps              ?? DECISION_DEFAULTS.max_burst_keeps,
+    max_burst_maybes:             settings?.max_burst_maybes             ?? DECISION_DEFAULTS.max_burst_maybes,
+    burst_keep_margin:            settings?.burst_keep_margin            ?? DECISION_DEFAULTS.burst_keep_margin,
+    burst_keep_winner_delta:      settings?.burst_keep_winner_delta      ?? DECISION_DEFAULTS.burst_keep_winner_delta,
+    burst_keep_reject_delta:      settings?.burst_keep_reject_delta      ?? DECISION_DEFAULTS.burst_keep_reject_delta,
   })
   const [decision, setDecision]               = useState(initDecision)
   const [savedDecision, setSavedDecision]     = useState(initDecision)
@@ -345,7 +402,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   }
 
   // Reject-to-Trash toggle. When ON, future R presses send the file to the
-  // system Trash via send2trash instead of moving it to _Trash/. Switching
+  // system Trash via send2trash instead of moving it to _Rejects/. Switching
   // this mid-session doesn't relocate already-rejected photos — applies to
   // future decisions only. Optimistic write with rollback on failure.
   async function handleRejectTrashToggle(next) {
@@ -364,7 +421,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
         type: 'success',
         message: next
           ? 'Rejected photos will be sent to system Trash'
-          : 'Rejected photos will be moved to the _Trash/ folder',
+          : 'Rejected photos will be moved to the _Rejects/ folder',
       })
     } catch (err) {
       console.error('Reject-to-trash preference save failed:', err)
@@ -658,11 +715,55 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 )}
 
                 <ToggleRow
-                  label="Cap Keep at one photo per burst"
-                  tooltip="Auto-cull scores each photo independently, so several near-identical frames in the same burst (same pose, seconds apart) can each clear the Keep cutoff and all land in _Keeps/. When on, only the single best-scoring photo per similarity burst is allowed to auto-cull to Keep — every other member that scored Keep demotes to Maybe instead, so you still get to review the alternates."
+                  label="Deduplicate Keeps within a burst"
+                  tooltip="Auto-cull scores each photo independently, so several near-identical frames in the same burst (same pose, seconds apart) can each clear the Keep cutoff and all land in _Keeps/. When on, the single best photo per burst always keeps; a few extra frames may also keep if they're genuinely strong; near-pixel-identical duplicates are rejected; and once the burst has kept a few Maybe alternates, further redundant frames are rejected too — so a big burst doesn't flood your review pile. Tune all of it with the knobs below."
                   enabled={decision.auto_cull_cap_burst_keeps}
                   onChange={v => updField('auto_cull_cap_burst_keeps', v)}
                 />
+                {decision.auto_cull_cap_burst_keeps && (
+                  <>
+                    <NumberRow
+                      label="Max Keeps per burst"
+                      tooltip={`How many photos from one burst may auto-cull to Keep, counting the best one. Default ${DECISION_DEFAULTS.max_burst_keeps}. Set to 1 to keep only the single best photo per burst; raise it to let more strong alternates through automatically.`}
+                      value={decision.max_burst_keeps}
+                      min={1} max={10} step={1}
+                      onChange={v => updField('max_burst_keeps', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Max Maybe alternates per burst"
+                      tooltip={`After the Keeps, how many more frames from one burst may stay as Maybe for review. Beyond this, further redundant frames are auto-rejected instead of piling up as Maybe — this is what stops a big burst of near-identical shots from flooding your review pile. Default ${DECISION_DEFAULTS.max_burst_maybes}. Set to 0 to reject every non-kept frame; raise it to keep a wider safety net.`}
+                      value={decision.max_burst_maybes}
+                      min={0} max={10} step={1}
+                      onChange={v => updField('max_burst_maybes', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Extra-keep margin above cutoff"
+                      tooltip={`An extra frame keeps only if its score clears the Keep cutoff by at least this many points — not barely over the line. Default ${DECISION_DEFAULTS.burst_keep_margin}. Higher = pickier about which extras survive.`}
+                      value={decision.burst_keep_margin}
+                      min={0} max={50} step={1}
+                      onChange={v => updField('burst_keep_margin', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Extra-keep closeness to best"
+                      tooltip={`An extra frame keeps only if its score is within this many points of the burst's best photo — a genuine alternate, not a weaker straggler. Default ${DECISION_DEFAULTS.burst_keep_winner_delta}. Lower = only near-identical-quality frames double-keep.`}
+                      value={decision.burst_keep_winner_delta}
+                      min={0} max={50} step={1}
+                      onChange={v => updField('burst_keep_winner_delta', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Reject when this far below best"
+                      tooltip={`A non-surviving burst frame more than this many points below the best photo (or below the Maybe cutoff) is sent straight to Reject instead of Maybe — the clearly-weaker duplicates. Default ${DECISION_DEFAULTS.burst_keep_reject_delta}. Raise it to make auto-reject rarer and route more to Maybe.`}
+                      value={decision.burst_keep_reject_delta}
+                      min={0} max={100} step={1}
+                      onChange={v => updField('burst_keep_reject_delta', v)}
+                      indent
+                    />
+                  </>
+                )}
               </div>
 
               {/* Fallback cutoffs — collapsed behind Advanced accordion */}
@@ -759,6 +860,22 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   />
                 )}
                 <ToggleRow
+                  label="Reject low perceptual quality"
+                  tooltip="Uses the TOPIQ-NR image-quality score (a whole-frame perceptual measure) to catch photos that the sharpness metric rates highly but are actually out-of-focus — e.g. a defocused frame full of fine texture that fools the edge detector. Photos scoring below the floor below are auto-rejected."
+                  enabled={decision.reject_low_iqa}
+                  onChange={v => updField('reject_low_iqa', v)}
+                />
+                {decision.reject_low_iqa && (
+                  <NumberRow
+                    label="Quality floor (IQA)"
+                    tooltip={`Photos with a TOPIQ-NR quality score below this number are rejected. Default ${DECISION_DEFAULTS.iqa_floor}. Keep it low — genuinely sharp photos score well above it (typically 70+); only clearly-degraded frames fall under 30. Raising it culls more aggressively.`}
+                    value={decision.iqa_floor}
+                    min={0} max={70} step={1}
+                    onChange={v => updField('iqa_floor', v)}
+                    indent
+                  />
+                )}
+                <ToggleRow
                   label="Reject above ISO ceiling"
                   tooltip="Photos shot at ISO higher than the ceiling below are auto-rejected. Useful if you know your camera becomes too noisy above a certain sensitivity."
                   enabled={decision.reject_above_iso_ceiling}
@@ -805,7 +922,8 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   className="w-full accent-[#5BB8D4]"
                 />
                 <p className="text-[10px] text-[#777] mt-1 leading-tight">
-                  Higher = stricter grouping. Lower = more photos per burst.
+                  Higher = stricter grouping. Lower = more photos per burst. Also
+                  controls how auto-cull decides which frames are redundant.
                 </p>
               </div>
 
@@ -813,26 +931,23 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-xs text-[#cecece]">Time gap</span>
                   <span className="text-xs text-[#9c9c9d] tabular-nums">
-                    {(() => {
-                      const total = Math.round(groupTimeGapSeconds ?? 60)
-                      if (total < 60) return `${total} seconds`
-                      const m = Math.floor(total / 60)
-                      const s = total % 60
-                      return `${m}:${String(s).padStart(2, '0')} minutes`
-                    })()}
+                    {formatTimeGap(groupTimeGapSeconds)}
                   </span>
                 </div>
                 <input
                   type="range"
-                  min="15"
-                  max="600"
-                  step="15"
-                  value={groupTimeGapSeconds ?? 60}
-                  onChange={e => setGroupTimeGapSeconds?.(parseFloat(e.target.value))}
+                  min="0"
+                  max={TIME_GAP_STEPS.length - 1}
+                  step="1"
+                  value={timeGapToIndex(groupTimeGapSeconds)}
+                  onChange={e => setGroupTimeGapSeconds?.(TIME_GAP_STEPS[parseInt(e.target.value, 10)])}
                   className="w-full accent-[#5BB8D4]"
                 />
                 <p className="text-[10px] text-[#777] mt-1 leading-tight">
-                  Max pause between shots in the same burst. Longer pauses start a new burst.
+                  Max pause between shots in the same burst. Longer pauses start a new burst. Ranges from 1 second to 5 minutes, with the finest steps at the short end.
+                </p>
+                <p className="text-[10px] text-[#6a6b6c] mt-1 leading-tight italic">
+                  Affects grouped review (Bursts / GroupLoupe) only — not auto-cull. Auto-cull groups by visual similarity, so it uses the Similarity slider above, not this one.
                 </p>
               </div>
             </div>
@@ -1389,7 +1504,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               <p className="label mb-1">Reject destination</p>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
                 Where rejected photos go. By default they live in a per-folder
-                <span className="font-mono text-[#cecece]"> _Trash/</span>
+                <span className="font-mono text-[#cecece]"> _Rejects/</span>
                 subfolder. Switch on the toggle to send them to the system
                 Trash instead — they can be recovered from the Trash
                 bin until you empty it.

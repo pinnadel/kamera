@@ -9,10 +9,11 @@ function RuleBreakdown({ breakdown, total }) {
   const [open, setOpen] = useState(false)
 
   const rules = [
-    { key: 'closed_eyes',  label: 'Closed eyes' },
-    { key: 'soft_face',    label: 'Face not sharp' },
-    { key: 'blurry_frame', label: 'Blurry frame' },
-    { key: 'low_score',    label: 'Low overall score' },
+    { key: 'closed_eyes',     label: 'Closed eyes' },
+    { key: 'soft_face',       label: 'Face not sharp' },
+    { key: 'blurry_frame',    label: 'Blurry frame' },
+    { key: 'burst_duplicate', label: 'Redundant burst frame' },
+    { key: 'low_score',       label: 'Low overall score' },
   ].filter(r => breakdown[r.key] > 0)
 
   // Highlight the dominant rule if it accounts for ≥60% of rejects
@@ -60,26 +61,36 @@ function RuleBreakdown({ breakdown, total }) {
 // AutoCullModal — preview and execute automatic K/M/X assignment
 // Scoped to `folderPath` when provided, so tab-triggered auto-cull only
 // previews and acts on photos from the active tab's folder.
-export function AutoCullModal({ folderPath, onClose, onComplete, onToast }) {
+export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete, onToast }) {
   const [preview, setPreview] = useState(null)
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
   const [previewError, setPreviewError] = useState(null)
 
-  const folderQuery = folderPath ? `?source_folder=${encodeURIComponent(folderPath)}` : ''
+  // Build the shared query string. Auto-cull's burst-dedup post-pass groups by
+  // VISUAL SIMILARITY only — it deliberately does NOT use the grouping time-gap
+  // (that slider is inert on fast bursts: continuous frames share an EXIF
+  // second, so no gap can split them; see _group_undecided_into_bursts). Only
+  // the Similarity threshold is passed. Falls back to the backend default when
+  // absent.
+  const params = new URLSearchParams()
+  if (folderPath) params.set('source_folder', folderPath)
+  if (groupThreshold != null) params.set('threshold', String(groupThreshold))
+  const qs = params.toString()
+  const query = qs ? `?${qs}` : ''
 
   useEffect(() => {
-    fetch(`${API}/auto-cull/preview${folderQuery}`)
+    fetch(`${API}/auto-cull/preview${query}`)
       .then(r => { if (!r.ok) throw new Error(`${r.status}`); return r.json() })
       .then(setPreview)
       .catch(err => setPreviewError(err.message || 'Could not load preview'))
       .finally(() => setLoading(false))
-  }, [folderQuery])
+  }, [query])
 
   async function runAutoCull() {
     setRunning(true)
     try {
-      const res = await fetch(`${API}/auto-cull${folderQuery}`, { method: 'POST' })
+      const res = await fetch(`${API}/auto-cull${query}`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || `${res.status}`)
@@ -170,6 +181,28 @@ export function AutoCullModal({ folderPath, onClose, onComplete, onToast }) {
                 )
               })}
             </div>
+
+            {/* Dedup-vs-model split: makes the grouping slider's effect legible.
+                Burst-dedup rejects (redundant frames of a burst) are the only
+                ones the time-gap / similarity slider can move; everything else
+                is the model's own per-photo quality call, which grouping never
+                touches. Shown whenever there are any rejects so the two sources
+                are always visible side by side. */}
+            {preview.counts.reject > 0 && (() => {
+              const dedup = preview.rule_breakdown?.burst_duplicate ?? 0
+              const model = Math.max(0, preview.counts.reject - dedup)
+              return (
+                <div className="px-3 py-2 mb-2 border border-[rgba(255,255,255,0.07)] rounded-lg text-[11px] leading-relaxed text-[#9c9c9d]">
+                  <span className="text-[#cecece] font-mono tabular-nums">{dedup}</span>
+                  {' rejected as redundant burst frames '}
+                  <span className="text-[#6a6b6c]">(Similarity slider + burst budgets)</span>
+                  {' · '}
+                  <span className="text-[#cecece] font-mono tabular-nums">{model}</span>
+                  {' from per-photo quality '}
+                  <span className="text-[#6a6b6c]">(the model's own call)</span>
+                </div>
+              )
+            })()}
 
             {(preview.rule_breakdown?.uncertain ?? 0) > 0 && (
               <div className="flex items-center justify-between px-3 py-2 mb-2 border border-[rgba(255,255,255,0.07)] rounded-lg">

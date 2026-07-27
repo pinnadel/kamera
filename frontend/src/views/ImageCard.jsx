@@ -42,7 +42,7 @@ function subfolderLabel(image) {
   if (parts.length <= 1) return null
   // Drop trailing decision-bucket segments (we want the originating
   // subfolder, not the cull destination).
-  const dropDirs = new Set(['_Keeps', '_Maybes', '_Trash'])
+  const dropDirs = new Set(['_Keeps', '_Maybes', '_Rejects'])
   const dirSegments = parts.slice(0, -1).filter(p => !dropDirs.has(p))
   if (dirSegments.length === 0) return null
   return dirSegments.join('/')
