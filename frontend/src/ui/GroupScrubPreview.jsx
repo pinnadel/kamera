@@ -14,7 +14,6 @@ import { API } from '../api'
 // Portalled to document.body: the grid clips and the tiles carry their own
 // stacking contexts, so an in-tree panel would be cut off.
 
-const PANEL_WIDTH   = 480
 const MARGIN        = 16   // viewport breathing room
 const GAP           = 12   // tile ↔ panel; must clear the caret
 const CARET_W       = 18
@@ -23,9 +22,19 @@ const RADIUS        = 10
 const PAD           = 10   // panel inner padding
 const BAR_BLOCK     = 13   // position bar + its top margin
 const ACTION_BLOCK  = 30   // action row + its top margin
-const IMG_MIN       = 220  // the size we'd LIKE — drives the flip decision
-const IMG_FLOOR     = 120  // last-resort floor when neither side has room
-const IMG_MAX       = 560
+
+// The panel is sized to FILL whichever side of the tile has more room — the
+// whole point of a peek is seeing the frame big enough to judge, and a fixed
+// size meant a tile near the top of the viewport got a cramped panel while
+// most of the screen sat empty above it.
+const IMG_FLOOR     = 120  // never smaller than this, even in a cramped viewport
+const IMG_CAP       = 900  // sanity ceiling on very tall displays
+// Width tracks height at the cameras' native 3:2, so a landscape frame fills
+// the box exactly and a portrait one still gains from the extra height.
+// Growing height alone would just add black bars to a 480px-wide box.
+const BOX_ASPECT    = 1.5
+const PANEL_MIN_W   = 420
+const PANEL_MAX_W   = 960
 const SURFACE       = '#161718'
 const HAIRLINE      = 'rgba(255,255,255,0.10)'
 
@@ -75,30 +84,31 @@ function place(rect, zoom) {
   const bottom0 = rect.bottom / zoom
   const width0  = rect.width  / zoom
 
-  const width = Math.min(PANEL_WIDTH, vw - MARGIN * 2)
-
-  // Horizontal: centred on the tile, then slid inward just enough to fit.
-  // This is what makes the panel sit left / middle / right according to the
-  // room available, without ever losing its aim.
-  const centre = left0 + width0 / 2
-  const left = Math.max(MARGIN, Math.min(centre - width / 2, vw - width - MARGIN))
-
   // Vertical: the largest image each side could seat without crossing a fold.
   const chrome = PAD * 2 + BAR_BLOCK + ACTION_BLOCK
   const roomBelow = vh - bottom0 - GAP - MARGIN - chrome
   const roomAbove = top0 - GAP - MARGIN - chrome
 
-  // Hang below when below is genuinely comfortable; otherwise take whichever
-  // side has more room. This is the flip: a tile low in the viewport (or
-  // scrolled near the bottom) puts the panel above itself rather than off the
-  // bottom edge.
-  const below = roomBelow >= IMG_MIN || roomBelow >= roomAbove
-  const room  = below ? roomBelow : roomAbove
-  // Never larger than the room we actually have — that's what keeps the panel
-  // inside the viewport. IMG_FLOOR only bites when a tall tile in a short
-  // viewport leaves neither side usable; the position clamp below is the
-  // backstop for that case.
-  const imageHeight = Math.max(IMG_FLOOR, Math.min(room, IMG_MAX))
+  // Whichever side has more room wins outright — no preference for below.
+  // Preferring below "when it's good enough" is what left the panel small
+  // near the top of the grid while the whole screen sat empty above it.
+  const below = roomBelow >= roomAbove
+  const room  = Math.max(below ? roomBelow : roomAbove, 0)
+  // Fill that room. Never larger than it — that's what keeps the panel inside
+  // the viewport. IMG_FLOOR only bites when a tall tile in a short viewport
+  // leaves neither side usable; the position clamp below backstops that.
+  const imageHeight = Math.max(IMG_FLOOR, Math.min(room, IMG_CAP))
+
+  // Horizontal: width follows the height, then the panel is centred on the
+  // tile and slid inward just enough to fit. That's what makes it sit left /
+  // middle / right according to the room available, without losing its aim.
+  // + PAD*2 so the IMAGE BOX is 3:2, not the panel including its padding.
+  const width = Math.max(
+    Math.min(PANEL_MIN_W, vw - MARGIN * 2),
+    Math.min(imageHeight * BOX_ASPECT + PAD * 2, PANEL_MAX_W, vw - MARGIN * 2),
+  )
+  const centre = left0 + width0 / 2
+  const left = Math.max(MARGIN, Math.min(centre - width / 2, vw - width - MARGIN))
 
   // Backstop: whatever the arithmetic above decided, force the panel fully
   // inside the viewport. It can only bite when IMG_FLOOR exceeded the room on

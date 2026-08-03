@@ -425,6 +425,61 @@ the run's first tile via `runImageIds`; controls live in
 and [frontend/src/modals/GroupPartnersOverlay.jsx](../frontend/src/modals/GroupPartnersOverlay.jsx)
 `SectionBulkBar`.
 
+### Why do burst frames look ungrouped in the Keeps view?
+
+They aren't — the **Keeps view deliberately doesn't draw groups**. Three gates
+in [frontend/src/App.jsx](../frontend/src/App.jsx) stack up:
+
+1. `gridItems` ([App.jsx:896](../frontend/src/App.jsx#L896)) emits a `group`
+   tile only from *undecided* members. Any decided photo becomes an
+   individual `{type:'image'}` card, so a fully-culled burst produces zero
+   group tiles.
+2. `displayGridItems` ([App.jsx:1009](../frontend/src/App.jsx#L1009)) drops
+   surviving group tiles under any decision filter other than Undecided.
+3. The re-clustering pass that rebuilds a visual enclosure for *decided*
+   photos (`DecidedGroupTile` + survivor chip) is gated to
+   `reject`/`maybe` only ([App.jsx:1064](../frontend/src/App.jsx#L1064)).
+
+The rationale: on Rejects/Maybes you want to confirm "did a groupmate
+survive?", which is what the chip answers. On Keeps every member already
+survived, so there was nothing to reassure you about. Consequence: the Keeps
+view is the one place where burst membership is invisible.
+
+To see the real grouping, switch the filter to **All** or **Undecided**, or
+open the group in GroupLoupe. To verify from the outside:
+
+```bash
+curl -s "localhost:8000/similarity-groups?threshold=0.90&time_gap_seconds=60" \
+  | python3 -c "import json,sys; [print(g['size'], sorted(i['filename'] for i in g['images'])) for g in json.load(sys.stdin)['groups']]"
+```
+
+### Why did two frames seconds apart still land in different groups?
+
+Three independent gates must all pass, and any one can split a burst. In
+order:
+
+1. **Time gap** — the primary split
+   ([similarity_scorer.py:625](../phase2_quality/similarity_scorer.py#L625)).
+   Default 60s ([useGroups.js:62](../frontend/src/hooks/useGroups.js#L62)).
+   A 61-second gap splits; there is no tolerance band.
+2. **SigLIP cosine ≥ threshold** (default 0.90). Note union-find is
+   *transitive*: two frames at cosine 0.81 still share a group if a chain of
+   intermediate frames links them. So a low pairwise score proves nothing on
+   its own.
+3. **The layered union gate**
+   ([`_pairwise_can_union`](../phase2_quality/similarity_scorer.py#L414)),
+   which runs on every edge that already cleared the cosine threshold:
+   - both frames have a FaceNet embedding → require face cosine ≥ 0.50
+     ([`_FACE_IDENTITY_COS`](../phase2_quality/similarity_scorer.py#L312));
+   - otherwise → scene-tag blocker, then a strict RGB-histogram cosine ≥ 0.90.
+
+Gate 3 is the common surprise. A frame where the subject turns away or gets
+small can score face-cosine ~0.4 against its own neighbour and be denied
+despite a 0.96 SigLIP match — the identity gate reads it as a different
+person. A frame with **no face detected at all** falls to the histogram path
+instead, where a background or exposure change (hist cosine ~0.77) splits it
+off.
+
 ### The grouping defaults look wrong on my library. Can I tune them?
 
 Yes — Settings → Model → Grouping section has the Similarity threshold

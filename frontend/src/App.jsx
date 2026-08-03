@@ -465,26 +465,47 @@ export default function App() {
   // rows. The backend returns newest-first, so any arrival shifts every
   // existing photo's index; without this, selectedIdx silently starts
   // resolving to a different photo (grid selection ring + DetailView jump to
-  // it). We track the previously-selected photo's id and re-resolve its
-  // index whenever `images` changes, only after the user has actually
-  // selected something (mirrors userHasNavigatedRef's gate — an untouched
-  // tab's selectedIdx defaulting to 0 is fine and shouldn't fight this).
+  // it). We track the previously-selected photo's id AND the previous
+  // selectedIdx together, in one effect, so we can tell "images reshuffled
+  // under an unchanged cursor" (re-resolve) apart from "selectedIdx itself
+  // just moved on purpose" (e.g. sendDecision advancing to the next photo in
+  // the same batch that patched images — trust it, don't fight it). Splitting
+  // this into two separate effects (one keyed on [images] to re-resolve, one
+  // keyed on [images, selectedIdx] to update the ref) raced: the re-resolve
+  // effect always ran first and read a ref that was one render stale, so it
+  // "corrected" a same-tick intentional selectedIdx change back to the OLD
+  // photo's new array position — stranding the cursor on a photo that had
+  // just left the current filtered view (selectedGridIdx -1, no roving
+  // tabIndex, arrow keys dead). Only after the user has actually selected
+  // something (mirrors userHasNavigatedRef's gate — an untouched tab's
+  // selectedIdx defaulting to 0 is fine and shouldn't fight this).
   const selectedIdRef = useRef(null)
+  const prevSelectedIdxRef = useRef(null)
   useEffect(() => {
-    if (!userHasNavigatedRef.current) return
+    if (!userHasNavigatedRef.current) {
+      selectedIdRef.current = images[selectedIdx]?.id ?? null
+      prevSelectedIdxRef.current = selectedIdx
+      return
+    }
+    const selectedIdxUnchanged = prevSelectedIdxRef.current === selectedIdx
     const currentId = selectedIdRef.current
-    if (currentId == null) return
-    const stillAtSameIdx = images[selectedIdx]?.id === currentId
-    if (stillAtSameIdx) return
-    const newIdx = images.findIndex(img => img.id === currentId)
-    if (newIdx >= 0) setSelectedIdx(newIdx)
-    // else: the selected photo left `images` entirely (moved by a decision
-    // elsewhere) — leave selectedIdx as-is, existing decision-handling code
-    // paths already manage that case explicitly.
-  }, [images]) // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
+    if (selectedIdxUnchanged && currentId != null && images[selectedIdx]?.id !== currentId) {
+      // Cursor didn't move, but the photo under it did — images reshuffled
+      // (new arrivals, re-sort, etc.). Re-resolve to the SAME photo's new
+      // position.
+      const newIdx = images.findIndex(img => img.id === currentId)
+      if (newIdx >= 0 && newIdx !== selectedIdx) {
+        prevSelectedIdxRef.current = newIdx
+        setSelectedIdx(newIdx)
+        return
+      }
+      // else: the selected photo left `images` entirely (moved by a decision
+      // elsewhere) — leave selectedIdx as-is, existing decision-handling code
+      // paths already manage that case explicitly.
+    }
     selectedIdRef.current = images[selectedIdx]?.id ?? null
-  }, [images, selectedIdx])
+    prevSelectedIdxRef.current = selectedIdx
+  }, [images, selectedIdx]) // eslint-disable-line react-hooks/exhaustive-deps
   const analyzing       = activeTab?.status === 'analyzing'
   const progress        = activeTab?.progress        ?? null
   const analyzeResult   = activeTab?.analyzeResult   ?? null
@@ -1336,14 +1357,6 @@ export default function App() {
       )
       const step = advanceDir === 'backward' ? -1 : +1
       const nextItem = curIdx >= 0 ? displayGridItems[curIdx + step] : null
-      console.log('[DEBUG sendDecision]', {
-        decidedImageId: image.id,
-        curIdx,
-        step,
-        nextItemType: nextItem?.type,
-        nextItemId: nextItem?.type === 'image' ? nextItem.image.id : nextItem?.groupKey || nextItem?.group?.best_image_id,
-        displayGridItemsLen: displayGridItems.length,
-      })
       if (nextItem?.type === 'group') {
         setSelectedDecidedGroupKey(null)
         setSelectedGroupId(nextItem.group.best_image_id)
