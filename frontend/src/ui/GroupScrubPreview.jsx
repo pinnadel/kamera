@@ -40,18 +40,22 @@ const ORDER = ['keep', 'maybe', 'reject']
 const UNDECIDED_COLOR = 'rgba(255,255,255,0.22)'
 
 // uiScaleZoom — the app scales its whole UI with `zoom` on <html>
-// (index.css, data-ui-scale S/M/L). That splits the page into two coordinate
-// spaces and this panel straddles both:
+// (index.css, data-ui-scale S/M/L), which splits the page into two coordinate
+// spaces that this panel straddles:
 //
-//   • getBoundingClientRect() reports VISUAL px — already multiplied by zoom.
-//   • a position:fixed node portalled into <body> is laid out INSIDE the
+//   • getBoundingClientRect() reports SCREEN px — zoom already applied.
+//   • a position:fixed node portalled into <body> still lays out INSIDE the
 //     zoomed root, so the left/top we set get multiplied by zoom again.
-//   • documentElement.clientWidth/Height are UNZOOMED layout px.
 //
-// Feeding a raw rect into fixed coordinates therefore double-applies the zoom
-// and the panel drifts away from its tile — further the further right the
-// tile sits. Everything below works in unzoomed layout px, so the rect gets
-// divided by this once, up front.
+// So everything here works in "fixed space" (screen px ÷ zoom), and the
+// anchor rect is divided by this once, up front.
+//
+// Do NOT reach for documentElement.clientWidth/clientHeight for the viewport
+// bounds: those report the real viewport, NOT the zoomed root's space, so at
+// scale M/L they overstate the room by the zoom factor — which sends the panel
+// off the bottom fold when it hangs below, and far above its tile when it
+// flips. window.innerWidth/Height are unambiguously the real viewport, so
+// dividing them by zoom lands in the same space as everything else.
 function uiScaleZoom() {
   const z = parseFloat(getComputedStyle(document.documentElement).zoom)
   return Number.isFinite(z) && z > 0 ? z : 1
@@ -61,10 +65,11 @@ function uiScaleZoom() {
 // hanging below. Same below-else-flip-above rule as ui/primitives.jsx's
 // placePopover, but centred rather than left-aligned, and it aims a caret.
 function place(rect, zoom) {
-  const vw = document.documentElement.clientWidth  || window.innerWidth
-  const vh = document.documentElement.clientHeight || window.innerHeight
+  // Viewport expressed in fixed space (see uiScaleZoom).
+  const vw = window.innerWidth  / zoom
+  const vh = window.innerHeight / zoom
 
-  // Into unzoomed layout space — the space `left`/`top` are interpreted in.
+  // Into fixed space — the space `left`/`top`/`bottom` are interpreted in.
   const left0   = rect.left   / zoom
   const top0    = rect.top    / zoom
   const bottom0 = rect.bottom / zoom
