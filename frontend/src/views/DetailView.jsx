@@ -1032,6 +1032,36 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
             </div>
           )
         }
+        if (item.type === 'decidedGroup') {
+          // A collapsed run of already-decided same-group photos (Maybe/
+          // Reject views). DetailView has no single-hero concept for it and
+          // reviewing it belongs to GroupPartnersOverlay, not this filmstrip
+          // — so it's a non-interactive placeholder, not a navigable stop
+          // (stepFilmstrip/pickFilmstripIndex above skip past it).
+          return (
+            <div
+              key={`dg-${item.groupKey}`}
+              data-filmstrip-idx={idx}
+              style={{ width: `${thumbW}px` }}
+              className="relative flex-shrink-0 rounded-md bg-[#161718] ring-1 ring-[rgba(255,255,255,0.06)] opacity-60 cursor-default"
+              title={`Group of ${item.images.length} ${item.decision === 'reject' ? 'rejects' : 'maybes'}`}
+            >
+              <div
+                style={{ height: `${thumbH}px` }}
+                className="relative bg-[#07080a] flex items-center justify-center overflow-hidden rounded-t-md"
+              >
+                <img
+                  src={`${API}/previews/${item.hero.id}`}
+                  alt=""
+                  className="max-h-full max-w-full object-contain"
+                />
+              </div>
+              <div className="px-1 py-0.5 text-[9px] text-[#9c9c9d] uppercase tracking-wider text-center">
+                Group
+              </div>
+            </div>
+          )
+        }
         const img = item.image
         return (
           <button

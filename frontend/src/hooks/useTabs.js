@@ -47,6 +47,12 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     }))
   }, [updateActiveTab])
 
+  const setSelectedDecidedGroupKey = useCallback((valueOrFn) => {
+    updateActiveTab(t => ({
+      selectedDecidedGroupKey: typeof valueOrFn === 'function' ? valueOrFn(t.selectedDecidedGroupKey) : valueOrFn,
+    }))
+  }, [updateActiveTab])
+
   const setAnalyzing = useCallback((value) => {
     // `analyzing` is derived from status; map it back so legacy callers work.
     updateActiveTab(t => ({
@@ -537,6 +543,7 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     setImages,
     setSelectedIdx,
     setSelectedGroupId,
+    setSelectedDecidedGroupKey,
     setAnalyzing,
     setAnalyzeResult,
     setProgress,

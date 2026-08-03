@@ -13,11 +13,15 @@
 //
 // Selection model: each grid cell carries a roving tabIndex (one cell at
 // tabIndex=0, others at tabIndex=-1). Arrow keys walk `displayGridItems` —
-// landing on a photo sets `selectedIdx`, landing on a group sets
-// `selectedGroupId`. K/M/R only act on photos. Enter or Space on a focused
-// group opens the GroupLoupe; Space on a focused photo toggles DetailView —
-// unless 2+ photos are staged for comparison, in which case Space opens the
-// Compare overlay (matches the floating "Compare N" button).
+// landing on a photo sets `selectedIdx`, landing on an undecided group sets
+// `selectedGroupId`, landing on a collapsed same-decision group (Maybe/Reject
+// views) sets `selectedDecidedGroupKey`. K/M/R only act on photos — neither
+// group kind has a single decision to apply. Enter or Space on a focused
+// undecided group opens GroupLoupe; on a focused decided group it opens
+// GroupPartnersOverlay (already-decided members, nothing to rank); Space on a
+// focused photo toggles DetailView — unless 2+ photos are staged for
+// comparison, in which case Space opens the Compare overlay (matches the
+// floating "Compare N" button).
 //
 // When GroupLoupe is open, this hook backs off entirely — the loupe owns
 // K/M/X/arrows/Enter/S/Z/Esc via its own useHotkeys calls (see GroupLoupe.jsx).
@@ -33,8 +37,11 @@ export function useKeyboard({
   setSelectedIdx,
   selectedGroupId,
   setSelectedGroupId,
+  selectedDecidedGroupKey,
+  setSelectedDecidedGroupKey,
   displayGridItems,
   enterLoupe,
+  openPartnersOverlay,
   sendDecision,
   setUserCols,
   undoImage,
@@ -66,6 +73,11 @@ export function useKeyboard({
         item => item.type === 'group' && item.group.best_image_id === selectedGroupId
       )
     }
+    if (selectedDecidedGroupKey != null) {
+      return displayGridItems.findIndex(
+        item => item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
+      )
+    }
     const photo = images[selectedIdx]
     if (!photo) return -1
     return displayGridItems.findIndex(
@@ -74,15 +86,22 @@ export function useKeyboard({
   }
 
   // Apply selection to whatever item sits at `targetIdx`. Photo → set
-  // selectedIdx + clear group cursor. Group → set selectedGroupId. Out-of-
-  // bounds is a no-op (don't wrap; the user can see they're at an edge).
+  // selectedIdx + clear both group cursors. Undecided group → set
+  // selectedGroupId. Collapsed decided group (Maybe/Reject) → set
+  // selectedDecidedGroupKey. Out-of-bounds is a no-op (don't wrap; the user
+  // can see they're at an edge).
   const focusItemAt = (targetIdx) => {
     if (targetIdx < 0 || targetIdx >= displayGridItems.length) return
     const item = displayGridItems[targetIdx]
     if (item.type === 'group') {
+      setSelectedDecidedGroupKey(null)
       setSelectedGroupId(item.group.best_image_id)
+    } else if (item.type === 'decidedGroup') {
+      setSelectedGroupId(null)
+      setSelectedDecidedGroupKey(item.groupKey)
     } else {
       setSelectedGroupId(null)
+      setSelectedDecidedGroupKey(null)
       const i = images.findIndex(img => img.id === item.image.id)
       if (i >= 0) setSelectedIdx(i)
     }
@@ -96,7 +115,7 @@ export function useKeyboard({
     const cur = findCurrentIdx()
     if (cur < 0) { focusItemAt(0); return }
     focusItemAt(cur + 1)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId])
+  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
   useHotkeys('arrowLeft', () => {
     if (loupeOpen || activeView !== 'grid' || detailOpen) return
@@ -104,7 +123,7 @@ export function useKeyboard({
     const cur = findCurrentIdx()
     if (cur < 0) { focusItemAt(0); return }
     focusItemAt(cur - 1)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId])
+  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
   useHotkeys('arrowDown', (e) => {
     if (loupeOpen || activeView !== 'grid' || detailOpen) return
@@ -114,7 +133,7 @@ export function useKeyboard({
     if (cur < 0) { focusItemAt(0); return }
     const target = Math.min(cur + cols(), displayGridItems.length - 1)
     focusItemAt(target)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, cols])
+  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey, cols])
 
   useHotkeys('arrowUp', (e) => {
     if (loupeOpen || activeView !== 'grid' || detailOpen) return
@@ -124,11 +143,13 @@ export function useKeyboard({
     if (cur < 0) { focusItemAt(0); return }
     const target = Math.max(cur - cols(), 0)
     focusItemAt(target)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, cols])
+  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey, cols])
 
   // ── Decision keys (K / R / M) ────────────────────────────────────────────
-  // No-op when a group tile is focused — per-photo decisions live inside the
-  // loupe. Also gated on grid focus so K from the search bar etc. is inert.
+  // No-op when a group tile (undecided OR a collapsed decided group) is
+  // focused — neither has a single photo to decide on; re-culling members of
+  // a decided group happens via GroupPartnersOverlay or the bulk-action bar,
+  // not K/M/R. Also gated on grid focus so K from the search bar etc. is inert.
 
   // Decision keys take the bulk path when a multi-selection is active —
   // K/M/R applies to every selected photo and the selection stays in place.
@@ -156,7 +177,7 @@ export function useKeyboard({
     const amended = await amendPromise
     if (amended) return
     if (multiSelectActive) { bulkSendDecision?.(decision); return }
-    if (selectedGroupId != null) return
+    if (selectedGroupId != null || selectedDecidedGroupKey != null) return
     sendDecision(decision)
   }
 
@@ -164,23 +185,24 @@ export function useKeyboard({
     if (loupeOpen || detailOpen || activeView !== 'grid') return
     if (!gridHasFocus()) return
     decideOrAmend('keep')
-  }, [loupeOpen, detailOpen, activeView, selectedGroupId, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
+  }, [loupeOpen, detailOpen, activeView, selectedGroupId, selectedDecidedGroupKey, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
 
   useHotkeys('r', () => {
     if (loupeOpen || detailOpen || activeView !== 'grid') return
     if (!gridHasFocus()) return
     decideOrAmend('reject')
-  }, [loupeOpen, detailOpen, activeView, selectedGroupId, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
+  }, [loupeOpen, detailOpen, activeView, selectedGroupId, selectedDecidedGroupKey, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
 
   useHotkeys('m', () => {
     if (loupeOpen || detailOpen || activeView !== 'grid') return
     if (!gridHasFocus()) return
     decideOrAmend('maybe')
-  }, [loupeOpen, detailOpen, activeView, selectedGroupId, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
+  }, [loupeOpen, detailOpen, activeView, selectedGroupId, selectedDecidedGroupKey, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
 
   // ── Open / detail / escape ───────────────────────────────────────────────
-  // Space and Enter both open the focused thing: a group → GroupLoupe, a
-  // photo → DetailView. Symmetric "open this cell" gesture.
+  // Space and Enter both open the focused thing: an undecided group →
+  // GroupLoupe, a collapsed decided group → GroupPartnersOverlay, a photo →
+  // DetailView. Symmetric "open this cell" gesture.
 
   useHotkeys('space', (e) => {
     if (loupeOpen) return
@@ -191,18 +213,28 @@ export function useKeyboard({
       enterLoupe?.(selectedGroupId)
       return
     }
+    if (selectedDecidedGroupKey != null) {
+      openPartnersOverlay?.(selectedDecidedGroupKey)
+      return
+    }
     setDetailOpen(o => !o)
-  }, [loupeOpen, activeView, selectedGroupId, enterLoupe])
+  }, [loupeOpen, activeView, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openPartnersOverlay])
 
   useHotkeys('enter', (e) => {
     if (loupeOpen) return
     if (activeView !== 'grid') return
     if (detailOpen) return
     if (!gridHasFocus()) return
-    if (selectedGroupId == null) return
-    e.preventDefault()
-    enterLoupe?.(selectedGroupId)
-  }, [loupeOpen, activeView, detailOpen, selectedGroupId, enterLoupe])
+    if (selectedGroupId != null) {
+      e.preventDefault()
+      enterLoupe?.(selectedGroupId)
+      return
+    }
+    if (selectedDecidedGroupKey != null) {
+      e.preventDefault()
+      openPartnersOverlay?.(selectedDecidedGroupKey)
+    }
+  }, [loupeOpen, activeView, detailOpen, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openPartnersOverlay])
 
   useHotkeys('escape', () => {
     if (detailOpen) { setDetailOpen(false); return }
@@ -232,14 +264,14 @@ export function useKeyboard({
       const handled = await runUndo()
       if (handled) return
     }
-    if (selectedGroupId != null) return
+    if (selectedGroupId != null || selectedDecidedGroupKey != null) return
     const img = images[selectedIdx]
     if (!img) return
     undoImage(img.id)
   }
 
-  useHotkeys('meta+z', runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
-  useHotkeys('u',      runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
+  useHotkeys('meta+z', runUndoGated, [loupeOpen, activeView, selectedGroupId, selectedDecidedGroupKey, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
+  useHotkeys('u',      runUndoGated, [loupeOpen, activeView, selectedGroupId, selectedDecidedGroupKey, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
 
   // ── Thumbnail size (= / -) ───────────────────────────────────────────────
 

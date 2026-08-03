@@ -1,7 +1,11 @@
-// GroupPartnersOverlay — opened by clicking a group's partner chip in the
-// Rejects/Maybes grid. Answers "which other members of this burst were culled
-// differently?" and lets the user re-cull any of them (or the current photo)
-// in place.
+// GroupPartnersOverlay — opened by clicking a group's partner chip (or a
+// collapsed DecidedGroupTile) in the Rejects/Maybes grid. Shows every member
+// of this burst, grouped by decision: which were culled differently, and
+// which share the current view's bucket. Lets the user re-cull any of them
+// (or the current photo) in place. Also the sole review surface for a group
+// with NO differently-culled members (e.g. every member Rejected) — there's
+// no "different" section to show, just the current bucket's members, still
+// useful for reviewing/re-culling the burst.
 //
 // Layout: SURVIVOR buckets first (Keeps, then Maybes), then a divider, then the
 // current view's own bucket (which includes the clicked photo). Only non-empty
@@ -9,9 +13,8 @@
 //
 // Live behaviour: `members` is the group's live member list (from
 // enrichedGroups via App.jsx), so a re-cull moves the photo into its new
-// section on the next render — the overlay never goes stale. When no member
-// differs from the current view's bucket anymore, there's nothing left to
-// compare, so the overlay auto-closes.
+// section on the next render — the overlay never goes stale, and never force-
+// closes itself; the user closes it explicitly.
 //
 // Close: X button, backdrop click, or ESC.
 
@@ -363,7 +366,6 @@ export function GroupPartnersOverlay({ members, viewDecision, onDecide, onBulkDe
   // Survivor buckets to show ABOVE the divider — the buckets that differ from
   // the current view. Rejects view → Keeps + Maybes; Maybes view → Keeps.
   const survivorKinds = viewDecision === 'maybe' ? ['keep'] : ['keep', 'maybe']
-  const differentlyCulled = survivorKinds.reduce((sum, k) => sum + byKind[k].length, 0)
 
   const survivorSections = survivorKinds.filter(k => byKind[k].length > 0)
   const currentSection = byKind[viewDecision] || []
@@ -390,15 +392,6 @@ export function GroupPartnersOverlay({ members, viewDecision, onDecide, onBulkDe
     if (order.length === 0) { setInspectIdx(null); return }
     if (inspectIdx > order.length - 1) setInspectIdx(order.length - 1)
   }, [order.length, inspectIdx])
-
-  // Auto-close once nothing is culled differently anymore (e.g. the user
-  // re-culled every survivor into the current bucket). Runs after render so the
-  // final re-cull is visible for a beat via the live `members` update.
-  useEffect(() => {
-    if (differentlyCulled === 0) onClose()
-  }, [differentlyCulled, onClose])
-
-  if (differentlyCulled === 0) return null
 
   return createPortal(
     <>

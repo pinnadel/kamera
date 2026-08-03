@@ -78,9 +78,10 @@ import { AutoCullModal } from './modals/AutoCullModal'
 import { SettingsModal } from './modals/SettingsModal'
 import { GroupPartnersOverlay } from './modals/GroupPartnersOverlay'
 import { PartnerCountChips, GroupBulkBar } from './ui/TileChips'
+import { GroupScrubPreview } from './ui/GroupScrubPreview'
 import { ImageCard } from './views/ImageCard'
 import { DetailView } from './views/DetailView'
-import { GroupTile } from './views/GroupTile'
+import { GroupTile, DecidedGroupTile } from './views/GroupTile'
 import { GroupLoupe } from './views/GroupLoupe'
 import { CompareView } from './views/CompareView'
 import { TrainingModeView } from './views/TrainingModeView'
@@ -100,6 +101,7 @@ import { useMultiSelect } from './hooks/useMultiSelect'
 import { useUndoStack } from './hooks/useUndoStack'
 import { useSettings } from './hooks/useSettings'
 import { useHideOnScroll } from './hooks/useHideOnScroll'
+import { useGroupScrub } from './hooks/useGroupScrub'
 import { useSort } from './hooks/useSort'
 import { compareImages as sortComparator } from './sortMetrics'
 import { SortPill } from './ui/SortPill'
@@ -416,6 +418,7 @@ export default function App() {
     setImages,
     setSelectedIdx,
     setSelectedGroupId,
+    setSelectedDecidedGroupKey,
     setAnalyzing,
     setAnalyzeResult,
     setProgress,
@@ -455,6 +458,7 @@ export default function App() {
   const images          = activeTab?.images          ?? []
   const selectedIdx     = activeTab?.selectedIdx     ?? 0
   const selectedGroupId = activeTab?.selectedGroupId ?? null
+  const selectedDecidedGroupKey = activeTab?.selectedDecidedGroupKey ?? null
 
   // Keep selectedIdx pointed at the SAME photo when `images` is replaced out
   // from under it — e.g. a background analysis or Watch Live poll landing new
@@ -1111,22 +1115,29 @@ export default function App() {
         const runImageIds = drawBorder
           ? run.filter(it => it.type === 'image').map(it => it.image.id)
           : null
-        run.forEach((it, i) => {
-          const position = !drawBorder
-            ? 'solo'
-            : i === 0 ? 'start'
-            : i === run.length - 1 ? 'end'
-            : 'middle'
-          // runId lets the render layer group adjacent members; runLen +
-          // index drive the spanning-border edges (see App.jsx grid overlay).
-          // groupChip only on the first tile — one chip per group.
+        // A run of ≥2 same-group, same-decision members collapses into ONE
+        // DecidedGroupTile (mirrors the Undecided view's GroupTile) instead of
+        // N individual bordered ImageCards. A solo run (this view's only
+        // representative of that group, or an ungrouped photo) still renders
+        // as a plain image item, unchanged.
+        if (drawBorder) {
           clustered.push({
-            ...it,
-            groupRun: { id: key, position, index: i, length: run.length },
-            groupChip: i === 0 ? groupChip : null,
-            runImageIds: i === 0 ? runImageIds : null,
+            type: 'decidedGroup',
+            groupKey: key,
+            hero: run[0].image,
+            images: run.map(it => it.image),
+            decision: decisionFilter,
+            groupChip,
+            runImageIds,
           })
-        })
+        } else {
+          clustered.push({
+            ...run[0],
+            groupRun: { id: key, position: 'solo', index: 0, length: 1 },
+            groupChip,
+            runImageIds: null,
+          })
+        }
       }
       return clustered
     }
@@ -1142,10 +1153,15 @@ export default function App() {
         item.type === 'group' && item.group.best_image_id === selectedGroupId
       )
     }
+    if (selectedDecidedGroupKey != null) {
+      return displayGridItems.findIndex(item =>
+        item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
+      )
+    }
     return displayGridItems.findIndex(item =>
       item.type === 'image' && item.image.id === images[selectedIdx]?.id
     )
-  }, [displayGridItems, images, selectedIdx, selectedGroupId])
+  }, [displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
   // If the focused group leaves the visible list (filter change, group
   // dissolves after re-clustering, etc.), drop the group cursor so the user
@@ -1157,6 +1173,16 @@ export default function App() {
     )
     if (!stillVisible) setSelectedGroupId(null)
   }, [displayGridItems, selectedGroupId, setSelectedGroupId])
+
+  // Same idea for a focused DecidedGroupTile — e.g. the last visible member
+  // of the run gets bulk-moved out, or the decision filter changes.
+  useEffect(() => {
+    if (selectedDecidedGroupKey == null) return
+    const stillVisible = displayGridItems.some(item =>
+      item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
+    )
+    if (!stillVisible) setSelectedDecidedGroupKey(null)
+  }, [displayGridItems, selectedDecidedGroupKey, setSelectedDecidedGroupKey])
 
   // Scroll selected cell into view AND sync DOM focus to it, so:
   //   - Tab into the grid lands on the highlighted cell.
@@ -1298,19 +1324,40 @@ export default function App() {
       // not the raw `images` array, so the next stop can be a group tile.
       // Falls back to ±1 in `images` if we can't locate the current photo
       // in the visible list (filter excluded it, race, etc.).
+      // The just-decided photo may not be a standalone `image` entry — if it
+      // was part of a same-decision run collapsed into a DecidedGroupTile
+      // (Maybe/Reject views), it's only reachable via that tile's `images`
+      // list. Treat the tile's position as the photo's position so the step
+      // below still lands on the next real item instead of falling through
+      // to the broken raw-array fallback.
       const curIdx = displayGridItems.findIndex(it =>
-        it.type === 'image' && it.image.id === image.id
+        (it.type === 'image' && it.image.id === image.id) ||
+        (it.type === 'decidedGroup' && it.images.some(img => img.id === image.id))
       )
       const step = advanceDir === 'backward' ? -1 : +1
       const nextItem = curIdx >= 0 ? displayGridItems[curIdx + step] : null
+      console.log('[DEBUG sendDecision]', {
+        decidedImageId: image.id,
+        curIdx,
+        step,
+        nextItemType: nextItem?.type,
+        nextItemId: nextItem?.type === 'image' ? nextItem.image.id : nextItem?.groupKey || nextItem?.group?.best_image_id,
+        displayGridItemsLen: displayGridItems.length,
+      })
       if (nextItem?.type === 'group') {
+        setSelectedDecidedGroupKey(null)
         setSelectedGroupId(nextItem.group.best_image_id)
+      } else if (nextItem?.type === 'decidedGroup') {
+        setSelectedGroupId(null)
+        setSelectedDecidedGroupKey(nextItem.groupKey)
       } else if (nextItem?.type === 'image') {
         setSelectedGroupId(null)
+        setSelectedDecidedGroupKey(null)
         setSelectedIdx(images.findIndex(img => img.id === nextItem.image.id))
       } else {
         // End of visible list — keep the photo cursor in range as before.
         setSelectedGroupId(null)
+        setSelectedDecidedGroupKey(null)
         setSelectedIdx(prev => advanceDir === 'backward'
           ? Math.max(prev - 1, 0)
           : Math.min(prev + 1, images.length - 1))
@@ -1325,7 +1372,7 @@ export default function App() {
     } catch (err) {
       addToast({ type: 'error', message: `Network error: ${err.message}`, duration: 8000 })
     }
-  }, [images, selectedIdx, advanceDir, loadModelInfo, addToast, setImages, setSelectedIdx, displayGridItems, setSelectedGroupId, undoStack])
+  }, [images, selectedIdx, advanceDir, loadModelInfo, addToast, setImages, setSelectedIdx, displayGridItems, setSelectedGroupId, setSelectedDecidedGroupKey, undoStack])
 
   // ── undoImage — per-photo undo ────────────────────────────────────────────
   // Reverses the decision of a specific image. Called from grid (U-key on the
@@ -1493,6 +1540,51 @@ export default function App() {
     }
   }, [images, loadImages, loadModelInfo, addToast, undoStack])
 
+  // Exchange two frames' decisions in one action — "this frame deserves the
+  // Keep slot, not that one" from the group-scrub panel. Needs two
+  // /bulk-decision calls because the endpoint carries a single decision per
+  // request, but pushes ONE undo entry and refreshes once, so the swap
+  // reverses as the single gesture it reads as.
+  const swapDecisions = useCallback(async ({ promoteId, promoteTo, demoteId, demoteTo }) => {
+    if (promoteId == null || demoteId == null || promoteId === demoteId) return
+    const prevOf = (id) => images.find(i => i.id === id)?.decision ?? null
+    const prevPromote = prevOf(promoteId)
+    const prevDemote  = prevOf(demoteId)
+    const post = async (ids, decision) => {
+      const res = await fetch(`${API}/bulk-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_ids: ids, decision }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `Swap failed (${res.status})`)
+      }
+    }
+    try {
+      // Vacate before filling, so the target bucket never transiently holds
+      // both frames — a mid-swap crash then leaves a gap, not a duplicate.
+      await post([demoteId], demoteTo)
+      await post([promoteId], promoteTo)
+      undoStack.push({
+        kind: 'decision',
+        label: 'swap',
+        items: [
+          { id: demoteId,  prev: prevDemote,  next: demoteTo },
+          { id: promoteId, prev: prevPromote, next: promoteTo },
+        ],
+        timestamp: Date.now(),
+      })
+      await loadImages()
+      loadModelInfo()
+    } catch (err) {
+      addToast({ type: 'error', message: err.message, duration: 8000 })
+      // The first leg may have landed — resync so the UI can't disagree with
+      // what's actually on disk.
+      await loadImages()
+    }
+  }, [images, loadImages, loadModelInfo, addToast, undoStack])
+
   // Open DetailView from inside the GroupLoupe. Sets the global selectedIdx
   // to the focused photo and stores a group context so DetailView's prev/next
   // cycle within the group instead of the global images array.
@@ -1536,10 +1628,16 @@ export default function App() {
     }
     if (nextItem.type === 'group') {
       setSelectedGroupId(nextItem.group.best_image_id)
-    } else {
+    } else if (nextItem.type === 'image') {
       setSelectedGroupId(null)
       const i = images.findIndex(img => img.id === nextItem.image.id)
       if (i >= 0) setSelectedIdx(i)
+    } else {
+      // decidedGroup can't actually be adjacent to an undecided `group` item
+      // in the same displayGridItems run (they render under mutually
+      // exclusive decisionFilter values), but guard defensively rather than
+      // dereference nextItem.image on an unexpected shape.
+      setSelectedGroupId(null)
     }
   }, [loupeGroup, exitLoupe, displayGridItems, images, setSelectedIdx, setSelectedGroupId, setDetailOpen, setDetailGroupContext])
 
@@ -1644,6 +1742,23 @@ export default function App() {
       setPartnersOverlay(null)
     }
   }, [decisionFilter, partnersOverlay])
+
+  // Hover-scrub peek on group tiles: sweeping across a tile steps through the
+  // burst's members in a panel anchored below it. Suspended whenever a
+  // full-screen surface owns the view or the grid is in select mode — those
+  // don't reliably produce the mouseleave that would otherwise close it.
+  const { scrub: groupScrub, preview: groupScrubPreview } = useGroupScrub({
+    suspended: !!loupeGroup || detailOpen || !!partnersOverlay || gridMultiSelect.isSelectMode,
+  })
+
+  // Open the partners overlay for a collapsed DecidedGroupTile by its groupKey
+  // (used by keyboard Enter/Space when a decidedGroup cell is focused — the
+  // same overlay the tile's survivor chip / double-click already open).
+  const openPartnersOverlay = useCallback((groupKey) => {
+    const item = displayGridItems.find(it => it.type === 'decidedGroup' && it.groupKey === groupKey)
+    if (!item) return
+    setPartnersOverlay({ imageId: item.hero.id, viewDecision: item.decision })
+  }, [displayGridItems])
 
   // Photo-onto-photo drop hover. Independent of dropHoverGroupId because a
   // photo can be hovered while a GroupTile is also under the same drag, and
@@ -2074,10 +2189,13 @@ export default function App() {
     setSelectedIdx,
     selectedGroupId,
     setSelectedGroupId,
+    selectedDecidedGroupKey,
+    setSelectedDecidedGroupKey,
     // Walk the *visible* list — filters/search/decision pills change what the
     // user sees, and arrow nav has to match that or it feels broken.
     displayGridItems,
     enterLoupe,
+    openPartnersOverlay,
     sendDecision,
     setUserCols,
     undoImage,
@@ -2169,6 +2287,23 @@ export default function App() {
             onDecide={sendGroupDecision}
             onBulkDecide={bulkDecide}
             onClose={() => setPartnersOverlay(null)}
+          />
+        )
+      })()}
+
+      {/* Hover-scrub panel for group tiles. Members are re-read live from
+          partnerSummaryByImageId each render (same pattern as
+          GroupPartnersOverlay) so a decision made inside the panel restyles it
+          on the spot instead of leaving the opening snapshot on screen. */}
+      {groupScrubPreview && (() => {
+        const anchorId = groupScrubPreview.members[0]?.id
+        const live = anchorId != null ? partnerSummaryByImageId.get(anchorId)?.members : null
+        return (
+          <GroupScrubPreview
+            {...groupScrubPreview}
+            members={live || groupScrubPreview.members}
+            onDecide={(imageId, decision) => bulkDecide([imageId], decision)}
+            onSwap={swapDecisions}
           />
         )
       })()}
@@ -2461,13 +2596,24 @@ export default function App() {
         const groupIdx = inGroup ? groupImages.findIndex(img => img.id === panelImage.id) : -1
 
         // ── Atomic step over displayGridItems for grid-filmstrip mode ──
+        // A collapsed DecidedGroupTile (Maybe/Reject) isn't something
+        // DetailView can render or open (it has no single "hero" concept the
+        // way an undecided group does — reviewing it belongs to
+        // GroupPartnersOverlay, not the filmstrip) — so it isn't a filmstrip
+        // stop; skip past it in the step direction.
         const stepFilmstrip = (delta) => {
-          const next = displayGridItems[filmstripIndex + delta]
+          let next = displayGridItems[filmstripIndex + delta]
+          let skip = delta
+          while (next && next.type === 'decidedGroup') {
+            skip += delta
+            next = displayGridItems[filmstripIndex + skip]
+          }
           if (!next) return
           if (next.type === 'image') {
             const i = images.findIndex(img => img.id === next.image.id)
-            if (i >= 0) { setSelectedGroupId(null); setSelectedIdx(i) }
+            if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
           } else {
+            setSelectedDecidedGroupKey(null)
             setSelectedGroupId(next.group.best_image_id)
           }
         }
@@ -2489,11 +2635,12 @@ export default function App() {
 
         const pickFilmstripIndex = (idx) => {
           const item = displayGridItems[idx]
-          if (!item) return
+          if (!item || item.type === 'decidedGroup') return
           if (item.type === 'image') {
             const i = images.findIndex(img => img.id === item.image.id)
-            if (i >= 0) { setSelectedGroupId(null); setSelectedIdx(i) }
+            if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
           } else {
+            setSelectedDecidedGroupKey(null)
             setSelectedGroupId(item.group.best_image_id)
           }
         }
@@ -3424,6 +3571,7 @@ export default function App() {
                     showFilename={showFilenames}
                     isAllView={decisionFilter === null}
                     isDropHover={dropHoverGroupId === item.group.best_image_id}
+                    scrub={groupScrub}
                     onSelect={() => {
                       setSelectedGroupId(item.group.best_image_id)
                     }}
@@ -3464,6 +3612,46 @@ export default function App() {
                     }}
                   />
                 </div>
+              ) : item.type === 'decidedGroup' ? (
+                // A run of ≥2 same-group photos sharing this view's decision
+                // (Maybe/Reject), collapsed into one stacked tile — mirrors
+                // the undecided GroupTile above. Opening it (double-click /
+                // Enter) shows GroupPartnersOverlay, not GroupLoupe: these
+                // photos are already decided, so there's nothing to rank.
+                <div
+                  key={`decided-${item.groupKey}`}
+                  data-grid-idx={idx}
+                  role="gridcell"
+                  tabIndex={selectedGridIdx === idx ? 0 : -1}
+                  className="outline-none"
+                  onFocus={() => {
+                    if (selectedDecidedGroupKey === item.groupKey) return
+                    setSelectedGroupId(null)
+                    setSelectedDecidedGroupKey(item.groupKey)
+                  }}
+                >
+                  <DecidedGroupTile
+                    hero={item.hero}
+                    images={item.images}
+                    decision={item.decision}
+                    groupChip={item.groupChip}
+                    runImageIds={item.runImageIds}
+                    isSelected={selectedDecidedGroupKey === item.groupKey}
+                    isSelectMode={gridMultiSelect.isSelectMode}
+                    showFilename={showFilenames}
+                    scrub={groupScrub}
+                    onSelect={() => {
+                      setSelectedGroupId(null)
+                      setSelectedDecidedGroupKey(item.groupKey)
+                    }}
+                    onOpen={() => {
+                      setSelectedGroupId(null)
+                      setSelectedDecidedGroupKey(item.groupKey)
+                      setPartnersOverlay({ imageId: item.hero.id, viewDecision: item.decision })
+                    }}
+                    onBulkDecide={(imageIds, decision) => bulkDecide(imageIds, decision)}
+                  />
+                </div>
               ) : (
                 <div
                   key={item.image.id}
@@ -3477,14 +3665,15 @@ export default function App() {
                     // unclipped corner near the footer visible. Bumping the whole
                     // tile above both the border overlay and the partner chip
                     // (z-20) lets ImageCard's ring paint fully on top.
-                    (!gridMultiSelect.isSelectMode && selectedGroupId == null && item.image.id === images[selectedIdx]?.id) ||
+                    (!gridMultiSelect.isSelectMode && selectedGroupId == null && selectedDecidedGroupKey == null && item.image.id === images[selectedIdx]?.id) ||
                     gridMultiSelect.selected.has(item.image.id)
                       ? ' z-30' : ''
                   }`}
                   onFocus={() => {
                     const i = images.findIndex(img => img.id === item.image.id)
-                    if (selectedGroupId == null && selectedIdx === i) return
+                    if (selectedGroupId == null && selectedDecidedGroupKey == null && selectedIdx === i) return
                     setSelectedGroupId(null)
+                    setSelectedDecidedGroupKey(null)
                     if (i >= 0) setSelectedIdx(i)
                   }}
                   onClick={(e) => {
@@ -3504,7 +3693,7 @@ export default function App() {
                       e.preventDefault()
                       if (!gridMultiSelect.isSelectMode) {
                         gridMultiSelect.enter()
-                        const focusedId = (selectedGroupId == null && images[selectedIdx]?.id)
+                        const focusedId = (selectedGroupId == null && selectedDecidedGroupKey == null && images[selectedIdx]?.id)
                         if (focusedId && focusedId !== imgId) {
                           gridMultiSelect.toggle(focusedId)
                         }
@@ -3519,7 +3708,7 @@ export default function App() {
                         // Anchor the focused photo so the extend covers the
                         // range from "what I had focused" to "what I just
                         // shift-clicked", not just the shift-clicked tile.
-                        const focusedId = (selectedGroupId == null && images[selectedIdx]?.id)
+                        const focusedId = (selectedGroupId == null && selectedDecidedGroupKey == null && images[selectedIdx]?.id)
                         if (focusedId && focusedId !== imgId) {
                           gridMultiSelect.toggle(focusedId)
                         }
@@ -3657,7 +3846,7 @@ export default function App() {
                   )}
                   <ImageCard
                     image={item.image}
-                    isSelected={!gridMultiSelect.isSelectMode && selectedGroupId == null && item.image.id === images[selectedIdx]?.id}
+                    isSelected={!gridMultiSelect.isSelectMode && selectedGroupId == null && selectedDecidedGroupKey == null && item.image.id === images[selectedIdx]?.id}
                     isMultiSelected={gridMultiSelect.selected.has(item.image.id)}
                     isSelectMode={gridMultiSelect.isSelectMode}
                     isDropHover={dropHoverPhotoId === item.image.id}
