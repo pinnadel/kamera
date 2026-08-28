@@ -12,6 +12,11 @@ class StopRequested(Exception):
     """Raised mid-analysis when the caller's stop_event has been set."""
     pass
 
+# RAW_DECODE_SUFFIXES is imported (not defined) here so this module keeps
+# re-exporting the name for callers that already pull it from here — e.g. the
+# batch loop's RAW prefetch in backend/routers/analysis.py. Canonical
+# definition lives in backend.constants, derived from RAW_FORMATS.
+from backend.constants import RAW_DECODE_SUFFIXES
 from phase1_technical.batch_sharpness_analyzer import (
     detect_sharpness as _detect_sharpness,
     detect_sharpness_array as _detect_sharpness_array,
@@ -292,9 +297,6 @@ def calculate_sharpness(image_path: str) -> dict:
         'width': result['width'],
         'height': result['height'],
     }
-
-
-RAW_DECODE_SUFFIXES = (".raf", ".nef", ".3fr", ".cr2", ".arw", ".dng")
 
 
 def decode_raw(image_path: str) -> tuple:

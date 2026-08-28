@@ -227,6 +227,44 @@ touched contributes nothing to training.
 
 ## Files & workflow
 
+### Which file formats can KaMeRa analyze?
+
+**Short answer:** RAF · NEF · 3FR · DNG · ARW · CR2 · CR3 · JPG/JPEG · PNG ·
+TIFF · HIF. `.3FR` (Hasselblad X2D II) and `.DNG` (DJI drones, Adobe DNG
+Converter output, natively-DNG cameras) are both fully supported.
+
+The single source of truth is
+[constants.py::RAW_FORMATS](backend/constants.py#L30). Two other constants are
+*derived* from it and should never be edited by hand:
+
+- `RAW_DECODE_SUFFIXES` — lowercase, dot-prefixed mirror, for matching
+  `path.suffix.lower()`. Every scorer's RAW decode branch imports this.
+- `SUPPORTED_EXTENSIONS` — the union of `RAW_DECODE_SUFFIXES` and the
+  processed formats. This is the gate the analyzer, the file watcher, and
+  `GET /images`' folder scan walk with.
+
+**Why the derivation matters:** the two constants used to be maintained
+separately, and a format could be listed as decodable in `RAW_FORMATS` while
+being missing from `SUPPORTED_EXTENSIONS` — in which case the files were never
+*discovered*, which on screen is indistinguishable from an empty folder. That's
+exactly what happened to `.dng`/`.arw`/`.cr2`/`.cr3` until 2026-08-28.
+`tests/test_raw_format_coverage.py` now fails if they drift apart, or if any
+scorer reintroduces a hardcoded `('.RAF', '.NEF', '.3FR')` tuple.
+
+**Adding a new RAW format** is a one-line change to `RAW_FORMATS` — provided
+rawpy/LibRaw can decode it. Verify with `analyze_photo_quality()` on a real
+file, not `rawpy.imread()`: the former is the actual call site and exercises
+all seven scorers.
+
+Two formats that look supported but aren't analyzed standalone: `.hif` *is*
+analyzed on its own (X100VI / X Half can shoot HIF-only), but becomes
+move-only when a same-stem RAW sits beside it — see
+[is_standalone_hif](backend/constants.py#L77). `.phos` is a Hasselblad
+edit-file and is never analyzed.
+
+Note: ARW / CR2 / CR3 are wired through the same derivation but have never been
+run against real Sony or Canon files.
+
 ### What gets written to disk on every K/M/X decision?
 
 1. **The RAW + sidecar move** to `_Keeps/`, `_Maybes/`, or `_Rejects/` (or
@@ -341,6 +379,32 @@ Tail `data/app.log` during the batch to spot outliers — anything above the
 investigating. `GET /analyze-progress` also exposes a live
 `elapsed_seconds` field that grows in real time while the batch runs and
 freezes at the final wall-clock total once `running` flips to `false`.
+
+### Why would TOPIQ and Aesthetic be blank for every photo in a batch?
+
+**Short answer:** A model that failed to load stays failed for the whole
+process, by design. Before 2026-08-28 a thread race could cause that on cold
+start; it's fixed now. If you still see it, restart the app and check
+`data/app.log` for the *first* load error.
+
+`iqa_scorer` and `aesthetic_scorer` each latch a `_load_failed` flag on a fatal
+load error, so subsequent photos short-circuit instead of re-attempting the
+load 700 times ([iqa_scorer.py:79](../phase2_quality/iqa_scorer.py#L79)). That
+guard is deliberate — but it means **one** bad load blanks the column for the
+entire run, and the UI just shows empty values rather than an error.
+
+The race that used to trigger it: `accelerate` initialises weights on the meta
+device via a **global** monkey-patch of `torch.nn.Module.register_parameter`.
+With the seven scorers fanned across a six-worker pool, SigLIP loading in one
+thread made pyiqa build its net on the meta device in another, and that
+thread's `.to(device)` failed with `Cannot copy out of meta tensor`. Every
+torch loader now holds one process-wide lock across construction
+([model_loading.py](../phase2_quality/model_loading.py)); the per-module locks
+that preceded it couldn't help, because the collision was *between* modules.
+
+Recovery if a load fails for some other reason (bad torch upgrade, corrupted
+weight cache): **Settings → Model → Reload models** clears `_load_failed` via
+`reset_load_failed()` and retries, without restarting the app.
 
 ### What happens when I drop a whole card into the watched folder at once?
 

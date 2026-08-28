@@ -25,12 +25,12 @@ preview scale.
 """
 
 import logging
-import threading
 from pathlib import Path
 
 from PIL import Image
 
 from phase2_quality.model_status import begin as _begin, end as _end
+from phase2_quality.model_loading import MODEL_LOAD_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,11 @@ _MAX_SIDE = 1024
 _metric = None
 _load_failed = False  # Set after fatal load error so we don't retry every photo.
 
-# Serialises the lazy load — concurrent first-loads (warm-up thread vs first
-# analyze) race accelerate's meta-device init and fail with "Cannot copy out
-# of meta tensor". See the matching lock + incident note in similarity_scorer.
-_load_lock = threading.Lock()
+# Serialises the lazy load against EVERY other torch model load in the
+# process, not just this module's. The race is with SigLIP/transformers, not
+# with a second TOPIQ load — see phase2_quality/model_loading.py for the
+# accelerate-global-state root cause and the reproduction.
+_load_lock = MODEL_LOAD_LOCK
 
 # Flag set the first time we observe an unexpected raw score range. Helps
 # diagnose pyiqa wrapper changes without spamming logs.

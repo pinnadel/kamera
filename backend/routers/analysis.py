@@ -306,6 +306,15 @@ def _warm_models() -> None:
     evidence: previous parallel implementation made aesthetic_scorer fail
     every session and TOPIQ retry-fail 200+ times per batch (logged 2026-05-05).
     Sequential load adds ~5s startup overhead but loads ALL three reliably.
+
+    Since 2026-08-28 the actual correctness guarantee is the process-wide
+    MODEL_LOAD_LOCK held by each loader (phase2_quality/model_loading.py) —
+    warming sequentially here could never be one, because it only orders the
+    loads *this* thread performs. If a user clicked Analyze before warm-up
+    finished, the six-worker scorer pool called the same loaders from other
+    threads and raced anyway, silently blanking IQA + Aesthetic for the whole
+    batch. This function stays sequential regardless: it avoids pointless lock
+    contention and keeps the startup toasts in a predictable order.
     """
     from phase2_quality.aesthetic_scorer import _get_metric as _get_aes
     from phase2_quality.iqa_scorer import _get_metric

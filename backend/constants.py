@@ -19,36 +19,59 @@ the constant with a "keep in sync" comment that drifted. Moving the
 constants here is the cheapest fix.
 """
 
-# Photo file extensions the analyzer + watcher recognise. Lowercase with
-# the leading dot so callers can match against `path.suffix.lower()`
-# directly. Update both this list AND
-# phase2_quality/burst_ranker.py::_DIRECT_PASS_FORMATS /
-# _RAW_FALLBACK_FORMATS when adding a new format.
-#
-# .hif is included as a directly-analyzable format (Fuji X100VI/X Half can
-# shoot HIF-only, no RAW at all — those files were previously invisible to
-# KaMeRa). But .hif is ALSO written as a sidecar next to a .RAF in RAW+HIF
-# mode, where it must stay move-only (see file_mover.py) and never get its
-# own DB row / independent analysis — that would double-count the shot and
-# double-move on decision. is_standalone_hif() below is the gate: callers
-# that walk a folder for analysis candidates must skip a .hif file that has
-# a same-stem RAW sibling.
-SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".raf", ".nef", ".3fr", ".png", ".tiff", ".tif", ".hif",
-})
-
 # Uppercase canonical format names used in `images.format` column for
 # RAW files. Kept aligned with rawpy's supported set; do not add formats
 # rawpy can't decode (the analyzer would crash). Used to gate RAW-only
 # code paths (preview demosaic, sidecar-pref invalidation, the burst
 # ranker's on-demand preview fallback).
+#
+# This is the single source of truth for "which RAW formats KaMeRa handles".
+# Everything RAW-shaped below derives from it — see RAW_DECODE_SUFFIXES.
 RAW_FORMATS: frozenset[str] = frozenset({
     "RAF", "NEF", "3FR", "ARW", "CR2", "CR3", "DNG",
 })
 
+# Lowercase, dot-prefixed mirror of RAW_FORMATS, so callers can match against
+# `path.suffix.lower()` directly. Derived, never hand-written.
+#
+# Why derived: until 2026-08-28 four scorers each carried their own literal
+# tuple of RAW suffixes, and three of them still read ('.RAF', '.NEF', '.3FR')
+# long after DNG/ARW/CR2/CR3 joined RAW_FORMATS. A .dng therefore fell through
+# to the cv2/Pillow branch, which cannot decode it. Import this constant
+# instead of retyping the list.
+RAW_DECODE_SUFFIXES: tuple[str, ...] = tuple(
+    sorted("." + fmt.lower() for fmt in RAW_FORMATS)
+)
+
+# Non-RAW photo extensions the analyzer + watcher recognise.
+#
+# .hif is here as a directly-analyzable format (Fuji X100VI/X Half can shoot
+# HIF-only, no RAW at all — those files were previously invisible to KaMeRa).
+# But .hif is ALSO written as a sidecar next to a .RAF in RAW+HIF mode, where
+# it must stay move-only (see file_mover.py) and never get its own DB row /
+# independent analysis — that would double-count the shot and double-move on
+# decision. is_standalone_hif() below is the gate: callers that walk a folder
+# for analysis candidates must skip a .hif file that has a same-stem RAW
+# sibling.
+_PROCESSED_EXTS: frozenset[str] = frozenset({
+    ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".hif",
+})
+
+# Photo file extensions the analyzer + watcher recognise. The RAW half is
+# derived from RAW_FORMATS so the two can never drift — before 2026-08-28 they
+# did, and DNG/ARW/CR2/CR3 counted as decodable RAW formats while staying
+# invisible to every folder walk (so the files were simply never discovered).
+#
+# Adding a new NON-RAW format still means updating
+# phase2_quality/burst_ranker.py::_DIRECT_PASS_FORMATS by hand; the RAW side
+# of that module already reads RAW_FORMATS.
+SUPPORTED_EXTENSIONS: frozenset[str] = _PROCESSED_EXTS | frozenset(RAW_DECODE_SUFFIXES)
+
 # Extensions that, when found as a same-stem sibling of a .hif file, mean
-# the .hif is a camera-baked sidecar preview (not a standalone photo).
-_HIF_PAIRED_RAW_EXTS: frozenset[str] = frozenset({".raf", ".nef", ".3fr"})
+# the .hif is a camera-baked sidecar preview (not a standalone photo). Any
+# RAW format qualifies — only Fuji ships RAW+HIF today, but gating on the
+# full set costs nothing and removes another hand-maintained copy.
+_HIF_PAIRED_RAW_EXTS: frozenset[str] = frozenset(RAW_DECODE_SUFFIXES)
 
 
 def is_standalone_hif(path) -> bool:
@@ -81,13 +104,11 @@ def is_raw_format(fmt: str | None) -> bool:
 
 
 # Extensions that count as a "processed" sibling for the jpeg_priority
-# analysis-mode skip (backend/routers/settings.py::analysis_mode). Deliberately
-# the non-RAW half of SUPPORTED_EXTENSIONS minus .hif-as-sidecar nuance —
-# .hif itself counts, since an X100VI/X Half RAW+HIF pair should skip the RAW
-# the same way a RAW+JPEG pair does.
-_PROCESSED_SIBLING_EXTS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".hif", ".png", ".tiff", ".tif",
-})
+# analysis-mode skip (backend/routers/settings.py::analysis_mode). Exactly the
+# non-RAW half of SUPPORTED_EXTENSIONS, .hif-as-sidecar nuance included — .hif
+# itself counts, since an X100VI/X Half RAW+HIF pair should skip the RAW the
+# same way a RAW+JPEG pair does.
+_PROCESSED_SIBLING_EXTS: frozenset[str] = _PROCESSED_EXTS
 
 
 def has_processed_sibling(path) -> bool:

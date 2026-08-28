@@ -4,6 +4,50 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## Fixed: IQA + Aesthetic silently blank for a whole batch (process-wide model-load lock, 2026-08-28)
+
+Found while verifying DNG support, fixed the same day. On a cold process the TOPIQ-NR and TOPIQ-IAA scores intermittently came back `None` for **every photo in the batch** — no crash, no toast, no user-visible error. Just two empty columns, which reads as "the model didn't have an opinion" rather than "the model never loaded."
+
+**Root cause.** `accelerate` implements meta-device weight initialisation by monkey-patching `torch.nn.Module.register_parameter` — *global process state*, not per-model and not thread-local. `analyze_photo_quality` fans seven scorers into a 6-worker pool, so a thread inside `AutoModel.from_pretrained()` (SigLIP) is live while another thread builds a net inside `pyiqa.create_metric()`. The second thread's parameters get created on the meta device and never filled; its `.to(device)` then raises `Cannot copy out of meta tensor`. The loser latches `_load_failed`, which by design short-circuits every subsequent call — so one lost race disables that scorer for the rest of the run.
+
+**Why the existing locks didn't catch it.** `iqa_scorer`, `aesthetic_scorer` and `similarity_scorer` each already had a `threading.Lock`, added by the 2026-07-19 watcher fix. Each correctly prevented *one module* from loading twice — but the collision is **between** modules, so no two threads ever contended for the same lock. `face_identity` had no lock at all despite also calling `.to(device)`. The asymmetry is what made the per-module locks look sufficient: loading pyiqa twice concurrently passes; loading pyiqa against SigLIP failed 2/2.
+
+`_warm_models` loading the three torch models sequentially in one background thread is why this was rare in the running app — but that's a mitigation, not a guarantee. It only orders the loads *that thread* performs; clicking Analyze before warm-up finished put the scorer pool on the same loaders from other threads.
+
+**Fix.** New `phase2_quality/model_loading.py` exporting a single process-wide `MODEL_LOAD_LOCK` (an `RLock`, so a loader that transitively triggers another load on the same thread can't deadlock). All four torch loaders now hold it across construction *and* `.to(device)` — the patch window spans both. Each keeps its `if _model is not None: return` fast path, so warm calls stay uncontended. MediaPipe (`face_analyzer`) deliberately stays out: it's TFLite, never touches torch module construction, and serialising it would only add first-photo latency. `_warm_models` stays sequential — now as a contention/ordering preference rather than the correctness mechanism — with its docstring corrected to say so.
+
+**`tests/test_model_load_lock.py` (11 tests)** covers three layers: every loader references the one lock; each actually *holds* it at the moment of construction; and two loaders released simultaneously from two threads never overlap. Verified all three layers fail when a module-local lock is reintroduced — the overlap test reports `assert 2 == 1`, i.e. the constructions genuinely collided.
+
+The behavioural tests patch each loader's own `_begin()` (the model-status toast hook, called inside the lock immediately before construction) rather than the library entry points, so they run in under 4s and never touch the network or the weight cache. Patching `transformers.AutoModel` does **not** work under pytest — `transformers` is a `_LazyModule`, and the swap reads back correctly on the module object while the loader's function-local `from transformers import AutoModel` still resolves to the real class. Worth knowing before anyone tries that approach again.
+
+Verified on the real cold-start path that previously failed: `analyze_photo_quality` on RAF/HIF/DNG in a fresh process with no pre-warming, IQA and Aesthetic populated 3/3 runs. 441/441 tests pass.
+
+---
+
+## DNG support + one source of truth for RAW formats (2026-08-28)
+
+Philipp asked for `.dng` analysis (DJI drone files) and whether `.3FR` was already supported. `.3FR` was — fully wired since 2026-06-30. `.dng` was **half-wired**, and the shape of that half is the interesting part.
+
+`DNG`, `ARW`, `CR2` and `CR3` had been sitting in `constants.RAW_FORMATS` for a long time, so everything gated on *that* constant already handled them: preview demosaic, the RAW+JPEG pairing inference, `has_processed_sibling`'s `jpeg_priority` skip, the burst ranker's RAW fallback. But `SUPPORTED_EXTENSIONS` was a hand-written literal that never got the same additions — and that constant is what the analyzer, the file watcher, and `GET /images`' folder scan walk with. A `.dng` on disk was therefore **never discovered at all**. Had it been, three of the four scorer decode branches still read a hardcoded `('.RAF', '.NEF', '.3FR')` and would have sent it down the `cv2.imread` path, which cannot decode a RAW.
+
+Fixed by making `RAW_FORMATS` the single source of truth rather than one of five parallel lists:
+
+- **`backend/constants.py`** — new `RAW_DECODE_SUFFIXES` (lowercase dot-prefixed mirror, *derived* from `RAW_FORMATS`). `SUPPORTED_EXTENSIONS` is now `_PROCESSED_EXTS | RAW_DECODE_SUFFIXES`, so the RAW half can no longer drift from `RAW_FORMATS`. `_HIF_PAIRED_RAW_EXTS` and `_PROCESSED_SIBLING_EXTS` likewise derive instead of repeating.
+- **Four scorer decode branches** now import that constant: `phase1_technical/utils.py::load_as_gray`, `phase1_technical/batch_sharpness_analyzer.py::detect_sharpness`, `phase2_quality/face_analyzer.py::_load_image`, and `quality_analyzer.py` (which re-exports it for `routers/analysis.py`'s RAW prefetch). Also switched `.upper()`-against-uppercase-literals to `.lower()`-against-the-constant.
+- **`batch_sharpness_analyzer.py`** doubles as a standalone calibration CLI where the repo root isn't on `sys.path`, so it bootstraps the root before importing. Its folder walk now uses `SUPPORTED_EXTENSIONS` (previously a 7-entry per-casing glob list that missed `.3fr` entirely), its `THRESHOLDS` table gets a derived entry per RAW format instead of silently falling back to the JPG value, and its `[raw_threshold]` CLI argument now applies to every RAW format. It also registers `pillow_heif` in `__main__` so `.hif` doesn't get silently dropped from a calibration set.
+- The three dev-CLI folder walks in `burst_detection.py` / `camera_shake.py` / `exposure.py` (all inside `__main__`) read `SUPPORTED_EXTENSIONS` too — they'd been stuck at `{jpg, jpeg, png, raf, nef}`.
+- Settings → Display copy no longer enumerates "RAW/RAF/NEF/3FR".
+
+**`tests/test_raw_format_coverage.py` (29 tests)** pins the derivation and — the part with teeth — asserts via `inspect.getsource` that the three suffix-branching functions contain no hardcoded `.RAF`/`.NEF`/`.3FR` literal. Verified the guard fails when a literal is reintroduced.
+
+Verified end-to-end through `analyze_photo_quality` (the real call site, not `rawpy.imread`) on a DJI `8192×4608` DNG and an Adobe-converted `8000×5320` DNG: sharpness, exposure, face, IQA, aesthetic, scene, 768-dim embedding and histogram all populate; `_raw_to_pil` + `_generate_preview` produce correct-orientation JPEGs. RAF and HIF regression-checked in the same process, unchanged. 430/430 tests pass, `npm run build` green, dist rebuilt.
+
+ARW/CR2/CR3 are wired by the same derivation but **untested** — no Sony/Canon sample files on hand.
+
+**Unrelated pre-existing issue found while verifying:** on a cold process, the TOPIQ IQA and aesthetic metrics sometimes both returned `None` with `NotImplementedError: Cannot copy out of meta tensor`. Reproduces identically on a RAF, so it was format-independent and not caused by this change. Fixed immediately after — see the next entry.
+
+---
+
 ## Fixed: K/M/X did nothing in the Keeps/Maybes/Rejects views until you clicked a photo (2026-07-27)
 
 Philipp reported (flagged **absolute must-have**) that pressing `X` on a selected photo *inside the Keep view* did **nothing at all** — no re-decision to Reject, no feedback.

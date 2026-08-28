@@ -24,6 +24,18 @@ from pathlib import Path
 import csv
 from datetime import datetime
 
+# This module doubles as a standalone calibration CLI
+# (`python phase1_technical/batch_sharpness_analyzer.py <folder>`), where
+# sys.path[0] is phase1_technical/ and the repo root is not importable. Put
+# the root on the path so the shared RAW-format constants resolve both when
+# imported as part of the package and when run directly.
+import sys as _sys
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+
+from backend.constants import RAW_DECODE_SUFFIXES, RAW_FORMATS, SUPPORTED_EXTENSIONS
+
 # Per-format normalized sharpness thresholds.
 # Score = geometric mean of per-megapixel Laplacian variance, Tenengrad, and
 # Modified Laplacian, each divided by its empirical scale constant so the three
@@ -34,13 +46,16 @@ from datetime import datetime
 # known-sharp and known-blurry photos and pick a threshold around the split.
 # Previous single-measure threshold was 2.3 (Laplacian-only); the new combined
 # score lands in a similar 1–10 band, so 2.3 is a reasonable starting point.
+#
+# Every format currently calibrates to the same 2.3, so get_threshold()'s
+# JPG fallback already covered the RAW formats missing from this table. The
+# RAW entries are filled in from RAW_FORMATS anyway so a future per-format
+# recalibration has a visible slot for each, rather than a silent fallback.
 THRESHOLDS = {
     'JPG':  2.3,
     'JPEG': 2.3,
-    'RAF':  2.3,
-    'NEF':  2.3,
-    '3FR':  2.3,
 }
+THRESHOLDS.update({fmt: 2.3 for fmt in sorted(RAW_FORMATS)})
 
 # Tile grid and aggregation percentile for regional focus measurement.
 # 16×16 = 256 tiles; p90 = "sharpest 10%" ≈ 25 tiles — a realistic floor for
@@ -258,7 +273,7 @@ def detect_sharpness(image_path):
     """
     try:
         # Load image (raw via rawpy demosaic, with thumbnail fallback)
-        if image_path.suffix.upper() in ['.RAF', '.NEF', '.3FR']:
+        if image_path.suffix.lower() in RAW_DECODE_SUFFIXES:
             try:
                 with rawpy.imread(str(image_path)) as raw:
                     rgb = raw.postprocess(
@@ -326,13 +341,12 @@ def analyze_folder(folder_path, thresholds=None, output_csv=True):
     folder = Path(folder_path)
     thresholds = thresholds or THRESHOLDS
 
-    # Supported formats
-    formats = ['.jpg', '.jpeg', '.JPG', '.JPEG', '.RAF', '.NEF', '.nef']
-
-    # Find all photos
-    photos = []
-    for fmt in formats:
-        photos.extend(folder.glob(f'*{fmt}'))
+    # Find all photos. Case-insensitive on the extension so a folder mixing
+    # .JPG and .jpg (or .DNG and .dng) is walked once, not once per casing.
+    photos = sorted(
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
 
     if not photos:
         print(f"❌ No photos found in {folder}")
@@ -460,6 +474,15 @@ def detect_camera(filename):
 if __name__ == "__main__":
     import sys
 
+    # backend/main.py normally registers this at app import; the standalone CLI
+    # never loads the app, so without it every .hif in the folder fails its
+    # Pillow fallback and is silently dropped from the calibration set.
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
+
     # Usage: python phase1_technical/batch_sharpness_analyzer.py /path/to/folder [threshold]
 
     if len(sys.argv) < 2:
@@ -473,7 +496,9 @@ if __name__ == "__main__":
     jpg_threshold = float(sys.argv[2]) if len(sys.argv) > 2 else THRESHOLDS['JPG']
     raw_threshold = float(sys.argv[3]) if len(sys.argv) > 3 else THRESHOLDS['RAF']
 
+    # The [raw_threshold] argument applies to every RAW format, not just the
+    # two that used to be spelled out here.
     custom_thresholds = {**THRESHOLDS, 'JPG': jpg_threshold, 'JPEG': jpg_threshold,
-                         'RAF': raw_threshold, 'NEF': raw_threshold}
+                         **{fmt: raw_threshold for fmt in RAW_FORMATS}}
 
     analyze_folder(folder_path, thresholds=custom_thresholds)

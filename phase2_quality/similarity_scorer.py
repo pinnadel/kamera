@@ -36,10 +36,10 @@ CPU inference: ~0.3–1.0s per image at 224px resolution.
 
 import json
 import logging
-import threading
 from pathlib import Path
 
 from phase2_quality.model_status import begin as _begin, end as _end
+from phase2_quality.model_loading import MODEL_LOAD_LOCK
 from phase2_quality.device import get_device as _get_device
 
 logger = logging.getLogger(__name__)
@@ -72,8 +72,12 @@ _load_failed = False
 # from_pretrained()/.to(device) fail with "Cannot copy out of meta tensor" —
 # and the loser sets _load_failed, poisoning the whole process even though the
 # winner's model works (2026-07-19 incident: warm-up thread vs first analyze).
-# Same reason _warm_models loads the three models sequentially.
-_load_lock = threading.Lock()
+#
+# This lock is now shared process-wide (phase2_quality/model_loading.py). The
+# 2026-07-19 fix made it module-local, which could not work: the global state
+# being raced on is accelerate's, so the collision is with *pyiqa*, and no two
+# threads ever contended for this module's own lock.
+_load_lock = MODEL_LOAD_LOCK
 
 
 def _is_siglip_cached() -> bool:

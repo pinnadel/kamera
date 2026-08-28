@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
 
+from backend.constants import RAW_DECODE_SUFFIXES
+
 
 @contextmanager
 def _suppress_stderr():
@@ -392,7 +394,7 @@ def _apply_clahe(rgb: np.ndarray) -> np.ndarray:
 
 def _load_image(path: Path) -> np.ndarray:
     """Load JPEG or RAW as an RGB numpy array, with EXIF rotation applied. Raises on failure."""
-    if path.suffix.upper() in ('.RAF', '.NEF', '.3FR'):
+    if path.suffix.lower() in RAW_DECODE_SUFFIXES:
         try:
             with rawpy.imread(str(path)) as raw:
                 return raw.postprocess(use_camera_wb=True, half_size=True, output_bps=8)

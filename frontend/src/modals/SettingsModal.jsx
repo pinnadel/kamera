@@ -1174,7 +1174,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   <div className="flex-1">
                     <p className="text-xs text-[#cecece] leading-relaxed mb-1">Reload AI scoring models</p>
                     <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                      The TOPIQ-NR, TOPIQ-IAA, and SigLIP models load once at startup and stay warm in RAM. You only need this if you've manually replaced a model file on disk (pulled a new version, swapped weights) and want the running app to pick it up without restarting the backend. Existing scores aren't recomputed — only future analyses use the new weights.
+                      The TOPIQ-NR, TOPIQ-IAA, and SigLIP models load once at startup and stay warm in RAM. Use this if you've manually replaced a model file on disk (pulled a new version, swapped weights) and want the running app to pick it up without restarting the backend. It also clears a stuck model: if one fails to load, it stays disabled for the rest of the session and its scores come back blank on every photo — this retries it. Existing scores aren't recomputed — only future analyses use the new weights.
                     </p>
                   </div>
                   <button
@@ -1432,9 +1432,9 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               <p className="label mb-1">Preview source</p>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
                 When a RAW shot has a camera-baked preview alongside it (Fuji
-                .HIF or any .JPG written next to the .RAF / .NEF), choose
-                whether to show the RAW or the camera’s rendition in the grid
-                and detail view.
+                .HIF or any .JPG written next to the RAW), choose whether to
+                show the RAW or the camera’s rendition in the grid and detail
+                view.
               </p>
 
               <div className="flex items-start justify-between gap-4 py-2">
@@ -1474,7 +1474,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
               <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingRawJpegMode ? 'opacity-50 pointer-events-none' : ''}`}>
                 {[
-                  { key: 'raw', label: 'RAW only', title: 'Show only the uncompressed RAW/RAF/NEF/3FR file' },
+                  { key: 'raw', label: 'RAW only', title: 'Show only the RAW file (RAF, NEF, 3FR, DNG, ARW, CR2, CR3)' },
                   { key: 'processed', label: 'Processed only', title: 'Show only the compressed JPEG/HIF file' },
                   { key: 'both', label: 'Both', title: 'Show every analyzed file as its own tile (default)' },
                 ].map(({ key, label, title }, i) => (
