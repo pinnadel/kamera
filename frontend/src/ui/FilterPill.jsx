@@ -14,7 +14,13 @@ import { ACTIVE_PILL } from './buttons'
 // Bottom-pill Filter control. The trigger is an icon-only funnel that opens the
 // menu; active filters render as removable chips in the bottom bar (see App),
 // NOT on the pill itself. Multiple categories can be active at once and combine
-// with AND: Camera (OR across cameras) · Date range · one composition type.
+// with AND: Camera (OR across cameras) · Date range · one composition type ·
+// one grouping value.
+//
+// Composition and grouping are different questions and sit in separate blocks:
+// composition is about what's IN the frame (faces), grouping is about burst
+// membership. "Multiple people" is the composition row that used to be called
+// "Group photos" — which read as a burst filter and wasn't one.
 //
 // Submenus (Date, Camera) flip placement to `right-full` when there isn't
 // room on the right of L1 — same viewport-aware logic as SortPill.
@@ -56,6 +62,13 @@ export function FilterPill({
   // re-picking the active one clears it. Menu stays open.
   const setComposition = (kind) => {
     setFilters({ ...f, composition: f.composition === kind ? null : kind })
+    setSubmenu(null)
+  }
+
+  // Grouped / Ungrouped are mutually exclusive the same way, and orthogonal to
+  // composition — both can be active at once.
+  const setGrouping = (kind) => {
+    setFilters({ ...f, grouping: f.grouping === kind ? null : kind })
     setSubmenu(null)
   }
 
@@ -141,9 +154,26 @@ export function FilterPill({
             onMouseEnter={() => setSubmenu(null)}
           />
           <FilterRow
-            label="Group photos"
+            label="Multiple people"
             active={f.composition === 'group'}
             onSelect={() => setComposition('group')}
+            onMouseEnter={() => setSubmenu(null)}
+          />
+
+          {/* Burst membership — the "work through the singles first, then the
+              groups" split. Separate block because it answers a different
+              question from the three composition rows above it. */}
+          <div className="my-1 mx-3 h-px bg-[#2a2b2d]" />
+          <FilterRow
+            label="Grouped"
+            active={f.grouping === 'grouped'}
+            onSelect={() => setGrouping('grouped')}
+            onMouseEnter={() => setSubmenu(null)}
+          />
+          <FilterRow
+            label="Ungrouped"
+            active={f.grouping === 'ungrouped'}
+            onSelect={() => setGrouping('ungrouped')}
             onMouseEnter={() => setSubmenu(null)}
           />
 

@@ -39,7 +39,7 @@ const FS_ZOOM_SCALES = [1, 1.5, 3]
 // hop between siblings without losing the detail panel context. Without
 // `groupContext`, DetailView behaves exactly as before — prev/next walk
 // the global images array.
-export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, onUndo, onAmend = null, onRegisterDecisionIntent = null, onMarkReviewed = null, onPrev, onNext, hasPrev, hasNext, autoGenerate, onExplanationGenerated, groupContext = null, onPickGroupMember = null, gridFilmstrip = null, onBulk = null, addToast = null, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, setFilmstripCollapsed = null, onStartStripResize = null, setBottomToolbarSlot = null, suppressPanelResize = false }) {
+export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, onUndo, onAmend = null, onRegisterDecisionIntent = null, onMarkReviewed = null, onPrev, onNext, hasPrev, hasNext, autoGenerate, onExplanationGenerated, groupContext = null, closeOnDecide = true, onPickGroupMember = null, gridFilmstrip = null, onBulk = null, addToast = null, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, setFilmstripCollapsed = null, onStartStripResize = null, setBottomToolbarSlot = null, suppressPanelResize = false }) {
   const shutter = formatShutter(image.shutter_speed)
   // Click on the in-panel photo enters fullscreen (true fullscreen overlay,
   // no info panel, no chrome — UX feedback 2026-05-06). Inside fullscreen,
@@ -267,8 +267,12 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
     const amended = await amendPromise
     if (amended) return
     onDecide(d)
-    if (groupContext) onClose()
-  }, [gridFilmstrip, groupContext, onDecide, onClose, onAmend, onRegisterDecisionIntent])
+    // Group mode normally closes on a decision because App.sendDecision
+    // advances the GLOBAL grid cursor, which would jump out of the group.
+    // A caller that advances within the group itself (the scrub panel's
+    // DetailView) passes closeOnDecide={false} and stays put.
+    if (groupContext && closeOnDecide) onClose()
+  }, [gridFilmstrip, groupContext, closeOnDecide, onDecide, onClose, onAmend, onRegisterDecisionIntent])
   useHotkeys('k', () => decideFromDetail('keep'),   { enableOnFormTags: false }, [decideFromDetail])
   useHotkeys('m', () => decideFromDetail('maybe'),  { enableOnFormTags: false }, [decideFromDetail])
   useHotkeys('r', () => decideFromDetail('reject'), { enableOnFormTags: false }, [decideFromDetail])

@@ -112,7 +112,7 @@ import { ViewPill, GRID_SIZE_OPTIONS } from './ui/ViewPill'
 // surface, so the layout picker would just be a one-row no-op without this.
 const GRID_ONLY_LAYOUT_OPTIONS = [{ id: 'grid', label: 'Grid', Icon: Grid2x2 }]
 import { FILMSTRIP_CHROME_WITH_BADGES, pillBottomAboveStrip, stripHeight } from './ui/filmstripMetrics'
-import { EMPTY_FILTER, filterPredicate, getActiveFilterChips, isFilterEmpty } from './filterUtils'
+import { EMPTY_FILTER, filterPredicate, getActiveFilterChips, groupingPredicate, isFilterEmpty } from './filterUtils'
 import { ViewModePill } from './ViewModePill'
 
 export default function App() {
@@ -357,6 +357,8 @@ export default function App() {
   const [compareImages, setCompareImages] = useState([])  // max 4
   const [compareOpen, setCompareOpen]     = useState(false)
   const gridRef = useRef(null)
+  // Sticky header — measured when the scrub panel scrolls a tile up under it.
+  const headerRef = useRef(null)
   // Suppress the launch-time scrollIntoView. selectedIdx defaults to 0 on a
   // restored tab even though the user hasn't actually picked anything, and the
   // grid is sorted — so images[0] is usually nowhere near the visual top.
@@ -1018,16 +1020,29 @@ export default function App() {
           : img.decision === decisionFilter)
       : null
     const compositionMatches = isFilterEmpty(filters) ? null : filterPredicate(filters)
-    if (decisionMatches || compositionMatches) {
+    // Burst membership, asked per photo. partnerSummaryByImageId holds an entry
+    // for every member of every multi-photo group, so presence IS the answer —
+    // but check the member count too rather than trust that invariant from
+    // here: a one-member entry would otherwise make a lone photo "grouped".
+    const groupingMatches = groupingPredicate(filters, (id) => {
+      const summary = partnerSummaryByImageId.get(id)
+      return !!summary && summary.members.length > 1
+    })
+    if (decisionMatches || compositionMatches || groupingMatches) {
       const passesAll = img =>
         (!decisionMatches    || decisionMatches(img)) &&
-        (!compositionMatches || compositionMatches(img))
+        (!compositionMatches || compositionMatches(img)) &&
+        (!groupingMatches    || groupingMatches(img))
       filtered = filtered.flatMap(item => {
         if (item.type !== 'group') {
           return passesAll(item.image) ? [item] : []
         }
         // Group tile: excluded by any decision filter other than Undecided.
         if (decisionFilter && decisionFilter !== 'undecided') return []
+        // A group tile is grouped by definition — no need to ask per member,
+        // and asking would be wrong for 'ungrouped' (every member answers no,
+        // so `.some()` would keep the tile).
+        if (filters?.grouping === 'ungrouped') return []
         // Composition filter (if any) tests the undecided members only.
         if (compositionMatches &&
             !item.undecidedImages.some(compositionMatches)) return []
@@ -1760,9 +1775,105 @@ export default function App() {
   // burst's members in a panel anchored below it. Suspended whenever a
   // full-screen surface owns the view or the grid is in select mode — those
   // don't reliably produce the mouseleave that would otherwise close it.
-  const { scrub: groupScrub, preview: groupScrubPreview } = useGroupScrub({
-    suspended: !!loupeGroup || detailOpen || !!partnersOverlay || gridMultiSelect.isSelectMode,
+  // Height the opening scroll has to keep clear so the tile doesn't land
+  // under the sticky header. Read live at click time rather than stored: the
+  // header hides itself on scroll-down and its height varies with the band
+  // count (multi-select toolbar, filter chips).
+  const headerTopInset = useCallback(() => {
+    const el = headerRef.current
+    if (!el) return 0
+    const r = el.getBoundingClientRect()
+    // Translated up out of view — it will not be covering the tile.
+    return r.bottom > 0 ? r.height : 0
+  }, [])
+
+  const {
+    scrub: groupScrub,
+    preview: groupScrubPreview,
+    stash: stashGroupScrub,
+    restore: restoreGroupScrub,
+  } = useGroupScrub({
+    suspended: !!loupeGroup || detailOpen || !!partnersOverlay || gridMultiSelect.isSelectMode
+      || compareOpen || activeView !== 'grid',
+    topInset: headerTopInset,
   })
+
+  // Burst the scrub panel handed to DetailView (Space/Enter), by its group id.
+  // Set means "DetailView is on loan from the panel": prev/next cycle the
+  // burst, K/M/R advance inside it, and closing hands the screen back.
+  const [scrubDetailGroupId, setScrubDetailGroupId] = useState(null)
+
+  // Derived live rather than snapshotted, so decisions made in DetailView are
+  // reflected in its group filmstrip instead of leaving the opening state on
+  // screen — same reason the panel itself re-reads its members every render.
+  const scrubDetailGroup = useMemo(() => {
+    if (scrubDetailGroupId == null) return null
+    const summary = partnerSummaryByImageId.get(scrubDetailGroupId)
+    if (!summary) return null
+    return { best_image_id: scrubDetailGroupId, images: summary.members }
+  }, [scrubDetailGroupId, partnerSummaryByImageId])
+
+  // Open DetailView on the frame the hover-scrub panel is showing (Space /
+  // Enter while it's up). Unlike the grid's double-click path this carries the
+  // burst with it: prev/next cycle the group's members, not the global grid
+  // order, so the way back is always to a frame the panel can actually show.
+  const openDetailFromScrub = useCallback((imageId) => {
+    const idx = images.findIndex(img => img.id === imageId)
+    if (idx < 0) return
+    const summary = partnerSummaryByImageId.get(imageId)
+    // Park the pass BEFORE detailOpen suspends the hook and wipes it.
+    stashGroupScrub()
+    setSelectedGroupId(null)
+    setSelectedDecidedGroupKey(null)
+    setSelectedIdx(idx)
+    setDetailGroupContext(null)
+    setScrubDetailGroupId(summary ? summary.groupId : null)
+    setDetailOpen(true)
+  }, [images, partnerSummaryByImageId, stashGroupScrub, setSelectedIdx, setSelectedGroupId, setSelectedDecidedGroupKey])
+
+  // The one way out of DetailView — X, backdrop, Esc and Space all land here.
+  // When it was opened from the scrub panel, closing rebuilds that panel on
+  // whichever frame DetailView ended on, so navigating or culling in there
+  // returns you to the burst where you actually left it rather than to the
+  // grid. `restoreGroupScrub` runs in the same batch as detailOpen going
+  // false, so the hook's suspend never sees a frame to tear down.
+  const closeDetail = useCallback(() => {
+    setDetailOpen(false)
+    setDetailGroupContext(null)
+    if (scrubDetailGroupId != null) {
+      setScrubDetailGroupId(null)
+      restoreGroupScrub(images[selectedIdx]?.id)
+    }
+  }, [scrubDetailGroupId, restoreGroupScrub, images, selectedIdx])
+
+  // Other paths close DetailView without going through closeDetail — chiefly
+  // closeLoupeAndAdvance, when a decision resolves the last undecided member
+  // of the burst. Those hand back to the grid on purpose (the group is done),
+  // but the flag has to come off or the NEXT DetailView would believe it was
+  // on loan from a panel that is no longer there.
+  useEffect(() => {
+    if (!detailOpen && scrubDetailGroupId != null) setScrubDetailGroupId(null)
+  }, [detailOpen, scrubDetailGroupId])
+
+  // K/M/R inside a scrub-opened DetailView. Deliberately NOT sendDecision:
+  // that advances the global grid cursor, which walks straight out of the
+  // burst. This steps within the burst instead — the same "judge this one,
+  // show me the next" the panel does, just full screen — and never closes,
+  // so Space/Esc stays the user's own way back.
+  const scrubDetailDecide = useCallback(async (decision) => {
+    const img = images[selectedIdx]
+    if (!img) return
+    const members = scrubDetailGroup?.images || []
+    const i = members.findIndex(m => m.id === img.id)
+    // Advance off the CURRENT array, before awaiting: bulkDecide reloads
+    // images, and this closure would then be looking the successor up in a
+    // stale list. A decision never adds or drops rows, so the index holds.
+    if (i >= 0 && i < members.length - 1) {
+      const nextIdx = images.findIndex(x => x.id === members[i + 1].id)
+      if (nextIdx >= 0) setSelectedIdx(nextIdx)
+    }
+    await bulkDecide([img.id], decision)
+  }, [images, selectedIdx, scrubDetailGroup, bulkDecide, setSelectedIdx])
 
   // Open the partners overlay for a collapsed DecidedGroupTile by its groupKey
   // (used by keyboard Enter/Space when a decidedGroup cell is focused — the
@@ -2197,6 +2308,9 @@ export default function App() {
     activeView,
     detailOpen,
     setDetailOpen,
+    // Single exit from DetailView, so Esc/Space get the scrub-panel hand-back
+    // that the X button and the backdrop already get.
+    closeDetail,
     images,
     selectedIdx,
     setSelectedIdx,
@@ -2222,6 +2336,11 @@ export default function App() {
     // Loupe locks out grid hotkeys — its own useHotkeys (in GroupLoupe.jsx)
     // owns K/M/X/arrows/Enter/S/Z/Esc while open.
     loupeOpen: !!loupeGroup,
+    // So does the hover-scrub panel: while it's up, arrows/K/M/R/U/Space act
+    // on the frame IT is showing (GroupScrubPreview.jsx). Ungated, both layers
+    // would answer one keypress — two /decision posts for the same intent,
+    // against two different photos.
+    scrubOpen: !!groupScrubPreview,
     // Bulk multi-select hooks — when isSelectMode && size>0, K/M/R hit the
     // whole selection and U reverts every selected photo to undecided.
     // Otherwise the per-photo handlers fire as before.
@@ -2317,6 +2436,8 @@ export default function App() {
             members={live || groupScrubPreview.members}
             onDecide={(imageId, decision) => bulkDecide([imageId], decision)}
             onSwap={swapDecisions}
+            onUndo={undoImage}
+            onOpenDetail={openDetailFromScrub}
           />
         )
       })()}
@@ -2580,8 +2701,13 @@ export default function App() {
         //     displayGridItems atomically — groups count as one stop. The
         //     focused item can be a solo photo or a group; when it's a
         //     group, the panel renders the hero.
-        const inGroup = !!detailGroupContext
-        const groupImages = detailGroupContext?.images || []
+        //   · scrub-panel mode (scrubDetailGroup set): same group navigation,
+        //     but closing reopens the hover-scrub panel on the frame we end
+        //     on rather than dropping back to the grid.
+        const groupCtx = detailGroupContext ?? scrubDetailGroup
+        const fromScrub = !detailGroupContext && !!scrubDetailGroup
+        const inGroup = !!groupCtx
+        const groupImages = groupCtx?.images || []
 
         // Resolve the *effective* image the panel renders. In grid-filmstrip
         // mode, a group-focused state renders the group's AI hero.
@@ -2675,9 +2801,13 @@ export default function App() {
             // In sticky-filmstrip mode there's no explicit detailOpen flag to
             // flip; closing means "go back to thumbnail grid".
             if (stickyFilmstrip) { setGridLayout('grid'); setDetailGroupContext(null); return }
-            setDetailOpen(false); setDetailGroupContext(null)
+            closeDetail()
           }}
-          onDecide={sendDecision}
+          onDecide={fromScrub ? scrubDetailDecide : sendDecision}
+          // A scrub-opened DetailView stays open through a decision: Space or
+          // Esc is the user's own way back to the panel, and closing out from
+          // under them would land them in the grid instead.
+          closeOnDecide={!fromScrub}
           onUndoImage={undoImage}
           onUndo={runUndo}
           onAmend={amendLastDecision}
@@ -2691,7 +2821,7 @@ export default function App() {
           onExplanationGenerated={(id, text) =>
             setImages(prev => prev.map(img => img.id === id ? { ...img, explanation: text } : img))
           }
-          groupContext={detailGroupContext}
+          groupContext={groupCtx}
           onPickGroupMember={inGroup ? (id) => {
             const i = images.findIndex(img => img.id === id)
             if (i >= 0) setSelectedIdx(i)
@@ -2765,6 +2895,7 @@ export default function App() {
           active so the selection toolbar (which lives in the filter row)
           stays reachable without scrolling back up. */}
       <div
+        ref={headerRef}
         className="sticky top-0 z-40 bg-[#101111] transition-transform duration-200 ease-out will-change-transform"
         style={{ transform: (headerHidden && !gridMultiSelect.isSelectMode) ? 'translateY(-100%)' : 'translateY(0)' }}
       >
@@ -3923,7 +4054,7 @@ export default function App() {
           : 'fixed left-1/2 -translate-x-1/2 z-40 flex items-center gap-1 px-2 py-1.5 bg-[#111214] border border-[#2a2b2d] rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.6)]'
         const wrapperStyle = inToolbar ? {} : { bottom: '8px' }
         const tree = (
-        <div style={wrapperStyle} className={wrapperClass}>
+        <div style={wrapperStyle} className={wrapperClass} data-bottom-bar={inToolbar ? undefined : 'true'}>
 
           {/* Sort dropdown — 2-level menu, leading direction toggle. State
               persists in localStorage via useSort(); same instance drives the

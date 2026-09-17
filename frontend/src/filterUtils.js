@@ -6,14 +6,23 @@
 // once and combine with AND (they narrow the set):
 //
 //   { cameras: string[], date: {from,to} | null, composition: 'portraits' |
-//     'landscape' | 'group' | null }
+//     'landscape' | 'group' | null, grouping: 'grouped' | 'ungrouped' | null }
 //
 // Within the Camera category the selected cameras OR together (a photo passes
 // if it was shot on ANY selected camera). Across categories it's AND. The
 // composition types are mutually contradictory (Portraits = ≥1 face, Landscape
-// = 0 faces, Group = >1 face) so only one is selectable at a time.
+// = 0 faces, Multiple people = >1 face) so only one is selectable at a time;
+// likewise the two grouping values.
+//
+// `composition` is about WHAT IS IN THE FRAME (faces). `grouping` is about
+// BURST MEMBERSHIP — whether the photo belongs to a similarity/manual group.
+// They are unrelated and independently selectable. They used to read as the
+// same thing because composition 'group' was labelled "Group photos", which
+// made a filter for "people together" look like a filter for "burst", so it
+// is labelled "Multiple people" now. Don't reintroduce "group" in a
+// composition label.
 
-export const EMPTY_FILTER = { cameras: [], date: null, composition: null }
+export const EMPTY_FILTER = { cameras: [], date: null, composition: null, grouping: null }
 
 // True when no category is active — the identity filter (everything passes).
 export function isFilterEmpty(filters) {
@@ -21,7 +30,8 @@ export function isFilterEmpty(filters) {
   return (
     (!filters.cameras || filters.cameras.length === 0) &&
     !filters.date &&
-    !filters.composition
+    !filters.composition &&
+    !filters.grouping
   )
 }
 
@@ -31,13 +41,29 @@ function compositionPredicate(kind) {
   switch (kind) {
     case 'portraits': return (img) => (img.face_count ?? 0) >= 1
     case 'landscape': return (img) => (img.face_count ?? 0) === 0
-    case 'group':     return (img) => (img.face_count ?? 0) > 1
+    case 'group':     return (img) => (img.face_count ?? 0) > 1   // "Multiple people"
     default:          return () => true
   }
 }
 
+// Predicate for the grouping category. Kept OUT of filterPredicate because an
+// image row carries no burst membership — that lives in App's group memos — so
+// the caller supplies the lookup. Returns null when the category is off, so
+// callers can skip the pass entirely.
+//
+// `isGrouped` is asked per image id and must answer "is this photo a member of
+// a group with at least two photos", regardless of how the grid happens to
+// render it: a burst whose other members are already decided still shows its
+// last undecided member as a plain tile, and that photo is still grouped.
+export function groupingPredicate(filters, isGrouped) {
+  const kind = filters?.grouping
+  if (!kind) return null
+  return (img) => (kind === 'grouped' ? isGrouped(img.id) : !isGrouped(img.id))
+}
+
 // Returns true when the image passes ALL active filter categories. When the
-// filter is empty every image passes (identity predicate).
+// filter is empty every image passes (identity predicate). Grouping is NOT
+// covered here — see groupingPredicate.
 export function filterPredicate(filters) {
   if (isFilterEmpty(filters)) return () => true
 
@@ -95,7 +121,12 @@ function dateLabel(date) {
 const COMPOSITION_LABEL = {
   portraits: 'Portraits',
   landscape: 'Landscape',
-  group: 'Group photos',
+  group: 'Multiple people',
+}
+
+export const GROUPING_LABEL = {
+  grouped: 'Grouped',
+  ungrouped: 'Ungrouped',
 }
 
 // One descriptor per active filter, for the removable chips in the bottom bar.
@@ -119,6 +150,13 @@ export function getActiveFilterChips(filters) {
       key: `composition:${filters.composition}`,
       label: COMPOSITION_LABEL[filters.composition] ?? filters.composition,
       next: { ...filters, composition: null },
+    })
+  }
+  if (filters.grouping) {
+    chips.push({
+      key: `grouping:${filters.grouping}`,
+      label: GROUPING_LABEL[filters.grouping] ?? filters.grouping,
+      next: { ...filters, grouping: null },
     })
   }
   if (filters.date) {

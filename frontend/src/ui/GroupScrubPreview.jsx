@@ -1,10 +1,13 @@
+import { useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
+import { useHotkeys } from 'react-hotkeys-hook'
 import { ArrowLeftRight } from 'lucide-react'
 import { API } from '../api'
 
 // GroupScrubPreview — the peek-and-fix panel that hangs off a group tile.
-// Sweeping the pointer across the tile scrubs the burst (hooks/useGroupScrub.js);
-// moving into the panel lets you act on the frame you landed on.
+// Clicking the tile pins it open (hooks/useGroupScrub.js) and scrolls that
+// tile under the header so this gets the whole remaining viewport; sweeping
+// the tile, the position bar below, or the arrow keys then step the burst.
 //
 // It walks the WHOLE original burst, not just the members visible in the
 // current filter view, and states each frame's bucket (border tint + pill +
@@ -13,6 +16,20 @@ import { API } from '../api'
 //
 // Portalled to document.body: the grid clips and the tiles carry their own
 // stacking contexts, so an in-tree panel would be cut off.
+//
+// It is dismissed by Esc, by a click anywhere outside it, or by clicking its
+// own tile again — not by moving the pointer away. It is a pinned surface.
+//
+// While it's on screen the panel OWNS the keyboard — ←/→ step the burst,
+// K/M/R re-cull the shown frame and advance to the one on its right, U /
+// Cmd+Z takes the last one back, Space/Enter opens it in DetailView, Esc
+// closes. useKeyboard.js backs off wholesale for as long as the panel is up
+// (its `scrubOpen` gate); without that both layers answer the same keypress
+// and fire two competing /decision posts for one press.
+//
+// Pointer and keyboard drive ONE index, never two: sweeping the tile or the
+// panel's position bar moves it, arrow keys move it, and whichever gesture
+// acted last is the one showing (hooks/useGroupScrub.js::RETAKE_PX).
 
 const MARGIN        = 16   // viewport breathing room
 const GAP           = 12   // tile ↔ panel; must clear the caret
@@ -70,10 +87,23 @@ function uiScaleZoom() {
   return Number.isFinite(z) && z > 0 ? z : 1
 }
 
+// Room the floating bottom toolbar takes off the viewport. It is `fixed` over
+// the grid, so the fold is not where the panel's room actually ends — without
+// this the action row lands underneath it, which is exactly the row you reach
+// for. Measured rather than hard-coded: the bar's height changes with what it
+// is hosting, and it disappears entirely inside DetailView.
+function bottomReserved(zoom) {
+  const el = document.querySelector('[data-bottom-bar]')
+  if (!el) return 0
+  const r = el.getBoundingClientRect()
+  if (r.height <= 0) return 0
+  return Math.max(0, (window.innerHeight - r.top) / zoom)
+}
+
 // place — centre the panel on the tile, keep it fully on screen, prefer
 // hanging below. Same below-else-flip-above rule as ui/primitives.jsx's
 // placePopover, but centred rather than left-aligned, and it aims a caret.
-function place(rect, zoom) {
+function place(rect, zoom, bottomInset = 0) {
   // Viewport expressed in fixed space (see uiScaleZoom).
   const vw = window.innerWidth  / zoom
   const vh = window.innerHeight / zoom
@@ -86,7 +116,7 @@ function place(rect, zoom) {
 
   // Vertical: the largest image each side could seat without crossing a fold.
   const chrome = PAD * 2 + BAR_BLOCK + ACTION_BLOCK
-  const roomBelow = vh - bottom0 - GAP - MARGIN - chrome
+  const roomBelow = vh - bottomInset - bottom0 - GAP - MARGIN - chrome
   const roomAbove = top0 - GAP - MARGIN - chrome
 
   // Whichever side has more room wins outright — no preference for below.
@@ -115,7 +145,7 @@ function place(rect, zoom) {
   // both sides, and a panel that's slightly detached from its tile is a much
   // better failure than one bleeding off the fold.
   const panelHeight = imageHeight + chrome
-  const maxTop = Math.max(MARGIN, vh - MARGIN - panelHeight)
+  const maxTop = Math.max(MARGIN, vh - bottomInset - MARGIN - panelHeight)
   const top    = Math.min(Math.max(MARGIN, bottom0 + GAP), maxTop)
   const bottom = Math.min(Math.max(MARGIN, vh - top0 + GAP), Math.max(MARGIN, vh - MARGIN - panelHeight))
 
@@ -176,14 +206,72 @@ function ActionButton({ tint, active, disabled, title, onClick, children }) {
 }
 
 export function GroupScrubPreview({
-  anchorRect, members, index, onPanelEnter, onPanelLeave, onDecide, onSwap,
+  anchorRect, members, index, onDecide, onSwap,
+  onScrubTo, onStep, onClose, onUndo, onOpenDetail,
 }) {
-  if (!anchorRect || !members || members.length === 0) return null
+  // Everything below the hooks may bail out, but the hooks themselves can't —
+  // so the open/active resolution happens first and the guards come after.
+  const count  = Array.isArray(members) ? members.length : 0
+  const open   = !!anchorRect && count > 0
+  const idx    = open ? Math.min(Math.max(index, 0), count - 1) : 0
+  const active = open ? members[idx] : null
 
-  const active = members[Math.min(index, members.length - 1)]
-  if (!active) return null
+  const barRef = useRef(null)
 
-  const p = place(anchorRect, uiScaleZoom())
+  // Hovering the position bar scrubs, same as sweeping the tile. Once the
+  // pointer is inside the panel no mousemove reaches the tile any more, so
+  // without this the scrub would be frozen exactly where the controls are.
+  const scrubFromBar = useCallback((e) => {
+    const el = barRef.current
+    if (!el || count === 0) return
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0) return
+    const t = (e.clientX - rect.left) / rect.width
+    onScrubTo?.(Math.floor(t * count))   // clamped by the hook
+  }, [count, onScrubTo])
+
+  // Decide the shown frame, then step right — the gesture is "judge this one,
+  // show me the next". Sends even when the frame already sits in that bucket:
+  // pressing K on an auto-culled Keep is the user CONFIRMING it, and only a
+  // manual decision writes a training sample (backend/routers/decisions.py).
+  // The file move itself is a no-op when the destination hasn't changed.
+  const decideAndAdvance = useCallback((kind) => {
+    if (!active) return
+    onDecide?.(active.id, kind)
+    onStep?.(+1)
+  }, [active, onDecide, onStep])
+
+  const undoActive = useCallback(() => {
+    if (!active) return
+    onUndo?.(active.id)
+  }, [active, onUndo])
+
+  const openActive = useCallback((e) => {
+    e.preventDefault()
+    if (active) onOpenDetail?.(active.id)
+  }, [active, onOpenDetail])
+
+  useHotkeys('arrowRight', (e) => { e.preventDefault(); onStep?.(+1) },
+    { enabled: open, enableOnFormTags: false }, [open, onStep])
+  useHotkeys('arrowLeft',  (e) => { e.preventDefault(); onStep?.(-1) },
+    { enabled: open, enableOnFormTags: false }, [open, onStep])
+
+  useHotkeys('k', () => decideAndAdvance('keep'),   { enabled: open }, [open, decideAndAdvance])
+  useHotkeys('m', () => decideAndAdvance('maybe'),  { enabled: open }, [open, decideAndAdvance])
+  useHotkeys('r', () => decideAndAdvance('reject'), { enabled: open }, [open, decideAndAdvance])
+
+  useHotkeys('u',      undoActive, { enabled: open }, [open, undoActive])
+  useHotkeys('meta+z', undoActive, { enabled: open }, [open, undoActive])
+
+  useHotkeys('space', openActive, { enabled: open }, [open, openActive])
+  useHotkeys('enter', openActive, { enabled: open }, [open, openActive])
+
+  useHotkeys('escape', () => onClose?.(), { enabled: open }, [open, onClose])
+
+  if (!open || !active) return null
+
+  const zoom = uiScaleZoom()
+  const p = place(anchorRect, zoom, bottomReserved(zoom))
   const activeTone = DECISION[active.decision]
   const borderColor = activeTone ? activeTone.color : HAIRLINE
 
@@ -210,8 +298,7 @@ export function GroupScrubPreview({
 
   return createPortal(
     <div
-      onMouseEnter={onPanelEnter}
-      onMouseLeave={onPanelLeave}
+      data-group-scrub="true"
       style={{
         position: 'fixed',
         left: p.left,
@@ -277,22 +364,52 @@ export function GroupScrubPreview({
           {activeTone ? activeTone.label : 'Undecided'}
         </span>
 
+        {/* The panel's keys aren't guessable from a hover affordance, and
+            hovering IS the whole entry point — so it says so, quietly, in the
+            corner of the frame rather than as another row of chrome. */}
+        <span style={{
+          position: 'absolute', bottom: 8, left: 8,
+          ...chipStyle('rgba(255,255,255,0.55)'),
+          fontWeight: 500,
+          letterSpacing: 0.2,
+        }}>
+          ← → step · K M R decide · U undo
+        </span>
+
         <span style={{
           position: 'absolute', top: 8, right: 8,
           ...chipStyle('#cecece'),
           fontVariantNumeric: 'tabular-nums',
         }}>
-          {index + 1} / {members.length}
+          {idx + 1} / {members.length}
         </span>
       </div>
 
       {/* Position bar — one segment per member, tinted by that member's own
           decision. Doubles as a map of how the whole burst was culled: three
           coral and one amber says at a glance that the moment survived. */}
-      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, marginTop: 8, height: 5 }}>
+      <div
+        ref={barRef}
+        onMouseMove={scrubFromBar}
+        onClick={(e) => { e.stopPropagation(); scrubFromBar(e) }}
+        title="Sweep to step through the burst"
+        style={{
+          position: 'relative',
+          display: 'flex',
+          alignItems: 'flex-end',
+          gap: 2,
+          marginTop: 8,
+          height: 5,
+          cursor: 'pointer',
+        }}
+      >
+        {/* A 5px-tall target is not a target. This grows the hit area into the
+            dead margins above and below without changing the layout `place()`
+            budgeted for (BAR_BLOCK). */}
+        <div aria-hidden style={{ position: 'absolute', left: 0, right: 0, top: -6, bottom: -6 }} />
         {members.map((m, i) => {
           const tone = DECISION[m.decision]
-          const on = i === index
+          const on = i === idx
           return (
             <div
               key={m.id}

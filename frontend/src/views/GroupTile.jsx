@@ -62,7 +62,9 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
   // (selection is per-photo). Render them visibly disabled.
   isSelectMode = false,
   onDragOver, onDragLeave, onDrop,
-  // Hover-scrub peek (hooks/useGroupScrub.js). Sweeping across the tile steps
+  // Peek panel (hooks/useGroupScrub.js). A CLICK opens it — alongside, not
+  // instead of, selecting the tile; double-click still opens the loupe.
+  // Sweeping across the tile steps
   // through its members in a panel anchored below. Stable object identity, so
   // it doesn't defeat this component's memo().
   scrub,
@@ -103,18 +105,19 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
     <button
       type="button"
       tabIndex={-1}
-      onClick={disabled ? undefined : onSelect}
+      onClick={disabled ? undefined : (e) => {
+        onSelect?.()
+        scrub?.onClick(e, group.images || undecidedImages)
+      }}
       onDoubleClick={disabled ? undefined : onOpen}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
-      onMouseEnter={disabled ? undefined : (e) => scrub?.onEnter(e, group.images || undecidedImages)}
       onMouseMove={disabled ? undefined : scrub?.onMove}
-      onMouseLeave={scrub?.onLeave}
       aria-disabled={disabled || undefined}
       className={`relative block w-full text-left bg-transparent rounded-lg transition-[transform,opacity] ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       style={{ opacity }}
-      title={disabled ? 'Groups can’t be multi-selected — exit Select first' : `${group.size} similar photos · double-click to open`}
+      title={disabled ? 'Groups can’t be multi-selected — exit Select first' : `${group.size} similar photos · click to peek · double-click to open`}
     >
       {/* Stacked-paper edges — peeking out behind the hero card to read as a
           stack at a glance. Two thin offset cards, restrained so the tile still
@@ -226,15 +229,16 @@ function DecidedGroupTileImpl({
     <button
       type="button"
       tabIndex={-1}
-      onClick={disabled ? undefined : onSelect}
+      onClick={disabled ? undefined : (e) => {
+        onSelect?.()
+        scrub?.onClick(e, scrubMembers)
+      }}
       onDoubleClick={disabled ? undefined : onOpen}
-      onMouseEnter={disabled ? undefined : (e) => scrub?.onEnter(e, scrubMembers)}
       onMouseMove={disabled ? undefined : scrub?.onMove}
-      onMouseLeave={scrub?.onLeave}
       aria-disabled={disabled || undefined}
       className={`group/run relative block w-full text-left bg-transparent rounded-lg transition-[transform,opacity] ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       style={{ opacity }}
-      title={disabled ? 'Groups can’t be multi-selected — exit Select first' : `${count} ${decisionWord} in this group · double-click to review`}
+      title={disabled ? 'Groups can’t be multi-selected — exit Select first' : `${count} ${decisionWord} in this group · click to peek · double-click to review`}
     >
       <StackedPaperEdges />
 

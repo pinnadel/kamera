@@ -4,6 +4,57 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## Group peek: click to open, and a real grouped/ungrouped filter (2026-09-17)
+
+Three asks in one pass. The filter one turned out not to be a bug.
+
+**"Group photos" was never a group filter.** It's `composition: 'group'` — `face_count > 1`, i.e. *more than one person in the frame* — sitting in the composition list next to Portraits and Landscape. That's why it showed ungrouped photos: the four singles in the screenshot each have two people in them, and the one burst that came with them had a member scoring 2+ faces. The filter was doing its job; its label was claiming someone else's. Renamed to **"Multiple people"**, and the file now says in as many words that composition is about what's in the frame while grouping is about burst membership, so the next person doesn't re-merge them.
+
+**A filter on burst membership now exists** — it didn't before. New `grouping: 'grouped' | 'ungrouped'` dimension, orthogonal to composition and AND-ed like every other category, with both directions selectable (only "show me groups" was ever expressible, and only by accident). "Grouped" means *member of a burst of ≥2*, independent of how the grid renders it — a burst whose other members are already decided still shows its last undecided member as a plain tile, and that photo is still grouped. The predicate lives outside `filterPredicate` because an image row carries no membership; the caller passes the lookup. It's applied at ITEM level in `displayGridItems`, not just per image: a group tile is grouped by definition and is dropped wholesale under "Ungrouped" — testing its members with `.some()` would have kept it, since every member individually answers "no, I'm not ungrouped" the wrong way round.
+
+**The peek panel opens on click now, not on hover**, and the click scrolls its tile up under the sticky header so the panel gets the whole remaining viewport (it already sizes itself to the room it's given). Consequences worth knowing:
+
+- **Most of the hover machinery is gone.** Dwell, grace period, the latch, and the document-level mousemove watcher all existed to make a panel survive a pointer that was only ever passing through. A pinned panel needs none of it. What stayed is everything about *steering*: tile sweep, position bar, arrow keys, the axis lock, the keyboard pin.
+- **Dismissal is explicit**: Esc, a click anywhere outside, or a click on the tile again. The anchor's own click is deliberately not handled by the outside-click watcher — mousedown lands before click, so closing there would let the toggle re-open it a moment later.
+- **A 220ms arm window** sits between the click and the panel, purely so double-click still reaches GroupLoupe / the partners overlay. Without it the first of the two clicks would open the panel *and scroll the grid* before the second arrived. It's on par with the 180ms hover dwell it replaced. A second click on a *different* tile inside that window isn't a double-click — it abandons the pending open and arms the new one.
+- **Scroll-then-measure, never the reverse.** The panel is placed against the tile's rect, so it has to be measured after the scroll lands: `scrollend` where it exists, a 420ms cap where it doesn't (older WebKit, the PWA shim). The "scrolling closes the panel" rule now ignores a guarded window around our own scroll, including the momentum tail that arrives after the panel is already up.
+- **The floating bottom toolbar is reserved for.** `place()` measured room against the raw viewport, so a panel hanging below put its action row — the row you actually reach for — under the toolbar. Now measured off `[data-bottom-bar]` rather than hard-coded, since the bar's height changes with what it hosts and it vanishes entirely inside DetailView.
+
+Opening still maps the click's x onto the burst, so clicking the right-hand end of a tile opens on a late frame — same mapping the hover sweep had.
+
+---
+
+## The hover-scrub panel takes the keyboard (2026-09-17)
+
+The group hover-scrub panel (2026-08-03) could already show you the whole burst behind a Reject tile and let you re-cull a frame — but only by clicking its buttons. Philipp wanted the keyboard: while the panel is up, ←/→ step the burst and K/M/R decide the shown frame and advance to the one on its right, so a group can be worked through without the pointer ever leaving the tile.
+
+**Ownership.** The panel now binds its own hotkeys (`ui/GroupScrubPreview.jsx`) the way `GroupLoupe` does, and `useKeyboard.js` gained a `scrubOpen` gate that backs it off wholesale — arrows, K/M/R, U/Cmd+Z, Space, Enter, Esc. Without that gate both layers answer one keypress and fire two `/decision` posts against two different photos: the panel's frame and whatever the grid cursor happens to be parked on. (Same failure the DetailView gate exists to prevent.)
+
+**One index, two gestures.** Pointer and keyboard drive the same scrub index; whichever acted last is the one showing. Two pieces make that work:
+- A keyboard step pins the pointer's x (`RETAKE_PX = 6`). The tile's `mousemove` only takes the scrub back once the pointer has genuinely travelled — otherwise the smallest twitch of a resting hand snaps you back to the frame under a stationary cursor the instant you press →.
+- The panel's position bar is now a scrub surface of its own (hover + click), with the hit area grown into the dead margins above and below without changing the height `place()` budgeted for. Once the pointer is inside the panel no `mousemove` reaches the tile at all, so before this the scrub was frozen exactly where the controls are.
+
+**Axis intent — the scrub stops when the hand turns.** Sweeping the tile and then heading down into the panel means crossing the rest of the tile on the way out, and on a 13-frame burst a 40px sideways drift during that trip is three photos — you arrive at the panel looking at the wrong one. So the tracker freezes the scrub once the gesture reads as vertical, and releases it on clearly horizontal movement again (`AXIS_LOCK_RATIO` 1.0 / `AXIS_UNLOCK_RATIO` 1.3 — the asymmetry is hysteresis, or a 45° gesture flaps).
+
+The part worth keeping is *what the direction is measured over*. The first cut used a 90ms time window and a minimum vertical travel, and it broke slow sweeps: a 4-second pass across the tile covers ~6px per window, which is the same size as the hand's own wobble, so the ratio is reading noise and it froze 90% of the sweep. Replacing the time window with a **travel window** — the direction is read over the most recent 18px of actual movement, whenever that took — normalises both speeds: a sweep reads as 18 across / 3 down whether it took 300ms or 4s, and a resting hand's jitter never accumulates 18px so it never reaches the test at all. Simulated against synthetic gestures before shipping: realistic sweeps (500ms–6s, drift up to ±20px) never lock; every exit — straight down, diagonal, slow, and the sweep-then-turn case — locks within 0.1–0.6 frames of horizontal drift.
+
+The dwell timer needed the same guard. Re-entering the tile from the panel restarts it, and its `measure()` snaps the index to the pointer's x — which would have walked straight past the lock on the return trip. It now leaves an already-open panel alone while the axis is locked; a *first* open still goes through, since there's nothing on screen to protect yet and it has to land on some frame.
+
+**The latch — the non-obvious half.** Deciding a photo can unmount the very tile the pointer is resting on: in the Rejects view, rescuing a frame drops it from the filtered grid, React removes the node, and the browser fires a `mouseleave` the user never performed. The panel would tear itself down on the first K. So the first key or decision *latches* the pass: the tile's own `mouseleave` stops being trusted, and a document-level `mousemove` watcher takes over the job of noticing a real departure — anywhere that isn't the panel (`[data-group-scrub]`) or a still-mounted anchor tile starts the same 240ms grace countdown, with `LATCH_SLOP = 10` of slack so the tile vanishing under a stationary cursor doesn't count as walking away. The watcher only schedules once; restarting the timer on every `mousemove` would mean a pointer that keeps moving never times out.
+
+**Space goes full screen and comes back where you left.** Space/Enter on the panel opens the shown frame in DetailView — now carrying the burst with it as a group context, so ←/→ cycle the burst's members rather than the global grid order. Space or Esc in there closes DetailView and *rebuilds the panel on the frame DetailView ended on*, whether you got there by navigating or by culling. Hover can't rebuild that — the pointer may be nowhere near the tile by then — so the pass is parked before `detailOpen` suspends the hook (`stash()`) and replayed on the way out (`restore(imageId)`). The anchor is re-measured if it's still mounted; the parked rect is the fallback for a tile the cull has since dropped from the filtered grid.
+
+Three things this needed underneath:
+- **K/M/R in a scrub-opened DetailView doesn't close it.** Group mode normally closes on a decision, because `sendDecision` advances the *global* grid cursor and would walk out of the burst. This path gets its own handler that advances within the burst instead, and a new `closeOnDecide={false}` on DetailView — Space/Esc stays the user's own way back.
+- **Esc and Space now share one exit.** Both routed through `App.closeDetail()`, which is also what the X button and the backdrop call, so the hand-back can't be bypassed. Space closing DetailView is no longer gated on grid focus (Esc already wasn't) — a full-screen surface shouldn't care what holds focus behind it.
+- **The re-entry snap had to be plugged.** Dismissing DetailView re-fires `mouseenter` on the tile underneath a cursor that never moved, and the tile's dwell timer ends with a `measure()` that snaps the index to the pointer's x — the restored frame would have been overwritten ~180ms after appearing. The dwell now leaves an already-open panel alone while the index is held (axis lock or keyboard pin), and `restore()` pins at the pointer's last known x so the frame stands until a genuine sideways move.
+
+**Decisions always post, even redundant ones.** Pressing K on a frame that is already a Keep still sends it. Only a *manual* decision writes a `training_samples` row, so confirming an auto-cull is real signal — and `move_photo` is a documented no-op when the destination folder hasn't changed. (The panel's Keep *button* stays disabled in that state; the key is the confirm gesture.)
+
+Also folded in: `suspended` now covers CompareView and any non-grid `activeView`. Both mount full-screen surfaces with their own K/M/R bindings, and a panel left open behind one would have collided with them.
+
+---
+
 ## Fixed: IQA + Aesthetic silently blank for a whole batch (process-wide model-load lock, 2026-08-28)
 
 Found while verifying DNG support, fixed the same day. On a cold process the TOPIQ-NR and TOPIQ-IAA scores intermittently came back `None` for **every photo in the batch** — no crash, no toast, no user-visible error. Just two empty columns, which reads as "the model didn't have an opinion" rather than "the model never loaded."
