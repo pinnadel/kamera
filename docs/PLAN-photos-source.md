@@ -1,5 +1,7 @@
 # Apple Photos as a source type
 
+> Open follow-ups live in [PLAN-photos-next.md](PLAN-photos-next.md) — start there.
+
 How KaMeRa culls an Apple Photos album without exporting anything, why it is
 built the way it is, and how to test it safely.
 
