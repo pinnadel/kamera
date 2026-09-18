@@ -130,7 +130,7 @@ export function SettingsView({ back, addToast, reloadImages }) {
             <Section title="Files & previews" icon={FileImage}>
               <ToggleRow
                 label="Send rejected photos to system Trash"
-                tooltip="When enabled, R presses move photos to the OS Trash via send2trash instead of the local _Trash/ subfolder. Restorable from Finder/Explorer."
+                tooltip="When enabled, R presses move photos to the OS Trash via send2trash instead of the local _Rejects/ subfolder. Restorable from Finder/Explorer."
                 checked={!!merged.reject_to_system_trash}
                 onChange={v => set('reject_to_system_trash', v)}
               />

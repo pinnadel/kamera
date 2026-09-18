@@ -13,7 +13,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { API } from '../api'
-import { makeNewTab, makeReadyTab } from '../tabs'
+import { makeNewTab, makeReadyTab, isPhotosTab } from '../tabs'
 
 export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }) {
 
@@ -44,6 +44,12 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
   const setSelectedGroupId = useCallback((valueOrFn) => {
     updateActiveTab(t => ({
       selectedGroupId: typeof valueOrFn === 'function' ? valueOrFn(t.selectedGroupId) : valueOrFn,
+    }))
+  }, [updateActiveTab])
+
+  const setSelectedDecidedGroupKey = useCallback((valueOrFn) => {
+    updateActiveTab(t => ({
+      selectedDecidedGroupKey: typeof valueOrFn === 'function' ? valueOrFn(t.selectedDecidedGroupKey) : valueOrFn,
     }))
   }, [updateActiveTab])
 
@@ -89,6 +95,9 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
 
   // ── Folder-restore on launch ─────────────────────────────────────────────
   // GET /folders + /watch → build initial tab list. Runs once on mount.
+  // Which tab the Photos album picker will fill, or null when it is closed.
+  // Mirrors the subfolderRequest / overwriteRequest pattern.
+  const [photosPickerRequest, setPhotosPickerRequest] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError]     = useState(null)
 
@@ -103,7 +112,13 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
         const folders = foldersData.folders || []
         const liveFolder = watchData.folder || null
         const restored = folders.map(f => ({
-          ...makeReadyTab(f.source_folder),
+          // source_type comes straight from the DB column; a Photos album also
+          // carries its display label, since its source_folder is an opaque URI.
+          ...makeReadyTab(f.source_folder, {
+            kind: f.source_type === 'photos' ? 'photos' : 'batch',
+            label: f.label || null,
+            libraryPath: f.library_path || null,
+          }),
           watchLive: f.source_folder === liveFolder,
         }))
         if (liveFolder && !folders.some(f => f.source_folder === liveFolder)) {
@@ -156,6 +171,11 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     if (activeTab.watchLive) return
     if (activeTab.status !== 'ready') return
     if (!activeTab.folderPath) return
+    // "The file vanished, so drop the row" is the wrong question for an album:
+    // an asset removed from the album leaves its original on disk, and an
+    // iCloud offload removes a file for a photo that is perfectly fine. The
+    // backend refuses too — this just saves the round trip.
+    if (isPhotosTab(activeTab)) return
     let cancelled = false
     fetch(`${API}/sync-folder`, {
       method: 'POST',
@@ -185,6 +205,8 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     if (!activeTab) return
     if (activeTab.status !== 'ready') return
     if (!activeTab.folderPath) return
+    // No directory to walk, so no Resume banner for Photos albums in v1.
+    if (isPhotosTab(activeTab)) return
     let cancelled = false
     const include = activeTab.includeSubfolders ? '&include_subfolders=true' : ''
     fetch(`${API}/folders/unfinished?folder_path=${encodeURIComponent(activeTab.folderPath)}${include}`)
@@ -219,14 +241,18 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
   const [errorsExpanded, setErrorsExpanded] = useState(false)
   const [skippedExpanded, setSkippedExpanded] = useState(false)
 
-  const runAnalysisForTab = useCallback(async (tabId, path, includeSubfolders = false) => {
+  // Shared by both source types. `path` is whatever the backend will report as
+  // source_folder — a real directory for a folder tab, a photos:// URI for an
+  // album — so the /analyze-progress poll's tab matcher works either way.
+  // `extraTabFields` carries the source-specific bits (kind, label, library).
+  const startAnalysis = useCallback(async (tabId, path, endpoint, body, extraTabFields = {}) => {
     setTabs(prev => {
       const idx = prev.findIndex(t => t.id === tabId)
       if (idx === -1) return prev
       const target = prev[idx]
       const updated = { ...target, folderPath: path, status: 'analyzing',
         analyzeResult: null, resultDismissed: false, progress: null,
-        loaded: false, images: [], includeSubfolders }
+        loaded: false, images: [], ...extraTabFields }
       const wasTrailingEmpty = idx === prev.length - 1 && target.status === 'empty'
       if (wasTrailingEmpty) {
         // The "+" button now sits left of the tab strip. New analyses should
@@ -241,10 +267,10 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     setSkippedExpanded(false)
 
     try {
-      const res = await fetch(`${API}/analyze-folder`, {
+      const res = await fetch(`${API}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ folder_path: path, include_subfolders: includeSubfolders }),
+        body: JSON.stringify(body),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`)
@@ -270,6 +296,94 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
           ? { ...t, status: 'ready', analyzeResult: data, progress: null, loaded: false }
           : t))
       }
+    } catch (err) {
+      if (err.message === 'Analysis already running') {
+        // The backend batch never actually stopped (reload, or "Resume
+        // analysis" clicked on a tab whose 'analyzing' status this frontend
+        // session never learned about) — this 409 means "reattach," not
+        // "fail." Keep the tab in 'analyzing' so the /analyze-progress
+        // poller's folderPath fallback (usePolling.js) picks the live batch
+        // back up and the progress bar reappears on its own.
+        setTabs(prev => prev.map(t => t.id === tabId
+          ? { ...t, status: 'analyzing', analyzeResult: null, progress: null }
+          : t))
+        return
+      }
+      setTabs(prev => prev.map(t => t.id === tabId
+        ? { ...t, status: 'error', analyzeResult: { error: err.message }, progress: null }
+        : t))
+    }
+  }, [setTabs])
+
+  const runAnalysisForTab = useCallback((tabId, path, includeSubfolders = false) => (
+    startAnalysis(
+      tabId, path, '/analyze-folder',
+      { folder_path: path, include_subfolders: includeSubfolders },
+      { includeSubfolders },
+    )
+  ), [startAnalysis])
+
+  // The album's source_folder key is computed by the backend (it hashes the
+  // library path), so it comes back in the response rather than being built
+  // here — the tab binds to it only once the analysis has actually started.
+  // There is no album equivalent of the tkinter folder picker — tkinter can
+  // only choose directories — so this opens our own modal instead.
+  const startPhotosAnalysis = useCallback((tabId) => {
+    const busyTab = tabs.find(t => t.status === 'analyzing')
+    if (busyTab && busyTab.id !== tabId) {
+      setBusyRequest({ tabId: busyTab.id, folderPath: busyTab.folderPath })
+      return
+    }
+    setPhotosPickerRequest({ tabId })
+  }, [tabs])
+
+  const dismissPhotosPicker = useCallback(() => setPhotosPickerRequest(null), [])
+
+  const runPhotosAnalysisForTab = useCallback(async (tabId, libraryPath, albumUuid, albumName) => {
+    setPhotosPickerRequest(null)
+    let sourceFolder = null
+    try {
+      const res = await fetch(`${API}/analyze-photos-album`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ library_path: libraryPath, album_uuid: albumUuid }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`)
+      sourceFolder = data.source_folder
+
+      setTabs(prev => {
+        const idx = prev.findIndex(t => t.id === tabId)
+        if (idx === -1) return prev
+        const target = prev[idx]
+        const updated = {
+          ...target,
+          folderPath: sourceFolder,
+          kind: 'photos',
+          label: data.album_name || albumName,
+          libraryPath,
+          status: data.status === 'started' ? 'analyzing' : 'ready',
+          analyzeResult: data.status === 'started' ? null : data,
+          resultDismissed: false,
+          progress: null,
+          loaded: false,
+          images: [],
+          _pendingSkipped: data.skipped || [],
+          photosSkipped: {
+            missingOriginals: data.missing_originals || 0,
+            videos: data.skipped_videos || 0,
+            unsupported: data.skipped_unsupported || 0,
+          },
+        }
+        const wasTrailingEmpty = idx === prev.length - 1 && target.status === 'empty'
+        if (wasTrailingEmpty) {
+          const others = prev.filter(t => t.id !== tabId)
+          return [updated, ...others, makeNewTab()]
+        }
+        return prev.map(t => t.id === tabId ? updated : t)
+      })
+      setErrorsExpanded(false)
+      setSkippedExpanded(false)
     } catch (err) {
       setTabs(prev => prev.map(t => t.id === tabId
         ? { ...t, status: 'error', analyzeResult: { error: err.message }, progress: null }
@@ -525,6 +639,7 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     setImages,
     setSelectedIdx,
     setSelectedGroupId,
+    setSelectedDecidedGroupKey,
     setAnalyzing,
     setAnalyzeResult,
     setProgress,
@@ -533,6 +648,10 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     loadImages,
     // Analysis lifecycle
     runAnalysisForTab,
+    runPhotosAnalysisForTab,
+    photosPickerRequest,
+    startPhotosAnalysis,
+    dismissPhotosPicker,
     stopAnalysis,
     stopping,
     setStopping,

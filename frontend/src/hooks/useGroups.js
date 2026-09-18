@@ -225,10 +225,33 @@ export function useGroups({ images, activeTab, addToast, loadModelInfo }) {
 
   // The currently-open group, or null. Recomputed when enrichedGroups
   // changes so live decisions update what the loupe renders.
-  const loupeGroup = useMemo(
-    () => enrichedGroups.find(g => g.best_image_id === loupeGroupId) || null,
-    [enrichedGroups, loupeGroupId],
-  )
+  //
+  // loupeGroupId IS a best_image_id snapshot, not a stable group key. If a
+  // background analysis drops a new, higher-scoring photo into the group
+  // the user has open, the group's best_image_id changes server-side and
+  // the exact match below would miss — which would fire the "group
+  // disappeared" close effect further down and boot the user out of the
+  // loupe. Since the old hero is still a member of the group (just no
+  // longer its best), fall back to finding the group that still contains
+  // it, so the loupe stays open on the same group across a hero handoff.
+  const loupeGroup = useMemo(() => {
+    if (loupeGroupId == null) return null
+    const exact = enrichedGroups.find(g => g.best_image_id === loupeGroupId)
+    if (exact) return exact
+    return enrichedGroups.find(g => g.images.some(img => img.id === loupeGroupId)) || null
+  }, [enrichedGroups, loupeGroupId])
+
+  // Keep loupeGroupId synced to the resolved group's current best_image_id.
+  // Without this, once loupeGroup is found via the member-id fallback above,
+  // every future render keeps missing the exact match and re-doing the
+  // fallback scan — harmless but wasteful, and it'd leave loupeGroupId
+  // permanently stale (e.g. for the "B" set-group-hero flow, which expects
+  // it to track the current hero).
+  useEffect(() => {
+    if (loupeGroup && loupeGroup.best_image_id !== loupeGroupId) {
+      setLoupeGroupId(loupeGroup.best_image_id)
+    }
+  }, [loupeGroup, loupeGroupId])
 
   // Re-anchor: if an anchor is pending and the current loupeGroup either
   // doesn't exist or doesn't contain the anchor photo, find a group that

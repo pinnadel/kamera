@@ -10,9 +10,14 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS
+from backend.constants import (
+    SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif,
+    is_raw_format, companion_stem_matches, has_processed_sibling,
+    is_photos_source_folder,
+)
 from backend.database import get_db
-from backend.state import PREVIEW_CACHE_DIR, _personal_model, _progress
+from backend.routers.settings import get_raw_jpeg_display_mode
+from backend.state import PREVIEW_CACHE_DIR, _decision_move_lock, _personal_model, _progress
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,58 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _filter_raw_jpeg_pairs(rows: list[dict]) -> list[dict]:
+    """
+    Hide one member of each detected RAW+JPEG (or RAW+standalone-HIF) pair
+    per the raw_jpeg_display_mode setting. Mode 'both' is a no-op (today's
+    behaviour). A "pair" is two rows in the same source_folder whose
+    filenames share a stem and whose formats are on opposite sides of the
+    RAW/processed split.
+
+    Orphans (a RAW or JPEG with no same-stem sibling in this result set) are
+    always kept regardless of mode — the filter only ever hides one half of
+    an actual detected pair, never a photo the user has no other copy of.
+
+    A row with analysis_status='skipped' (analysis_mode=jpeg_priority — see
+    settings.py) is ALWAYS hidden here, unconditionally on raw_jpeg_display_mode.
+    It exists only so K/M/R decisions can mirror onto it and move it with its
+    processed sibling; it has no scores and was never meant to render as a
+    tile.
+    """
+    rows = [r for r in rows if r.get("analysis_status") != "skipped"]
+
+    mode = get_raw_jpeg_display_mode()
+    if mode == "both":
+        return rows
+
+    # Group candidate rows by (source_folder, stem) to find pairs cheaply.
+    #
+    # Photos rows are never grouped, so they can never land in hide_ids and are
+    # always returned. Pairing is a folder concept — two files sharing a stem in
+    # one directory. Hiding one half of a "pair" inside an album would also
+    # leave it unmirrored (the decision mirror is gated on the same capability),
+    # i.e. permanently undecided and invisible.
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        if row.get("source_type") == "photos":
+            continue
+        key = (row.get("source_folder"), Path(row["filename"]).stem.lower())
+        groups.setdefault(key, []).append(row)
+
+    hide_ids: set[int] = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue  # orphan — no companion in this result set, always shown
+        raw_members = [r for r in members if is_raw_format(r.get("format"))]
+        processed_members = [r for r in members if not is_raw_format(r.get("format"))]
+        if not raw_members or not processed_members:
+            continue  # same-stem rows that aren't actually a RAW/processed pair
+        losers = processed_members if mode == "raw" else raw_members
+        hide_ids.update(r["id"] for r in losers)
+
+    return [r for r in rows if r["id"] not in hide_ids]
 
 
 def _delete_image_rows(ids: list[int]) -> int:
@@ -88,7 +145,7 @@ def list_images(source_folder: str | None = None):
     base_sql = """
         SELECT
             i.id, i.file_path, i.filename, i.camera, i.format,
-            i.shot_at, i.preview_path, i.source_folder,
+            i.shot_at, i.preview_path, i.source_folder, i.source_type,
             i.focal_length_mm, i.aperture, i.shutter_speed, i.iso,
             i.sharpness_score, i.exposure_score, i.overall_score,
             i.highlight_clip_pct, i.shadow_clip_pct,
@@ -103,7 +160,7 @@ def list_images(source_folder: str | None = None):
             i.iqa_score, i.aesthetic_score,
             i.manual_group_id,
             i.explanation,
-            d.decision
+            d.decision, d.reason
         FROM images i
         LEFT JOIN decisions d ON d.image_id = i.id
     """
@@ -117,13 +174,19 @@ def list_images(source_folder: str | None = None):
             rows = conn.execute(base_sql + " ORDER BY i.imported_at DESC").fetchall()
 
     rows_dicts = [dict(row) for row in rows]
+    rows_dicts = _filter_raw_jpeg_pairs(rows_dicts)
 
     # Annotate with personal_score if the model has been trained.
     # predict_batch() calls pipeline.predict() once for all N rows — fast.
+    #
+    # Photos-album rows are scored None regardless: _personal_model is trained
+    # on the 'folder' corpus only, so running it over iPhone HEICs would emit a
+    # confident number from a model that has never seen that distribution. A
+    # separate Photos model is deferred until its corpus is worth training.
     if _personal_model.ready:
         personal_scores = _personal_model.predict_batch(rows_dicts)
         for img, ps in zip(rows_dicts, personal_scores):
-            img["personal_score"] = ps
+            img["personal_score"] = None if img.get("source_type") == "photos" else ps
     else:
         for img in rows_dicts:
             img["personal_score"] = None
@@ -169,18 +232,27 @@ def list_folders():
     Return distinct source folders that currently have analyzed images.
 
     Used by the multi-tab UI on launch to rebuild one tab per folder.
+
+    `source_type` tells the UI which kind of tab to rebuild. `label` and
+    `library_path` are only populated for Photos albums, whose source_folder is
+    an opaque photos:// URI — without the label the tab bar would show a raw
+    album UUID, since it otherwise renders the last path segment.
     """
     with get_db() as conn:
         rows = conn.execute(
             """
             SELECT
-                source_folder,
-                COUNT(*)            AS image_count,
-                MAX(imported_at)    AS last_imported_at
-            FROM images
-            WHERE source_folder IS NOT NULL
-            GROUP BY source_folder
-            ORDER BY MAX(imported_at) DESC
+                i.source_folder,
+                COUNT(*)              AS image_count,
+                MAX(i.imported_at)    AS last_imported_at,
+                MAX(i.source_type)    AS source_type,
+                a.album_name          AS label,
+                a.library_path        AS library_path
+            FROM images i
+            LEFT JOIN photos_albums a ON a.source_folder = i.source_folder
+            WHERE i.source_folder IS NOT NULL
+            GROUP BY i.source_folder
+            ORDER BY MAX(i.imported_at) DESC
             """
         ).fetchall()
     return {"folders": [dict(r) for r in rows]}
@@ -205,26 +277,41 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
         "unfinished":     int   # total_on_disk - done_count
       }
 
-    Skips conventional decision subfolders (_Keeps / _Maybes / _Trash) to
+    Skips conventional decision subfolders (_Keeps / _Maybes / _Rejects) to
     match analyze_folder's walk semantics — otherwise a freshly-moved photo
     would count as "unfinished" forever.
     """
+    # Walks the filesystem — there is nothing to walk for an album. The
+    # Resume banner is folder-only for now.
+    if is_photos_source_folder(folder_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Unfinished counts are not available for Photos albums",
+        )
+
     folder = Path(folder_path)
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
+
+    def _is_analyzable(f: Path) -> bool:
+        if f.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return False
+        if f.suffix.lower() == ".hif" and not is_standalone_hif(f):
+            return False  # RAW+HIF sidecar — moves with its RAF, never analyzed alone
+        return True
 
     if include_subfolders:
         skip_dirs = DECISION_SUBFOLDERS
         candidates = [
             f for f in folder.rglob("*")
             if f.is_file()
-            and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            and _is_analyzable(f)
             and not any(part in skip_dirs for part in f.relative_to(folder).parts)
         ]
     else:
         candidates = [
             f for f in folder.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            if f.is_file() and _is_analyzable(f)
         ]
 
     total_on_disk = len(candidates)
@@ -243,8 +330,21 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
                 (str(folder),),
             ).fetchall()
         }
+        skipped_raw_paths = {
+            row[0] for row in conn.execute(
+                "SELECT file_path FROM images WHERE analysis_status = 'skipped' AND source_folder = ?",
+                (str(folder),),
+            ).fetchall()
+        }
 
-    done_count = sum(1 for f in candidates if str(f) in done_paths)
+    # A 'skipped' RAW (jpeg_priority analysis mode) still counts as "finished"
+    # here as long as its processed sibling is still on disk — otherwise the
+    # Resume-analysis banner would nag forever about a RAW that was
+    # intentionally left unscored. See analyze_folder's identical guard.
+    still_skippable = {p for p in skipped_raw_paths if has_processed_sibling(Path(p))}
+    resolved_paths = done_paths | still_skippable
+
+    done_count = sum(1 for f in candidates if str(f) in resolved_paths)
     return {
         "folder_path": str(folder),
         "total_on_disk": total_on_disk,
@@ -269,14 +369,28 @@ def sync_folder(request: ClearFolderRequest):
             detail="Analysis is running for this folder — wait or stop it first.",
         )
 
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, file_path FROM images WHERE source_folder = ?",
-            (request.source_folder,),
-        ).fetchall()
+    # "The file is gone, so drop the row" is wrong in BOTH directions for a
+    # Photos album. Removing an asset from the album leaves the original file
+    # sitting in the library (stale row survives), and an iCloud offload of a
+    # still-perfectly-fine photo makes its original vanish from disk (row and
+    # decision deleted for no reason). Album membership, not file existence,
+    # is the right predicate there — deferred, so for now simply never reap.
+    if is_photos_source_folder(request.source_folder):
+        return {"status": "skipped", "images_removed": 0, "previews_removed": 0}
 
-    missing_ids = [r["id"] for r in rows if not Path(r["file_path"]).exists()]
-    previews_removed = _delete_image_rows(missing_ids)
+    # Read + existence-check under _decision_move_lock so this can't observe a
+    # photo mid-move (file already relocated on disk, file_path not updated
+    # yet) and wrongly conclude the row is orphaned. See the incident note on
+    # _decision_move_lock in backend/state.py.
+    with _decision_move_lock:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, file_path FROM images WHERE source_folder = ?",
+                (request.source_folder,),
+            ).fetchall()
+
+        missing_ids = [r["id"] for r in rows if not Path(r["file_path"]).exists()]
+        previews_removed = _delete_image_rows(missing_ids)
 
     return {
         "status": "synced",

@@ -329,3 +329,133 @@ def test_set_manual_group_rejects_join_without_target(patched_db):
     with pytest.raises(HTTPException) as exc:
         set_manual_group(_make_request(image_ids=[1], mode="join_group"))
     assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Stale singleton anchor reclaim — regression for "groupings lost after
+# reload" (2026-07-25). Removing one photo from a 2-member anchored group
+# used to leave the other member pinned to the old anchor forever: a size-1
+# anchor bucket never renders (the ≥2 rule) AND can never rejoin
+# auto-clustering (non-NULL manual_group_id always short-circuits into the
+# anchor phase) — so the survivor silently vanished from every future
+# /similarity-groups response, appearing as "the group disappeared on
+# reload" even though nothing about reload itself was at fault.
+# ---------------------------------------------------------------------------
+
+
+def test_singletons_mode_reclaims_stale_partner(patched_db):
+    """Removing one photo from a 2-member anchored group ('Remove from
+    group' in GroupLoupe) must clear the OTHER member's stale anchor too,
+    not just mint a fresh anchor for the removed photo."""
+    from backend.routers.model import set_manual_group
+    conn = _open_conn(patched_db)
+    _insert_image(conn, 1, manual_group_id="pair-anchor")
+    _insert_image(conn, 2, manual_group_id="pair-anchor")
+    conn.close()
+
+    # Remove photo 1 only — mirrors GroupLoupe's "Remove from group" button,
+    # which calls mode='singletons' with just the selected ids.
+    resp = set_manual_group(_make_request(image_ids=[1], mode="singletons"))
+    assert resp["updated"] == 1
+
+    conn = _open_conn(patched_db)
+    rows = {r["id"]: r["manual_group_id"] for r in conn.execute(
+        "SELECT id, manual_group_id FROM images WHERE id IN (1, 2)"
+    ).fetchall()}
+    conn.close()
+    # Photo 1 got its own fresh singleton anchor (unchanged behaviour).
+    assert rows[1] is not None and rows[1] != "pair-anchor"
+    # Photo 2 must be reclaimed back to NULL — it's alone in "pair-anchor"
+    # now, which would otherwise never render again and could never
+    # auto-cluster either.
+    assert rows[2] is None
+
+
+def test_singletons_mode_leaves_larger_bucket_intact(patched_db):
+    """Removing one photo from a 3-member group must NOT touch the other
+    two — they're still a valid ≥2 group and keep their shared anchor."""
+    from backend.routers.model import set_manual_group
+    conn = _open_conn(patched_db)
+    _insert_image(conn, 1, manual_group_id="trio-anchor")
+    _insert_image(conn, 2, manual_group_id="trio-anchor")
+    _insert_image(conn, 3, manual_group_id="trio-anchor")
+    conn.close()
+
+    set_manual_group(_make_request(image_ids=[1], mode="singletons"))
+
+    conn = _open_conn(patched_db)
+    rows = {r["id"]: r["manual_group_id"] for r in conn.execute(
+        "SELECT id, manual_group_id FROM images WHERE id IN (2, 3)"
+    ).fetchall()}
+    conn.close()
+    assert rows[2] == "trio-anchor"
+    assert rows[3] == "trio-anchor"
+
+
+def test_join_group_reclaims_stale_donor_bucket(patched_db):
+    """Pulling one photo out of a 2-member group to join a different group
+    must reclaim the abandoned donor's lone remaining member."""
+    from backend.routers.model import set_manual_group
+    conn = _open_conn(patched_db)
+    _insert_image(conn, 1, manual_group_id="donor-anchor")
+    _insert_image(conn, 2, manual_group_id="donor-anchor")
+    _insert_image(conn, 10, manual_group_id="target-anchor")
+    conn.close()
+
+    resp = set_manual_group(_make_request(
+        image_ids=[1], mode="join_group", target_image_id=10,
+    ))
+    assert resp["manual_group_id"] == "target-anchor"
+
+    conn = _open_conn(patched_db)
+    rows = {r["id"]: r["manual_group_id"] for r in conn.execute(
+        "SELECT id, manual_group_id FROM images WHERE id IN (1, 2, 10)"
+    ).fetchall()}
+    conn.close()
+    assert rows[1] == "target-anchor"
+    assert rows[10] == "target-anchor"
+    # Photo 2 is now alone in "donor-anchor" — must be reclaimed.
+    assert rows[2] is None
+
+
+def test_clear_mode_reclaims_stale_partner(patched_db):
+    """Clearing one photo out of a 2-member group must reclaim the other
+    member left behind, not just the cleared photo."""
+    from backend.routers.model import set_manual_group
+    conn = _open_conn(patched_db)
+    _insert_image(conn, 1, manual_group_id="pair-anchor")
+    _insert_image(conn, 2, manual_group_id="pair-anchor")
+    conn.close()
+
+    set_manual_group(_make_request(image_ids=[1], mode="clear"))
+
+    conn = _open_conn(patched_db)
+    rows = {r["id"]: r["manual_group_id"] for r in conn.execute(
+        "SELECT id, manual_group_id FROM images WHERE id IN (1, 2)"
+    ).fetchall()}
+    conn.close()
+    assert rows[1] is None
+    assert rows[2] is None
+
+
+def test_new_group_reclaims_stale_donor_bucket(patched_db):
+    """Pulling one photo into a brand-new group must reclaim its old
+    2-member bucket's abandoned partner."""
+    from backend.routers.model import set_manual_group
+    conn = _open_conn(patched_db)
+    _insert_image(conn, 1, manual_group_id="old-anchor")
+    _insert_image(conn, 2, manual_group_id="old-anchor")
+    _insert_image(conn, 3)
+    conn.close()
+
+    resp = set_manual_group(_make_request(image_ids=[1, 3], mode="new_group"))
+    anchor = resp["manual_group_id"]
+
+    conn = _open_conn(patched_db)
+    rows = {r["id"]: r["manual_group_id"] for r in conn.execute(
+        "SELECT id, manual_group_id FROM images WHERE id IN (1, 2, 3)"
+    ).fetchall()}
+    conn.close()
+    assert rows[1] == anchor
+    assert rows[3] == anchor
+    assert rows[2] is None

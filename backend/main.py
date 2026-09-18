@@ -84,6 +84,7 @@ from backend.routers import (
     images,
     model,
     pairwise,
+    photos,
     search,
     settings,
     system,
@@ -137,6 +138,7 @@ app.include_router(decisions.router)
 app.include_router(images.router)
 app.include_router(model.router)
 app.include_router(pairwise.router)
+app.include_router(photos.router)
 app.include_router(search.router)
 app.include_router(settings.router)
 app.include_router(system.router)
@@ -152,6 +154,16 @@ if _DIST.is_dir():
     # Serve JS/CSS/assets directly.
     app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
 
+    # The HTML shell must never be cached: its <script> tag points at a
+    # content-hashed bundle (main-<hash>.js) that changes on every build. If
+    # the browser (or the installed PWA's app_mode_loader) serves a stale
+    # index.html, it references a bundle that no longer exists on disk (404),
+    # and navigations fall back to that stale shell — which is exactly how an
+    # export/download ends up saving index.html instead of the real response.
+    # no-store forces a fresh shell on every launch; the hashed assets under
+    # /assets stay immutably cacheable via StaticFiles.
+    _NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
+
     # Every non-API path returns index.html so React Router works client-side.
     # Exception: if a real file exists in the dist root at that path (e.g.
     # `mobile.html` from the multi-entry build), serve it directly so the
@@ -166,5 +178,8 @@ if _DIST.is_dir():
                 # Path escaped the dist root — refuse and fall through.
                 candidate = None
             if candidate is not None and candidate.is_file():
-                return FileResponse(candidate)
-        return FileResponse(_DIST / "index.html")
+                # HTML shells (index/mobile) must not be cached; other real
+                # files (favicons, manifest) are fine to cache normally.
+                hdrs = _NO_STORE if candidate.suffix == ".html" else None
+                return FileResponse(candidate, headers=hdrs)
+        return FileResponse(_DIST / "index.html", headers=_NO_STORE)

@@ -1,3 +1,37 @@
+// PLAN-keeps-reviewed: "reviewed" state is derived from file_path alone (no
+// DB column — see docs/PLAN-keeps-reviewed.md's Piece 2 data-model note).
+// True only for photos an auto-cull decided 'keep' and that are sitting in
+// plain _Keeps, awaiting a human "Mark reviewed". A manual keep already
+// lands in _Keeps_reviewed directly (Piece 1), so this is false for those.
+export function needsReview(image) {
+  if (image?.decision !== 'keep') return false
+  // A Photos asset never sits in a _Keeps folder — there is no promotion step
+  // to offer. The path check below would already say false for a library path,
+  // but stating it on the source is the honest version of that answer.
+  if (image?.source_type === 'photos') return false
+  const path = image?.file_path
+  if (!path) return false
+  const parts = path.split('/')
+  return parts.includes('_Keeps') && !parts.includes('_Keeps_reviewed')
+}
+
+// "Have I personally looked at this photo yet?" — the grid's "only
+// unconfirmed" filter. Source of truth is decisions.reason (surfaced by
+// GET /images): 'manual' is written by every human K/M/R and by Mark
+// reviewed, every other value names the auto-cull rule that fired.
+//
+// null counts as unconfirmed on purpose, and covers two cases: a photo with
+// no decision at all (open work — it belongs in the filter), and a decision
+// made before migration v49 added the column. Erring toward "show it" is the
+// safe direction; the opposite would let an unseen photo slip through a bulk
+// trash action.
+//
+// Distinct from needsReview() above: that one is keep-only and path-based,
+// and answers the narrower Provenance question "may this be archived yet?".
+export function isUnconfirmed(image) {
+  return image?.reason !== 'manual'
+}
+
 export function formatEta(seconds) {
   if (seconds == null || seconds < 1) return null
   if (seconds < 60) return `${seconds}s`
@@ -23,6 +57,22 @@ export function formatDuration(seconds) {
   if (s === 0 && m === 0) return `${h}h`
   if (s === 0) return `${h}h ${m}m`
   return `${h}h ${m}m ${s}s`
+}
+
+// middleTruncate — shorten a string from the middle so both the beginning
+// and the end stay visible (e.g. "2026-05-09_16-31-07_X100VI_DSCF0761.RAF"
+// → "2026-05-09_16-3…_DSCF0761.RAF"). Tile filenames share a common date
+// prefix and the distinguishing part is the trailing frame number + ext, so
+// CSS `truncate` (which always cuts the tail) hides exactly the part the
+// user scans for. `head`/`tail` are character budgets; total visible length
+// is head + 1 (ellipsis) + tail. Returns the string untouched when it
+// already fits. Width-based truncation isn't possible here (we don't measure
+// the rendered glyphs), so this is a generous character cap — the row still
+// applies overflow-hidden as a hard backstop on very narrow tiles.
+export function middleTruncate(str, head = 16, tail = 13) {
+  const s = str ?? ''
+  if (s.length <= head + tail + 1) return s
+  return `${s.slice(0, head)}…${s.slice(-tail)}`
 }
 
 export function formatShutter(seconds) {

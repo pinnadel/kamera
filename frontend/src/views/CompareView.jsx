@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useHotkeys } from 'react-hotkeys-hook'
 import { X } from 'lucide-react'
 import { API } from '../api'
-import { BTN_ICON } from '../ui/buttons'
+import { BTN_ICON, SELECTION_RING } from '../ui/buttons'
 import { DecisionBadge, ScoreBadge } from '../ui/primitives'
 import { pickHeadlineScore } from '../ui/format'
 
@@ -309,7 +309,7 @@ export function CompareView({ images, onClose, onDecide, onBulkDecide, onUndoIma
           const isFocused = idx === safeIdx
           const decision  = localDecisions[img.id] ?? null
           const ring = isFocused
-            ? 'ring-1 ring-[#5BB8D4]'
+            ? SELECTION_RING
             : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.18)]'
 
           const panelCursor = zoomOn

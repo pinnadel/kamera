@@ -43,6 +43,7 @@ import {
   CircleDot,
   Columns2,
   ExternalLink,
+  Eye,
   Folder,
   FolderInput as FolderInputIcon,
   FolderTree,
@@ -67,8 +68,8 @@ import {
 } from 'lucide-react'
 import { MoveIntoGroupModal } from './modals/MoveIntoGroupModal'
 import { API } from './api'
-import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY } from './ui/buttons'
-import { formatEta, formatDuration } from './ui/format'
+import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, ACTIVE_TOGGLE, ACTIVE_PILL } from './ui/buttons'
+import { formatEta, formatDuration, needsReview, isUnconfirmed } from './ui/format'
 import { Spinner, DecisionWord, Toggle } from './ui/primitives'
 import { DownloadToast, ToastStack } from './ui/toasts'
 import { ShortcutsModal } from './modals/ShortcutsModal'
@@ -76,19 +77,24 @@ import { FEEDBACK_URL } from './version'
 import { ConfirmModal } from './modals/ConfirmModal'
 import { AutoCullModal } from './modals/AutoCullModal'
 import { SettingsModal } from './modals/SettingsModal'
+import { GroupPartnersOverlay } from './modals/GroupPartnersOverlay'
+import { PartnerCountChips, GroupBulkBar } from './ui/TileChips'
+import { GroupScrubPreview } from './ui/GroupScrubPreview'
 import { ImageCard } from './views/ImageCard'
 import { DetailView } from './views/DetailView'
-import { GroupTile } from './views/GroupTile'
+import { GroupTile, DecidedGroupTile } from './views/GroupTile'
 import { GroupLoupe } from './views/GroupLoupe'
 import { CompareView } from './views/CompareView'
 import { TrainingModeView } from './views/TrainingModeView'
 import { PairwiseTrainingView } from './views/PairwiseTrainingView'
 import { DashboardView } from './views/DashboardView'
 import { TabBar } from './views/TabBar'
+import PhotosAlbumPicker from './modals/PhotosAlbumPicker'
 import { TabFoldersForm } from './views/TabFoldersForm'
 import { PersonalModelBanner } from './views/PersonalModelBanner'
+import { PhotosLibraryBanner } from './views/PhotosLibraryBanner'
 import { BannerStates } from './views/BannerStates'
-import { makeNewTab, makeReadyTab, tabLabel } from './tabs'
+import { makeNewTab, makeReadyTab, tabLabel, isPhotosTab } from './tabs'
 import { buildTrainingQueue } from './training'
 import { usePolling } from './hooks/usePolling'
 import { useTabs } from './hooks/useTabs'
@@ -98,7 +104,9 @@ import { useMultiSelect } from './hooks/useMultiSelect'
 import { useUndoStack } from './hooks/useUndoStack'
 import { useSettings } from './hooks/useSettings'
 import { useHideOnScroll } from './hooks/useHideOnScroll'
+import { useGroupScrub } from './hooks/useGroupScrub'
 import { useSort } from './hooks/useSort'
+import { useLocalStorageState } from './hooks/useLocalStorageState'
 import { compareImages as sortComparator } from './sortMetrics'
 import { SortPill } from './ui/SortPill'
 import { FilterPill } from './ui/FilterPill'
@@ -108,7 +116,7 @@ import { ViewPill, GRID_SIZE_OPTIONS } from './ui/ViewPill'
 // surface, so the layout picker would just be a one-row no-op without this.
 const GRID_ONLY_LAYOUT_OPTIONS = [{ id: 'grid', label: 'Grid', Icon: Grid2x2 }]
 import { FILMSTRIP_CHROME_WITH_BADGES, pillBottomAboveStrip, stripHeight } from './ui/filmstripMetrics'
-import { filterPredicate, getActiveFilterLabel } from './filterUtils'
+import { EMPTY_FILTER, filterPredicate, getActiveFilterChips, groupingPredicate, isFilterEmpty } from './filterUtils'
 import { ViewModePill } from './ViewModePill'
 
 export default function App() {
@@ -126,6 +134,17 @@ export default function App() {
     document.documentElement.dataset.uiScale = uiScale
     localStorage.setItem('pca.uiScale', uiScale)
   }, [uiScale])
+  // Grid filename visibility. When OFF, the filename row under each tile is
+  // hidden (the chip row + group summary stay). Pure display preference,
+  // toggled in Settings → Display or with the F key. Default ON. The footer
+  // reserves its text-row height either way, so toggling never reflows the
+  // grid — it only shows/hides the text.
+  const [showFilenames, setShowFilenames] = useState(
+    () => localStorage.getItem('pca.showFilenames') !== '0'
+  )
+  useEffect(() => {
+    localStorage.setItem('pca.showFilenames', showFilenames ? '1' : '0')
+  }, [showFilenames])
   // When ON, the header `+` button auto-opens the OS folder picker. When OFF
   // (default), `+` just navigates to the empty New-analysis page where the
   // user can click "Open folder" themselves.
@@ -147,6 +166,12 @@ export default function App() {
   }, [advanceDir])
   const [toasts, setToasts]               = useState([])
   const [decisionFilter, setDecisionFilter] = useState(null)
+  // "Only unconfirmed" — hides every photo already carrying a human verdict
+  // (decisions.reason === 'manual'), in whichever bucket it currently sits.
+  // Stacks with decisionFilter rather than replacing it, so it works both as
+  // "the rest of my work, everywhere" (All view) and as a per-bucket queue.
+  // Persisted: a culling session spans reloads.
+  const [unconfirmedOnly, setUnconfirmedOnly] = useLocalStorageState('pca.unconfirmedOnly', false)
   // searchInput is the immediately-controlled input value. searchQuery is
   // the debounced value that flows into filtering and HighlightedText. With
   // 741 cards each running a HighlightedText loop, every keystroke previously
@@ -169,10 +194,11 @@ export default function App() {
   const [sortOpen,  setSortOpen]            = useState(false)
   const [filterOpen, setFilterOpen]         = useState(false)
   const [tabSettingsOpen, setTabSettingsOpen] = useState(false)
-  // `filter` is a discriminated-union object (see filterUtils.js): null,
-  // {type:'date', from, to}, {type:'portraits'|'landscape'|'group'}, or
-  // {type:'camera', value}. In-memory only — no persistence.
-  const [filter, setFilter] = useState(null)
+  // `filters` is a multi-filter object (see filterUtils.js):
+  // { cameras: string[], date: {from,to}|null, composition: 'portraits'|
+  // 'landscape'|'group'|null }. Categories combine with AND; cameras OR within
+  // the camera category. In-memory only — no persistence.
+  const [filters, setFilters] = useState(EMPTY_FILTER)
   // Search starts collapsed (icon-only). Click search icon → expand inline
   // with a width transition. Stays open while typed content remains; collapses
   // on outside-click only when the input is empty.
@@ -341,12 +367,18 @@ export default function App() {
   const [compareImages, setCompareImages] = useState([])  // max 4
   const [compareOpen, setCompareOpen]     = useState(false)
   const gridRef = useRef(null)
+  // Sticky header — measured when the scrub panel scrolls a tile up under it.
+  const headerRef = useRef(null)
   // Suppress the launch-time scrollIntoView. selectedIdx defaults to 0 on a
   // restored tab even though the user hasn't actually picked anything, and the
   // grid is sorted — so images[0] is usually nowhere near the visual top.
   // Without this gate the page autoscrolls to a "random" deep tile on open.
   // Flipped to true by the first real cursor movement (arrow nav, click, etc.).
   const userHasNavigatedRef = useRef(false)
+  // Tracks the last decisionFilter the grid-focus effect acted on, so that
+  // effect fires only on an actual filter *switch* (enter Keeps view), not on
+  // every displayGridItems recompute (which churns constantly during a batch).
+  const lastFocusedFilterRef = useRef(null)
 
   // Reveal-on-scroll-up header. Hides the App bar + TabBar (and the filter
   // bar nested inside) when scrolling down, slides them back into view on
@@ -398,12 +430,17 @@ export default function App() {
     setImages,
     setSelectedIdx,
     setSelectedGroupId,
+    setSelectedDecidedGroupKey,
     setAnalyzing,
     setAnalyzeResult,
     setProgress,
     setResultDismissed,
     loadImages,
     runAnalysisForTab,
+    runPhotosAnalysisForTab,
+    photosPickerRequest,
+    startPhotosAnalysis,
+    dismissPhotosPicker,
     stopAnalysis,
     stopping,
     errorsExpanded,
@@ -437,10 +474,65 @@ export default function App() {
   const images          = activeTab?.images          ?? []
   const selectedIdx     = activeTab?.selectedIdx     ?? 0
   const selectedGroupId = activeTab?.selectedGroupId ?? null
+  const selectedDecidedGroupKey = activeTab?.selectedDecidedGroupKey ?? null
+
+  // Keep selectedIdx pointed at the SAME photo when `images` is replaced out
+  // from under it — e.g. a background analysis or Watch Live poll landing new
+  // rows. The backend returns newest-first, so any arrival shifts every
+  // existing photo's index; without this, selectedIdx silently starts
+  // resolving to a different photo (grid selection ring + DetailView jump to
+  // it). We track the previously-selected photo's id AND the previous
+  // selectedIdx together, in one effect, so we can tell "images reshuffled
+  // under an unchanged cursor" (re-resolve) apart from "selectedIdx itself
+  // just moved on purpose" (e.g. sendDecision advancing to the next photo in
+  // the same batch that patched images — trust it, don't fight it). Splitting
+  // this into two separate effects (one keyed on [images] to re-resolve, one
+  // keyed on [images, selectedIdx] to update the ref) raced: the re-resolve
+  // effect always ran first and read a ref that was one render stale, so it
+  // "corrected" a same-tick intentional selectedIdx change back to the OLD
+  // photo's new array position — stranding the cursor on a photo that had
+  // just left the current filtered view (selectedGridIdx -1, no roving
+  // tabIndex, arrow keys dead). Only after the user has actually selected
+  // something (mirrors userHasNavigatedRef's gate — an untouched tab's
+  // selectedIdx defaulting to 0 is fine and shouldn't fight this).
+  const selectedIdRef = useRef(null)
+  const prevSelectedIdxRef = useRef(null)
+  useEffect(() => {
+    if (!userHasNavigatedRef.current) {
+      selectedIdRef.current = images[selectedIdx]?.id ?? null
+      prevSelectedIdxRef.current = selectedIdx
+      return
+    }
+    const selectedIdxUnchanged = prevSelectedIdxRef.current === selectedIdx
+    const currentId = selectedIdRef.current
+    if (selectedIdxUnchanged && currentId != null && images[selectedIdx]?.id !== currentId) {
+      // Cursor didn't move, but the photo under it did — images reshuffled
+      // (new arrivals, re-sort, etc.). Re-resolve to the SAME photo's new
+      // position.
+      const newIdx = images.findIndex(img => img.id === currentId)
+      if (newIdx >= 0 && newIdx !== selectedIdx) {
+        prevSelectedIdxRef.current = newIdx
+        setSelectedIdx(newIdx)
+        return
+      }
+      // else: the selected photo left `images` entirely (moved by a decision
+      // elsewhere) — leave selectedIdx as-is, existing decision-handling code
+      // paths already manage that case explicitly.
+    }
+    selectedIdRef.current = images[selectedIdx]?.id ?? null
+    prevSelectedIdxRef.current = selectedIdx
+  }, [images, selectedIdx]) // eslint-disable-line react-hooks/exhaustive-deps
   const analyzing       = activeTab?.status === 'analyzing'
   const progress        = activeTab?.progress        ?? null
   const analyzeResult   = activeTab?.analyzeResult   ?? null
   const resultDismissed = activeTab?.resultDismissed ?? false
+  // Watch-live indicator (the /watch path, e.g. Provenance's Import & Analyze)
+  // — separate from `analyzing` (the /analyze-folder batch path). Files
+  // trickle in continuously so there's no fixed total; liveAnalyzed+liveLeft
+  // is a live-updating "session so far" denominator, not a real batch size.
+  const liveAnalyzing   = !analyzing && !!activeTab?.liveAnalyzing
+  const liveLeft        = activeTab?.liveLeft     ?? 0
+  const liveAnalyzed    = activeTab?.liveAnalyzed ?? 0
 
   // ── Semantic search fetch (depends on activeTab being defined above) ─────────
   useEffect(() => {
@@ -464,7 +556,9 @@ export default function App() {
 
   // ── Quit (production launcher only) ──────────────────────────────────────
   const [quitting, setQuitting] = useState(false)
+  const [quitConfirmOpen, setQuitConfirmOpen] = useState(false)
   async function quitApp() {
+    setQuitConfirmOpen(false)
     setQuitting(true)
     try { await fetch(`${API}/quit`, { method: 'POST' }) } catch (_) {}
     // Give the server 1s to shut down, then close the tab.
@@ -480,6 +574,9 @@ export default function App() {
     loadModelInfo,
     trainModel,
     trainingModel,
+    exportTasteModel,
+    importTasteModel,
+    importingModel,
     autoGenerate,
     setAutoGenerate,
   } = useSettings({ addToast, loadImages })
@@ -704,7 +801,7 @@ export default function App() {
       ensureTabForFolder(folder)
       setTabs(prev => prev.map(t =>
         t.folderPath === folder
-          ? { ...t, liveAnalyzing: true, liveLeft: watch.in_flight }
+          ? { ...t, liveAnalyzing: true, liveLeft: watch.in_flight, liveAnalyzed: watch.analyzed ?? 0 }
           : t
       ))
       return
@@ -727,7 +824,7 @@ export default function App() {
           // Truly done — clear the indicator on any tab still showing it.
           setTabs(prev => prev.map(t =>
             t.folderPath === folder && t.liveAnalyzing
-              ? { ...t, liveAnalyzing: false, liveLeft: 0 } : t
+              ? { ...t, liveAnalyzing: false, liveLeft: 0, liveAnalyzed: 0 } : t
           ))
         }
       })
@@ -775,7 +872,7 @@ export default function App() {
     const result = await _sendGroupDecision(imageId, decision)
     if (result) {
       setImages(prev => prev.map(img =>
-        img.id === imageId ? { ...img, decision: result.decision, file_path: result.new_path } : img
+        img.id === imageId ? { ...img, decision: result.decision, file_path: result.new_path, reason: 'manual' } : img
       ))
       undoStack.push({
         kind: 'decision',
@@ -804,22 +901,86 @@ export default function App() {
   }, [images, sortField, sortDir])
 
   // ── Grid items ────────────────────────────────────────────────────────────
+  // A group tile represents ONLY the still-undecided remainder of a burst. The
+  // moment a member is decided (K/M/R), it leaves the group tile and renders as
+  // an individual card in its decision's filter view — exactly like a photo that
+  // was never grouped. So:
+  //   • a group with ≥2 undecided members → one group tile (carrying an
+  //     `undecidedImages` view of just those members; the full `group` object is
+  //     preserved untouched for the loupe / ranking / batch actions).
+  //   • a group with exactly 1 undecided member → that lone member as an
+  //     individual (a "group of one" isn't a group).
+  //   • a group with 0 undecided members → no group tile at all.
+  // Un-deciding a photo returns it to undecided, so it re-enters its group's
+  // undecided set on the next render — the split is a live view, never a
+  // mutation of group membership (which stays keyed to similarity clustering).
+  const isUndecided = (img) => !img.decision && img.analysis_status === 'done'
   const gridItems = useMemo(() => {
     const groupByImageId = new Map()
     enrichedGroups.forEach(group => group.images.forEach(img => groupByImageId.set(img.id, group)))
+    // Precompute each group's undecided members (in the group's own member order
+    // so the hero stays first when present). Keyed by best_image_id.
+    const undecidedByGroup = new Map()
+    enrichedGroups.forEach(group => {
+      undecidedByGroup.set(group.best_image_id, group.images.filter(isUndecided))
+    })
     const seen = new Set()
     const items = []
     for (const image of sortedImages) {
       const group = groupByImageId.get(image.id)
-      if (!group) {
+      // No group, or this member is already decided → individual card. A decided
+      // ex-member is just a normal photo in its decision colour.
+      if (!group || !isUndecided(image)) {
         items.push({ type: 'image', image })
-      } else if (!seen.has(group.best_image_id)) {
-        seen.add(group.best_image_id)
-        items.push({ type: 'group', group })
+        continue
       }
+      // Undecided group member: emit the group (or its lone member) once, on the
+      // first undecided member encountered in sort order.
+      if (seen.has(group.best_image_id)) continue
+      seen.add(group.best_image_id)
+      const undecided = undecidedByGroup.get(group.best_image_id) || []
+      if (undecided.length >= 2) {
+        items.push({ type: 'group', group, undecidedImages: undecided })
+      } else if (undecided.length === 1) {
+        items.push({ type: 'image', image: undecided[0] })
+      }
+      // length 0 can't happen here (this member is undecided), but harmless.
     }
     return items
   }, [sortedImages, enrichedGroups])
+
+  // ── Group-partner summary ──────────────────────────────────────────────────
+  // For every photo that belongs to a similarity group (size > 1), how were its
+  // *other* group members decided? Drives the partner-count chips + shared
+  // border in the Rejects/Maybes views: reviewing a culled frame, the user
+  // wants to confirm at a glance that at least one groupmate survived (Keep or
+  // Maybe) — that the moment wasn't thrown away wholesale.
+  //
+  // enrichedGroups already has each member's live decision merged in
+  // (useGroups.enrichedGroups), so counts stay current through undo/re-decide
+  // with no extra wiring. Undecided partners contribute to no chip.
+  //
+  // Shape: Map<imageId, { groupId, counts: {keep,maybe,reject}, members: [...] }>.
+  // `counts` tallies the OTHER members by decision; `members` is the group's full
+  // live member list (used by the chip overlay to show the differently-culled
+  // photos and the current one, sectioned by decision, with per-photo re-cull).
+  // Only grouped photos (size > 1) get an entry; singletons/ungrouped are absent.
+  const partnerSummaryByImageId = useMemo(() => {
+    const summary = new Map()
+    for (const group of enrichedGroups) {
+      for (const img of group.images) {
+        const counts = { keep: 0, maybe: 0, reject: 0 }
+        for (const other of group.images) {
+          if (other.id === img.id) continue
+          if (other.decision === 'keep' || other.decision === 'maybe' || other.decision === 'reject') {
+            counts[other.decision] += 1
+          }
+        }
+        summary.set(img.id, { groupId: group.best_image_id, counts, members: group.images })
+      }
+    }
+    return summary
+  }, [enrichedGroups])
 
   // Groups ordered to match the grid: a group's rank is its position in
   // gridItems (which already reflects the global sort). Any group not
@@ -848,45 +1009,79 @@ export default function App() {
     reject:    images.filter(img => img.decision === 'reject').length,
   }), [images])
 
+  // How many photos in the CURRENT bucket still carry no human verdict — the
+  // "Only unconfirmed" pill's badge. Scoped to the active decision filter so
+  // the number always answers "how much is left in front of me right now";
+  // on the All view that widens to the whole remaining workload, undecided
+  // photos included.
+  const unconfirmedCount = useMemo(() => images.filter(img => {
+    if (!isUnconfirmed(img)) return false
+    if (decisionFilter === null) return true
+    if (decisionFilter === 'undecided') return !img.decision && img.analysis_status === 'done'
+    return img.decision === decisionFilter
+  }).length, [images, decisionFilter])
+
+  // Auto-culled keepers still awaiting a human "mark reviewed" — the "Mark
+  // all reviewed" bulk bar's scope (docs/PLAN-keeps-reviewed.md Piece 3).
+  // Manual keeps never appear here (they skip straight to _Keeps_reviewed).
+  const needsReviewIds = useMemo(
+    () => images.filter(needsReview).map(img => img.id),
+    [images]
+  )
+
   const displayGridItems = useMemo(() => {
     const q = searchQuery.trim().toLowerCase()
 
     let filtered = gridItems
-    // Combined filter pass: groups are kept as groups when ANY member
-    // matches, annotated with a filterContext so GroupTile can render the
-    // partial-match dim + "X of Y kept" footer + mini-badge. Previously
-    // groups were collapsed to their hero photo, which hid any group whose
-    // hero wasn't the decided/matching photo (the original bug: marking a
-    // non-hero as Maybe/Reject made the group disappear from those filter
-    // views entirely).
+    // Combined filter pass. A group tile now holds ONLY undecided members
+    // (decided ones are already individual items from gridItems), so:
+    //   • Individual cards match the decision + composition predicates directly.
+    //   • A group tile is all-undecided by construction, so it only survives the
+    //     Undecided filter (or no decision filter) — never Keeps/Maybes/Rejects.
+    //     Under a composition filter it survives if any of its undecided members
+    //     matches. No filterContext / partial-match summary anymore.
     const decisionMatches = decisionFilter
       ? (img => decisionFilter === 'undecided'
           ? (!img.decision && img.analysis_status === 'done')
           : img.decision === decisionFilter)
       : null
-    const compositionMatches = filter ? filterPredicate(filter) : null
-    const compositionLabel   = filter ? getActiveFilterLabel(filter) : null
-    if (decisionMatches || compositionMatches) {
+    const compositionMatches = isFilterEmpty(filters) ? null : filterPredicate(filters)
+    // Burst membership, asked per photo. partnerSummaryByImageId holds an entry
+    // for every member of every multi-photo group, so presence IS the answer —
+    // but check the member count too rather than trust that invariant from
+    // here: a one-member entry would otherwise make a lone photo "grouped".
+    const groupingMatches = groupingPredicate(filters, (id) => {
+      const summary = partnerSummaryByImageId.get(id)
+      return !!summary && summary.members.length > 1
+    })
+    // "Only unconfirmed": drop anything already carrying a human verdict, so a
+    // photo you promoted out of one bucket never shows up again in the next.
+    // Runs HERE, before the decidedGroup clustering further down, so a
+    // collapsed group run can't re-gather members this filter just removed.
+    const unconfirmedMatches = unconfirmedOnly ? isUnconfirmed : null
+    if (decisionMatches || compositionMatches || groupingMatches || unconfirmedMatches) {
       const passesAll = img =>
         (!decisionMatches    || decisionMatches(img)) &&
-        (!compositionMatches || compositionMatches(img))
+        (!compositionMatches || compositionMatches(img)) &&
+        (!groupingMatches    || groupingMatches(img)) &&
+        (!unconfirmedMatches || unconfirmedMatches(img))
       filtered = filtered.flatMap(item => {
         if (item.type !== 'group') {
           return passesAll(item.image) ? [item] : []
         }
-        const matchingCount = item.group.images.reduce(
-          (n, img) => n + (passesAll(img) ? 1 : 0), 0,
-        )
-        if (matchingCount === 0) return []
-        return [{
-          ...item,
-          filterContext: {
-            decision: decisionFilter || null,
-            label: compositionLabel,
-            matchingCount,
-            total: item.group.size,
-          },
-        }]
+        // Group tile: excluded by any decision filter other than Undecided.
+        if (decisionFilter && decisionFilter !== 'undecided') return []
+        // No unconfirmedMatches check here: a group tile holds only undecided
+        // members by construction, and an undecided photo has no decisions row
+        // and therefore no reason — it is unconfirmed by definition.
+        // A group tile is grouped by definition — no need to ask per member,
+        // and asking would be wrong for 'ungrouped' (every member answers no,
+        // so `.some()` would keep the tile).
+        if (filters?.grouping === 'ungrouped') return []
+        // Composition filter (if any) tests the undecided members only.
+        if (compositionMatches &&
+            !item.undecidedImages.some(compositionMatches)) return []
+        return [item]
       })
     }
     if (searchMode === 'semantic' && semanticResults !== null) {
@@ -919,8 +1114,106 @@ export default function App() {
         return item.group.images.some(img => (img.filename || '').toLowerCase().includes(q))
       })
     }
+
+    // ── Cluster + annotate group members (Rejects/Maybes only) ────────────────
+    // In these views every item is an individual `image` (group tiles only ever
+    // survive the Undecided filter), and members of the same original burst are
+    // scattered by the active sort. Reorder so groupmates sit adjacent so a
+    // group can be wrapped in one shared border, and attach ONE survivor chip
+    // to the run's first tile.
+    //
+    // Chip semantics: a photo *survives* culling if it's a Keep or Maybe. The
+    // chip answers "did any groupmate survive, and how" — so we show the
+    // SURVIVOR buckets (keep, maybe) MINUS the bucket we're currently viewing:
+    //   • Rejects view → "N Keeps" + "N Maybe" chips (survived elsewhere)
+    //   • Maybes  view → "N Keeps" chip only (a better survivor exists)
+    // A group with no such partners keeps its border but shows no chip. The chip
+    // is clickable → opens an overlay listing the differently-culled members
+    // (and the current bucket) with per-photo re-cull; that overlay needs the
+    // group's full member list, carried on `groupChip.members`.
+    // Gated to reject/maybe so All/Undecided/Keeps stay untouched.
+    if (decisionFilter === 'reject' || decisionFilter === 'maybe') {
+      // Which survivor buckets to surface, given the current view.
+      const chipKinds = decisionFilter === 'maybe' ? ['keep'] : ['keep', 'maybe']
+      const survivorCounts = (counts) => {
+        if (!counts) return null
+        const out = {}
+        let any = false
+        for (const kind of chipKinds) {
+          const n = counts[kind] || 0
+          if (n > 0) { out[kind] = n; any = true }
+        }
+        return any ? out : null
+      }
+      // Bucket by groupId, preserving each group's first-appearance order (so
+      // the existing sort still drives the overall sequence). Ungrouped photos
+      // are singletons that stay in place by first appearance.
+      const order = []              // ordered list of bucket keys
+      const buckets = new Map()     // key -> [items]
+      for (const item of filtered) {
+        if (item.type !== 'image') { // defensive; shouldn't occur under K/M/R
+          const k = `__nogroup_${order.length}`
+          order.push(k); buckets.set(k, [item])
+          continue
+        }
+        const summary = partnerSummaryByImageId.get(item.image.id)
+        const key = summary ? `g_${summary.groupId}` : `s_${item.image.id}`
+        if (!buckets.has(key)) { order.push(key); buckets.set(key, []) }
+        buckets.get(key).push(item)
+      }
+      const clustered = []
+      for (const key of order) {
+        const run = buckets.get(key)
+        // A run of ≥2 present members reads as one enclosure; a lone member
+        // (its groupmates live in other decision views) renders like any
+        // ungrouped photo but still gets a chip on the first (only) tile.
+        const drawBorder = key.startsWith('g_') && run.length >= 2
+        // The group's survivor chip + full member list, computed once and hung
+        // on the run's first tile only. `members` comes from partnerSummary
+        // (the same for every member of the run).
+        const firstSummary = run[0].type === 'image'
+          ? partnerSummaryByImageId.get(run[0].image.id)
+          : null
+        const chipCounts = survivorCounts(firstSummary && firstSummary.counts)
+        const groupChip = chipCounts
+          ? { counts: chipCounts, members: firstSummary.members, viewDecision: decisionFilter }
+          : null
+        // Image ids of the members actually rendered in this run — i.e. the
+        // current view's bucket for this group. Hung on the first tile so the
+        // hover bulk-action bar can move the whole visible run in one call
+        // (survivors culled into other buckets are untouched). Only meaningful
+        // when the run draws a shared border (≥2 adjacent members).
+        const runImageIds = drawBorder
+          ? run.filter(it => it.type === 'image').map(it => it.image.id)
+          : null
+        // A run of ≥2 same-group, same-decision members collapses into ONE
+        // DecidedGroupTile (mirrors the Undecided view's GroupTile) instead of
+        // N individual bordered ImageCards. A solo run (this view's only
+        // representative of that group, or an ungrouped photo) still renders
+        // as a plain image item, unchanged.
+        if (drawBorder) {
+          clustered.push({
+            type: 'decidedGroup',
+            groupKey: key,
+            hero: run[0].image,
+            images: run.map(it => it.image),
+            decision: decisionFilter,
+            groupChip,
+            runImageIds,
+          })
+        } else {
+          clustered.push({
+            ...run[0],
+            groupRun: { id: key, position: 'solo', index: 0, length: 1 },
+            groupChip,
+            runImageIds: null,
+          })
+        }
+      }
+      return clustered
+    }
     return filtered
-  }, [gridItems, decisionFilter, filter, searchQuery, searchMode, semanticResults])
+  }, [gridItems, decisionFilter, unconfirmedOnly, filters, searchQuery, searchMode, semanticResults, partnerSummaryByImageId])
 
   // Index of the currently-focused grid cell — drives scrollIntoView and the
   // GroupTile's selection ring. Computed against the filtered/visible list so
@@ -931,10 +1224,15 @@ export default function App() {
         item.type === 'group' && item.group.best_image_id === selectedGroupId
       )
     }
+    if (selectedDecidedGroupKey != null) {
+      return displayGridItems.findIndex(item =>
+        item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
+      )
+    }
     return displayGridItems.findIndex(item =>
       item.type === 'image' && item.image.id === images[selectedIdx]?.id
     )
-  }, [displayGridItems, images, selectedIdx, selectedGroupId])
+  }, [displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
   // If the focused group leaves the visible list (filter change, group
   // dissolves after re-clustering, etc.), drop the group cursor so the user
@@ -947,6 +1245,16 @@ export default function App() {
     if (!stillVisible) setSelectedGroupId(null)
   }, [displayGridItems, selectedGroupId, setSelectedGroupId])
 
+  // Same idea for a focused DecidedGroupTile — e.g. the last visible member
+  // of the run gets bulk-moved out, or the decision filter changes.
+  useEffect(() => {
+    if (selectedDecidedGroupKey == null) return
+    const stillVisible = displayGridItems.some(item =>
+      item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
+    )
+    if (!stillVisible) setSelectedDecidedGroupKey(null)
+  }, [displayGridItems, selectedDecidedGroupKey, setSelectedDecidedGroupKey])
+
   // Scroll selected cell into view AND sync DOM focus to it, so:
   //   - Tab into the grid lands on the highlighted cell.
   //   - Tab out of the grid resumes from the highlighted cell.
@@ -955,9 +1263,23 @@ export default function App() {
   // Only steal focus when it's already inside the grid — never from search,
   // settings, modals, or any other surface. preventScroll avoids the browser
   // double-scrolling on top of our explicit scrollIntoView.
+  //
+  // Gate on the selected photo's ID actually changing (real navigation), not
+  // on `selectedGridIdx` drifting — /images returns newest-first, so a batch
+  // landing new rows shifts the selected photo's grid POSITION underneath it
+  // every poll tick even though selectedIdx still id-tracks the same photo.
+  // Without this gate, every mid-batch arrival re-fired scrollIntoView and
+  // stole DOM focus, yanking the viewport off whatever the user was looking
+  // at. Also skip entirely while a batch is running on the active tab —
+  // belt-and-suspenders so no arrival-triggered re-render can nudge scroll.
+  const lastScrolledIdRef = useRef(null)
   useEffect(() => {
     if (!gridRef.current || selectedGridIdx < 0) return
     if (!userHasNavigatedRef.current) return
+    if (analyzing) return
+    const currentId = images[selectedIdx]?.id ?? null
+    if (currentId != null && currentId === lastScrolledIdRef.current) return
+    lastScrolledIdRef.current = currentId
     const el = gridRef.current.querySelector(`[data-grid-idx="${selectedGridIdx}"]`)
     if (!el) return
     el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
@@ -972,7 +1294,47 @@ export default function App() {
     if (gridRef.current.contains(active) || focusUnowned) {
       el.focus({ preventScroll: true })
     }
-  }, [selectedIdx, selectedGridIdx])
+  }, [selectedIdx, selectedGridIdx, images, analyzing])
+
+  // Move keyboard focus into the grid when the decision filter switches (e.g.
+  // clicking the Keeps/Maybes/Rejects pill). The filter pills decline focus
+  // (onMouseDown preventDefault) to preserve grid focus, but if focus was
+  // *unowned* (document.body, common after a fresh load or scroll) nothing
+  // put it into the grid — so K/M/X, which require gridHasFocus(), silently
+  // no-op until the user clicks a photo. Selecting + DOM-focusing the first
+  // visible photo cell here makes decision keys work the moment you land in a
+  // filtered view. Fires only on an actual filter change (guarded by
+  // lastFocusedFilterRef), never on the constant displayGridItems churn during
+  // a batch. Never steals focus from search/settings/modals — only claims it
+  // when the grid is the active surface and focus is unowned or already inside.
+  useEffect(() => {
+    if (lastFocusedFilterRef.current === decisionFilter) return
+    lastFocusedFilterRef.current = decisionFilter
+    if (activeView !== 'grid') return
+    if (detailOpen || loupeGroup || settingsOpen || filterOpen ||
+        tabSettingsOpen || autoCullOpen || compareOpen || viewOpen) return
+    if (!gridRef.current) return
+    // Only claim focus when nothing else holds it (or the grid already does) —
+    // matches the focus-reclaim tolerance in the scrollIntoView effect above.
+    const active = document.activeElement
+    if (!(gridRef.current.contains(active) || !active || active === document.body)) return
+    const firstPhotoIdx = displayGridItems.findIndex(it => it.type === 'image')
+    if (firstPhotoIdx < 0) return
+    const firstPhoto = displayGridItems[firstPhotoIdx]
+    setSelectedGroupId(null)
+    const i = images.findIndex(img => img.id === firstPhoto.image.id)
+    if (i >= 0) setSelectedIdx(i)
+    // Focus the cell so gridHasFocus() passes for the next K/M/X. Deferred to
+    // the next frame so the roving-tabIndex / data-grid-idx for the new
+    // selection has committed to the DOM before we query for it.
+    userHasNavigatedRef.current = true
+    requestAnimationFrame(() => {
+      const el = gridRef.current?.querySelector(`[data-grid-idx="${firstPhotoIdx}"]`)
+      el?.focus({ preventScroll: true })
+    })
+  }, [decisionFilter, activeView, detailOpen, loupeGroup, settingsOpen,
+      filterOpen, tabSettingsOpen, autoCullOpen, compareOpen, viewOpen,
+      displayGridItems, images, setSelectedGroupId, setSelectedIdx])
 
   // Flip the navigation-gate on the first real user interaction with the grid
   // (pointer down on a tile or any cursor-moving key while focus is in the
@@ -1013,9 +1375,15 @@ export default function App() {
         return
       }
 
+      // `reason` is mirrored optimistically alongside decision/file_path
+      // everywhere a decision is applied or undone. Without it the "only
+      // unconfirmed" filter would keep showing a photo you just decided until
+      // the next /images poll caught up — exactly the double-look the filter
+      // exists to prevent. Undo sets it back to null: the backend deletes the
+      // whole decisions row, and the reason goes with it.
       setImages(prev =>
         prev.map((img, idx) =>
-          idx === selectedIdx ? { ...img, decision, file_path: data.new_path } : img
+          idx === selectedIdx ? { ...img, decision, file_path: data.new_path, reason: 'manual' } : img
         )
       )
       undoStack.push({
@@ -1033,19 +1401,32 @@ export default function App() {
       // not the raw `images` array, so the next stop can be a group tile.
       // Falls back to ±1 in `images` if we can't locate the current photo
       // in the visible list (filter excluded it, race, etc.).
+      // The just-decided photo may not be a standalone `image` entry — if it
+      // was part of a same-decision run collapsed into a DecidedGroupTile
+      // (Maybe/Reject views), it's only reachable via that tile's `images`
+      // list. Treat the tile's position as the photo's position so the step
+      // below still lands on the next real item instead of falling through
+      // to the broken raw-array fallback.
       const curIdx = displayGridItems.findIndex(it =>
-        it.type === 'image' && it.image.id === image.id
+        (it.type === 'image' && it.image.id === image.id) ||
+        (it.type === 'decidedGroup' && it.images.some(img => img.id === image.id))
       )
       const step = advanceDir === 'backward' ? -1 : +1
       const nextItem = curIdx >= 0 ? displayGridItems[curIdx + step] : null
       if (nextItem?.type === 'group') {
+        setSelectedDecidedGroupKey(null)
         setSelectedGroupId(nextItem.group.best_image_id)
+      } else if (nextItem?.type === 'decidedGroup') {
+        setSelectedGroupId(null)
+        setSelectedDecidedGroupKey(nextItem.groupKey)
       } else if (nextItem?.type === 'image') {
         setSelectedGroupId(null)
+        setSelectedDecidedGroupKey(null)
         setSelectedIdx(images.findIndex(img => img.id === nextItem.image.id))
       } else {
         // End of visible list — keep the photo cursor in range as before.
         setSelectedGroupId(null)
+        setSelectedDecidedGroupKey(null)
         setSelectedIdx(prev => advanceDir === 'backward'
           ? Math.max(prev - 1, 0)
           : Math.min(prev + 1, images.length - 1))
@@ -1060,17 +1441,33 @@ export default function App() {
     } catch (err) {
       addToast({ type: 'error', message: `Network error: ${err.message}`, duration: 8000 })
     }
-  }, [images, selectedIdx, advanceDir, loadModelInfo, addToast, setImages, setSelectedIdx, displayGridItems, setSelectedGroupId, undoStack])
+  }, [images, selectedIdx, advanceDir, loadModelInfo, addToast, setImages, setSelectedIdx, displayGridItems, setSelectedGroupId, setSelectedDecidedGroupKey, undoStack])
 
   // ── undoImage — per-photo undo ────────────────────────────────────────────
   // Reverses the decision of a specific image. Called from grid (U-key on the
   // selected photo), GroupLoupe (U on the focused photo in the loupe), and
   // DetailView (U on the open photo). Backend reconstructs previous_path
   // from images.source_folder so the caller doesn't have to remember it.
-  // Silent no-op when the photo has no decision (matches Cmd+Z conventions).
+  // Says so when there is nothing to undo, rather than doing nothing silently.
+  //
+  // This is the most-hit dead end in the app: U reverses the SELECTED photo's
+  // decision, but K/M/R advance the cursor onto the next photo, which is
+  // undecided by definition. The in-memory undo stack normally catches that
+  // case first (runUndo), so pressing U straight after a decision works — but
+  // the stack does not survive a page reload, and then U lands here and did
+  // nothing at all. "Nothing happened" reads as a broken feature; naming the
+  // reason turns it into a one-second correction.
   const undoImage = useCallback(async (imageId) => {
     const img = images.find(i => i.id === imageId)
-    if (!img || !img.decision) return  // nothing to undo
+    if (!img) return
+    if (!img.decision) {
+      addToast({
+        type: 'info',
+        message: 'Nothing to undo here — select a decided photo, then press U',
+        duration: 4000,
+      })
+      return
+    }
 
     try {
       const res = await fetch(`${API}/undo-decision`, {
@@ -1092,13 +1489,63 @@ export default function App() {
         return
       }
       setImages(prev => prev.map(i =>
-        i.id === imageId ? { ...i, decision: null, file_path: data.new_path } : i
+        i.id === imageId ? { ...i, decision: null, file_path: data.new_path, reason: null } : i
       ))
       loadModelInfo()
     } catch (err) {
       addToast({ type: 'error', message: `Undo failed: ${err.message}`, duration: 6000 })
     }
   }, [images, addToast, setImages, loadModelInfo])
+
+  // ── markReviewed — release an auto-culled keeper to Provenance ────────────
+  // The human counterpart to the manual-K routing: auto-cull keeps land in
+  // plain _Keeps and wait here. Photo stays visible in the Keep-filtered
+  // view (badge, not disappear — see docs/PLAN-keeps-reviewed.md).
+  const markReviewed = useCallback(async (imageId) => {
+    try {
+      const res = await fetch(`${API}/mark-reviewed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_id: imageId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        addToast({ type: 'error', message: data.detail || `Mark reviewed failed (${res.status})`, duration: 6000 })
+        return
+      }
+      setImages(prev => prev.map(img =>
+        img.id === imageId ? { ...img, file_path: data.new_path, reason: 'manual' } : img
+      ))
+    } catch (err) {
+      addToast({ type: 'error', message: `Network error: ${err.message}`, duration: 6000 })
+    }
+  }, [addToast, setImages])
+
+  const bulkMarkReviewed = useCallback(async (imageIds) => {
+    setBulkRunning(true)
+    try {
+      const res = await fetch(`${API}/bulk-mark-reviewed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_ids: imageIds }),
+      })
+      const data = await res.json()
+      await loadImages()
+      const moved = data.moved ?? 0
+      const failed = data.errors?.length ?? 0
+      if (failed > 0) {
+        addToast({ type: 'warning', message: `${moved} marked reviewed · ${failed} failed`, duration: 6000 })
+      } else {
+        addToast({ type: 'info', message: `${moved} photo${moved !== 1 ? 's' : ''} marked reviewed` })
+      }
+    } catch (e) {
+      console.error('Bulk mark-reviewed failed:', e)
+      addToast({ type: 'error', message: 'Could not mark photos reviewed — server error' })
+    } finally {
+      setBulkRunning(false)
+      setBulkConfirm(null)
+    }
+  }, [loadImages, addToast])
 
   // ── Training mode ─────────────────────────────────────────────────────────
   const enterTrainingMode = useCallback(() => {
@@ -1178,6 +1625,51 @@ export default function App() {
     }
   }, [images, loadImages, loadModelInfo, addToast, undoStack])
 
+  // Exchange two frames' decisions in one action — "this frame deserves the
+  // Keep slot, not that one" from the group-scrub panel. Needs two
+  // /bulk-decision calls because the endpoint carries a single decision per
+  // request, but pushes ONE undo entry and refreshes once, so the swap
+  // reverses as the single gesture it reads as.
+  const swapDecisions = useCallback(async ({ promoteId, promoteTo, demoteId, demoteTo }) => {
+    if (promoteId == null || demoteId == null || promoteId === demoteId) return
+    const prevOf = (id) => images.find(i => i.id === id)?.decision ?? null
+    const prevPromote = prevOf(promoteId)
+    const prevDemote  = prevOf(demoteId)
+    const post = async (ids, decision) => {
+      const res = await fetch(`${API}/bulk-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_ids: ids, decision }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `Swap failed (${res.status})`)
+      }
+    }
+    try {
+      // Vacate before filling, so the target bucket never transiently holds
+      // both frames — a mid-swap crash then leaves a gap, not a duplicate.
+      await post([demoteId], demoteTo)
+      await post([promoteId], promoteTo)
+      undoStack.push({
+        kind: 'decision',
+        label: 'swap',
+        items: [
+          { id: demoteId,  prev: prevDemote,  next: demoteTo },
+          { id: promoteId, prev: prevPromote, next: promoteTo },
+        ],
+        timestamp: Date.now(),
+      })
+      await loadImages()
+      loadModelInfo()
+    } catch (err) {
+      addToast({ type: 'error', message: err.message, duration: 8000 })
+      // The first leg may have landed — resync so the UI can't disagree with
+      // what's actually on disk.
+      await loadImages()
+    }
+  }, [images, loadImages, loadModelInfo, addToast, undoStack])
+
   // Open DetailView from inside the GroupLoupe. Sets the global selectedIdx
   // to the focused photo and stores a group context so DetailView's prev/next
   // cycle within the group instead of the global images array.
@@ -1221,10 +1713,16 @@ export default function App() {
     }
     if (nextItem.type === 'group') {
       setSelectedGroupId(nextItem.group.best_image_id)
-    } else {
+    } else if (nextItem.type === 'image') {
       setSelectedGroupId(null)
       const i = images.findIndex(img => img.id === nextItem.image.id)
       if (i >= 0) setSelectedIdx(i)
+    } else {
+      // decidedGroup can't actually be adjacent to an undecided `group` item
+      // in the same displayGridItems run (they render under mutually
+      // exclusive decisionFilter values), but guard defensively rather than
+      // dereference nextItem.image on an unexpected shape.
+      setSelectedGroupId(null)
     }
   }, [loupeGroup, exitLoupe, displayGridItems, images, setSelectedIdx, setSelectedGroupId, setDetailOpen, setDetailGroupContext])
 
@@ -1319,6 +1817,130 @@ export default function App() {
   // under the cursor only, not the whole selection (matches Finder behaviour).
   const [tileMenu, setTileMenu] = useState(null)
 
+  // Group-partners overlay: { imageId, viewDecision } of the clicked chip, or
+  // null. Members are re-read live from partnerSummaryByImageId each render so
+  // re-culls restructure it. Close it if the decision filter changes out from
+  // under it (the chip only exists in the reject/maybe views).
+  const [partnersOverlay, setPartnersOverlay] = useState(null)
+  useEffect(() => {
+    if (partnersOverlay && decisionFilter !== partnersOverlay.viewDecision) {
+      setPartnersOverlay(null)
+    }
+  }, [decisionFilter, partnersOverlay])
+
+  // Hover-scrub peek on group tiles: sweeping across a tile steps through the
+  // burst's members in a panel anchored below it. Suspended whenever a
+  // full-screen surface owns the view or the grid is in select mode — those
+  // don't reliably produce the mouseleave that would otherwise close it.
+  // Height the opening scroll has to keep clear so the tile doesn't land
+  // under the sticky header. Read live at click time rather than stored: the
+  // header hides itself on scroll-down and its height varies with the band
+  // count (multi-select toolbar, filter chips).
+  const headerTopInset = useCallback(() => {
+    const el = headerRef.current
+    if (!el) return 0
+    const r = el.getBoundingClientRect()
+    // Translated up out of view — it will not be covering the tile.
+    return r.bottom > 0 ? r.height : 0
+  }, [])
+
+  const {
+    scrub: groupScrub,
+    preview: groupScrubPreview,
+    stash: stashGroupScrub,
+    restore: restoreGroupScrub,
+  } = useGroupScrub({
+    suspended: !!loupeGroup || detailOpen || !!partnersOverlay || gridMultiSelect.isSelectMode
+      || compareOpen || activeView !== 'grid',
+    topInset: headerTopInset,
+  })
+
+  // Burst the scrub panel handed to DetailView (Space/Enter), by its group id.
+  // Set means "DetailView is on loan from the panel": prev/next cycle the
+  // burst, K/M/R advance inside it, and closing hands the screen back.
+  const [scrubDetailGroupId, setScrubDetailGroupId] = useState(null)
+
+  // Derived live rather than snapshotted, so decisions made in DetailView are
+  // reflected in its group filmstrip instead of leaving the opening state on
+  // screen — same reason the panel itself re-reads its members every render.
+  const scrubDetailGroup = useMemo(() => {
+    if (scrubDetailGroupId == null) return null
+    const summary = partnerSummaryByImageId.get(scrubDetailGroupId)
+    if (!summary) return null
+    return { best_image_id: scrubDetailGroupId, images: summary.members }
+  }, [scrubDetailGroupId, partnerSummaryByImageId])
+
+  // Open DetailView on the frame the hover-scrub panel is showing (Space /
+  // Enter while it's up). Unlike the grid's double-click path this carries the
+  // burst with it: prev/next cycle the group's members, not the global grid
+  // order, so the way back is always to a frame the panel can actually show.
+  const openDetailFromScrub = useCallback((imageId) => {
+    const idx = images.findIndex(img => img.id === imageId)
+    if (idx < 0) return
+    const summary = partnerSummaryByImageId.get(imageId)
+    // Park the pass BEFORE detailOpen suspends the hook and wipes it.
+    stashGroupScrub()
+    setSelectedGroupId(null)
+    setSelectedDecidedGroupKey(null)
+    setSelectedIdx(idx)
+    setDetailGroupContext(null)
+    setScrubDetailGroupId(summary ? summary.groupId : null)
+    setDetailOpen(true)
+  }, [images, partnerSummaryByImageId, stashGroupScrub, setSelectedIdx, setSelectedGroupId, setSelectedDecidedGroupKey])
+
+  // The one way out of DetailView — X, backdrop, Esc and Space all land here.
+  // When it was opened from the scrub panel, closing rebuilds that panel on
+  // whichever frame DetailView ended on, so navigating or culling in there
+  // returns you to the burst where you actually left it rather than to the
+  // grid. `restoreGroupScrub` runs in the same batch as detailOpen going
+  // false, so the hook's suspend never sees a frame to tear down.
+  const closeDetail = useCallback(() => {
+    setDetailOpen(false)
+    setDetailGroupContext(null)
+    if (scrubDetailGroupId != null) {
+      setScrubDetailGroupId(null)
+      restoreGroupScrub(images[selectedIdx]?.id)
+    }
+  }, [scrubDetailGroupId, restoreGroupScrub, images, selectedIdx])
+
+  // Other paths close DetailView without going through closeDetail — chiefly
+  // closeLoupeAndAdvance, when a decision resolves the last undecided member
+  // of the burst. Those hand back to the grid on purpose (the group is done),
+  // but the flag has to come off or the NEXT DetailView would believe it was
+  // on loan from a panel that is no longer there.
+  useEffect(() => {
+    if (!detailOpen && scrubDetailGroupId != null) setScrubDetailGroupId(null)
+  }, [detailOpen, scrubDetailGroupId])
+
+  // K/M/R inside a scrub-opened DetailView. Deliberately NOT sendDecision:
+  // that advances the global grid cursor, which walks straight out of the
+  // burst. This steps within the burst instead — the same "judge this one,
+  // show me the next" the panel does, just full screen — and never closes,
+  // so Space/Esc stays the user's own way back.
+  const scrubDetailDecide = useCallback(async (decision) => {
+    const img = images[selectedIdx]
+    if (!img) return
+    const members = scrubDetailGroup?.images || []
+    const i = members.findIndex(m => m.id === img.id)
+    // Advance off the CURRENT array, before awaiting: bulkDecide reloads
+    // images, and this closure would then be looking the successor up in a
+    // stale list. A decision never adds or drops rows, so the index holds.
+    if (i >= 0 && i < members.length - 1) {
+      const nextIdx = images.findIndex(x => x.id === members[i + 1].id)
+      if (nextIdx >= 0) setSelectedIdx(nextIdx)
+    }
+    await bulkDecide([img.id], decision)
+  }, [images, selectedIdx, scrubDetailGroup, bulkDecide, setSelectedIdx])
+
+  // Open the partners overlay for a collapsed DecidedGroupTile by its groupKey
+  // (used by keyboard Enter/Space when a decidedGroup cell is focused — the
+  // same overlay the tile's survivor chip / double-click already open).
+  const openPartnersOverlay = useCallback((groupKey) => {
+    const item = displayGridItems.find(it => it.type === 'decidedGroup' && it.groupKey === groupKey)
+    if (!item) return
+    setPartnersOverlay({ imageId: item.hero.id, viewDecision: item.decision })
+  }, [displayGridItems])
+
   // Photo-onto-photo drop hover. Independent of dropHoverGroupId because a
   // photo can be hovered while a GroupTile is also under the same drag, and
   // the visuals shouldn't fight.
@@ -1360,7 +1982,7 @@ export default function App() {
       const patchMap = new Map(patches.map(p => [p.id, p]))
       setImages(prevImgs => prevImgs.map(img => {
         const p = patchMap.get(img.id)
-        return p ? { ...img, decision, file_path: p.new_path } : img
+        return p ? { ...img, decision, file_path: p.new_path, reason: 'manual' } : img
       }))
       undoStack.push({
         kind: 'decision',
@@ -1380,6 +2002,48 @@ export default function App() {
       })
     }
   }, [gridMultiSelect.selected, images, setImages, loadModelInfo, addToast, undoStack])
+
+  // bulkSendUndo — revert every selected photo to undecided in one keystroke.
+  // The undo counterpart to bulkSendDecision: same "act on the whole selection"
+  // contract that K/M/R already honour, so U / Cmd+Z is consistent with them.
+  // Mirrors undoImage per-photo (parallel /undo-decision calls) rather than the
+  // global stack, because a multi-selection is an explicit "these photos"
+  // instruction, not "the last thing I did". Undecided members are skipped
+  // (nothing to reverse); failures are reported the same way as bulk decide.
+  const bulkSendUndo = useCallback(async () => {
+    const ids = Array.from(gridMultiSelect.selected).filter(id => {
+      const img = images.find(i => i.id === id)
+      return img && img.decision
+    })
+    if (ids.length === 0) return
+    const results = await Promise.allSettled(ids.map(id =>
+      fetch(`${API}/undo-decision`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_id: id }),
+      }).then(async r => {
+        const data = await r.json().catch(() => ({}))
+        if (!r.ok) throw new Error(data.detail || `${r.status}`)
+        return { id, new_path: data.new_path }
+      })
+    ))
+    const patches = results.filter(r => r.status === 'fulfilled').map(r => r.value)
+    const failures = results.filter(r => r.status === 'rejected').length
+    if (patches.length > 0) {
+      const patchMap = new Map(patches.map(p => [p.id, p]))
+      setImages(prevImgs => prevImgs.map(img => {
+        const p = patchMap.get(img.id)
+        return p ? { ...img, decision: null, file_path: p.new_path, reason: null } : img
+      }))
+    }
+    loadModelInfo()
+    if (failures > 0) {
+      addToast({
+        type: 'error',
+        message: `${patches.length} reverted, ${failures} failed`,
+        duration: 5000,
+      })
+    }
+  }, [gridMultiSelect.selected, images, setImages, loadModelInfo, addToast])
 
   // runUndo — pops the top of the undo stack and replays the inverse.
   // Called by U / Cmd+Z from any surface (grid, loupe, detail, compare).
@@ -1418,7 +2082,7 @@ export default function App() {
         setImages(prev => prev.map(img => {
           const p = patchMap.get(img.id)
           if (!p) return img
-          return { ...img, decision: p.decision, file_path: p.new_path }
+          return { ...img, decision: p.decision, file_path: p.new_path, reason: p.decision === null ? null : 'manual' }
         }))
       }
       loadModelInfo()
@@ -1475,6 +2139,13 @@ export default function App() {
   }, [])
 
   const amendLastDecision = useCallback(async (decision) => {
+    // Amend is a single-photo "fix my last press" gesture keyed off whatever
+    // landed on top of the shared undo stack. It has no concept of the
+    // current selection, so while multi-select is active it must never fire —
+    // otherwise a double-press mid-bulk-action silently re-targets just the
+    // last decision's photo(s) instead of running bulkSendDecision on the
+    // whole selection.
+    if (gridMultiSelect.isSelectMode) return false
     const intent = lastDecisionIntentRef.current
     if (!intent) return false
     if (Date.now() - intent.timestamp > AMEND_WINDOW_MS) return false
@@ -1523,7 +2194,7 @@ export default function App() {
     const patchMap = new Map(patches.map(p => [p.id, p]))
     setImages(prev => prev.map(img => {
       const p = patchMap.get(img.id)
-      return p ? { ...img, decision, file_path: p.new_path } : img
+      return p ? { ...img, decision, file_path: p.new_path, reason: 'manual' } : img
     }))
 
     // Replace the stale entry: keep each item's *original* prev so Undo still
@@ -1548,7 +2219,7 @@ export default function App() {
 
     loadModelInfo()
     return true
-  }, [undoStack, setImages, addToast, loadModelInfo])
+  }, [undoStack, setImages, addToast, loadModelInfo, gridMultiSelect.isSelectMode])
 
   const bulkCompareFromSelection = useCallback(() => {
     const ids = Array.from(gridMultiSelect.selected)
@@ -1646,7 +2317,7 @@ export default function App() {
       await loadImages()
       loadModelInfo()
       setDecisionFilter('reject')
-      addToast({ type: 'info', message: `${ids.length} photos moved to _Trash` })
+      addToast({ type: 'info', message: `${ids.length} photos moved to _Rejects` })
     } catch (e) {
       console.error('Bulk reject failed:', e)
     } finally {
@@ -1662,9 +2333,32 @@ export default function App() {
       const data = await res.json()
       await loadImages()
       setDecisionFilter(null)
-      addToast({ type: 'info', message: `${data.trashed} file${data.trashed !== 1 ? 's' : ''} sent to Trash` })
+      // Report the truth: only `trashed` files verifiably reached the system
+      // Trash. Missing/failed files kept their reject rows (a folder-watching
+      // app may have grabbed them first), so warn instead of claiming success.
+      const trashed = data.trashed ?? 0
+      const notTrashed = (data.skipped_missing ?? 0) + (data.failed ?? 0)
+      // Photos assets cannot be deleted from here at all — Photos exposes no
+      // delete to AppleScript, and PhotoKit refuses this process. Their reject
+      // rows survive, so say so rather than reporting a smaller count with no
+      // explanation.
+      const skippedPhotos = data.skipped_unsupported ?? 0
+      if (skippedPhotos > 0) {
+        addToast({
+          type: 'warning',
+          message: `${trashed} sent to Trash · ${skippedPhotos} in Photos albums can only be deleted in Photos`,
+        })
+      } else if (notTrashed > 0) {
+        addToast({
+          type: 'warning',
+          message: `${trashed} sent to Trash · ${notTrashed} couldn't be trashed (still in your reject list)`,
+        })
+      } else {
+        addToast({ type: 'info', message: `${trashed} file${trashed !== 1 ? 's' : ''} sent to Trash` })
+      }
     } catch (e) {
       console.error('Trash rejects failed:', e)
+      addToast({ type: 'error', message: 'Could not send rejects to Trash — server error' })
     } finally {
       setBulkRunning(false)
       setBulkConfirm(null)
@@ -1681,15 +2375,21 @@ export default function App() {
     activeView,
     detailOpen,
     setDetailOpen,
+    // Single exit from DetailView, so Esc/Space get the scrub-panel hand-back
+    // that the X button and the backdrop already get.
+    closeDetail,
     images,
     selectedIdx,
     setSelectedIdx,
     selectedGroupId,
     setSelectedGroupId,
+    selectedDecidedGroupKey,
+    setSelectedDecidedGroupKey,
     // Walk the *visible* list — filters/search/decision pills change what the
     // user sees, and arrow nav has to match that or it feels broken.
     displayGridItems,
     enterLoupe,
+    openPartnersOverlay,
     sendDecision,
     setUserCols,
     undoImage,
@@ -1703,14 +2403,23 @@ export default function App() {
     // Loupe locks out grid hotkeys — its own useHotkeys (in GroupLoupe.jsx)
     // owns K/M/X/arrows/Enter/S/Z/Esc while open.
     loupeOpen: !!loupeGroup,
+    // So does the hover-scrub panel: while it's up, arrows/K/M/R/U/Space act
+    // on the frame IT is showing (GroupScrubPreview.jsx). Ungated, both layers
+    // would answer one keypress — two /decision posts for the same intent,
+    // against two different photos.
+    scrubOpen: !!groupScrubPreview,
     // Bulk multi-select hooks — when isSelectMode && size>0, K/M/R hit the
-    // whole selection and U undoes the whole bulk action. Otherwise the
-    // per-photo handlers fire as before.
+    // whole selection and U reverts every selected photo to undecided.
+    // Otherwise the per-photo handlers fire as before.
     multiSelectActive: gridMultiSelect.isSelectMode && gridMultiSelect.size > 0,
     bulkSendDecision,
+    bulkSendUndo,
     runUndo,
     amendLastDecision,
     registerDecisionIntent,
+    // F toggles grid filename visibility (mirrors the Settings → Display
+    // switch). Grid-only; gated inside the hook like the other view hotkeys.
+    toggleFilenames: () => setShowFilenames(v => !v),
   })
 
   // ── Render: loading ───────────────────────────────────────────────────────
@@ -1762,6 +2471,43 @@ export default function App() {
 
       {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
       {bannerStatesOpen && <BannerStates onClose={() => setBannerStatesOpen(false)} />}
+
+      {/* Group-partners overlay — opened from a group's survivor chip. Members
+          are read LIVE from partnerSummaryByImageId so a re-cull inside the
+          overlay restructures its sections on the next render. Closes on
+          X / backdrop / ESC and auto-closes when nothing differs anymore. */}
+      {partnersOverlay && (() => {
+        const summary = partnerSummaryByImageId.get(partnersOverlay.imageId)
+        if (!summary) return null   // photo left its group (defensive) → render nothing
+        return (
+          <GroupPartnersOverlay
+            members={summary.members}
+            viewDecision={partnersOverlay.viewDecision}
+            onDecide={sendGroupDecision}
+            onBulkDecide={bulkDecide}
+            onClose={() => setPartnersOverlay(null)}
+          />
+        )
+      })()}
+
+      {/* Hover-scrub panel for group tiles. Members are re-read live from
+          partnerSummaryByImageId each render (same pattern as
+          GroupPartnersOverlay) so a decision made inside the panel restyles it
+          on the spot instead of leaving the opening snapshot on screen. */}
+      {groupScrubPreview && (() => {
+        const anchorId = groupScrubPreview.members[0]?.id
+        const live = anchorId != null ? partnerSummaryByImageId.get(anchorId)?.members : null
+        return (
+          <GroupScrubPreview
+            {...groupScrubPreview}
+            members={live || groupScrubPreview.members}
+            onDecide={(imageId, decision) => bulkDecide([imageId], decision)}
+            onSwap={swapDecisions}
+            onUndo={undoImage}
+            onOpenDetail={openDetailFromScrub}
+          />
+        )
+      })()}
 
       {tileMenu && createPortal(
         <div
@@ -1820,6 +2566,9 @@ export default function App() {
           modelInfo={modelInfo}
           onTrain={trainModel}
           training={trainingModel}
+          onExportModel={exportTasteModel}
+          onImportModel={importTasteModel}
+          importingModel={importingModel}
           onStartTraining={enterTrainingMode}
           undecidedCount={undecidedCount}
           bannerDismissed={bannerDismissed}
@@ -1835,6 +2584,8 @@ export default function App() {
           }}
           uiScale={uiScale}
           onUiScaleChange={setUiScale}
+          showFilenames={showFilenames}
+          onToggleFilenames={() => setShowFilenames(v => !v)}
           advanceDir={advanceDir}
           onAdvanceDirChange={setAdvanceDir}
           groupThreshold={threshold}
@@ -1847,9 +2598,19 @@ export default function App() {
       {autoCullOpen && (
         <AutoCullModal
           folderPath={activeTab?.folderPath || ''}
+          groupThreshold={threshold}
           onClose={() => setAutoCullOpen(false)}
           onComplete={handleAutoCullComplete}
           onToast={addToast}
+        />
+      )}
+
+      {photosPickerRequest && (
+        <PhotosAlbumPicker
+          onClose={dismissPhotosPicker}
+          onPick={(libraryPath, albumUuid, albumName) =>
+            runPhotosAnalysisForTab(photosPickerRequest.tabId, libraryPath, albumUuid, albumName)
+          }
         />
       )}
 
@@ -1913,6 +2674,18 @@ export default function App() {
             setBannerDismissedAtTier(tier)
             setBannerDismissConfirm(false)
           }}
+        />
+      )}
+
+      {quitConfirmOpen && (
+        <ConfirmModal
+          title="Quit KaMeRa?"
+          body="This shuts down the backend server. Any in-progress analysis will be stopped."
+          confirmLabel="Quit"
+          confirmTone="danger"
+          confirmIcon={Power}
+          onCancel={() => setQuitConfirmOpen(false)}
+          onConfirm={quitApp}
         />
       )}
 
@@ -2004,8 +2777,13 @@ export default function App() {
         //     displayGridItems atomically — groups count as one stop. The
         //     focused item can be a solo photo or a group; when it's a
         //     group, the panel renders the hero.
-        const inGroup = !!detailGroupContext
-        const groupImages = detailGroupContext?.images || []
+        //   · scrub-panel mode (scrubDetailGroup set): same group navigation,
+        //     but closing reopens the hover-scrub panel on the frame we end
+        //     on rather than dropping back to the grid.
+        const groupCtx = detailGroupContext ?? scrubDetailGroup
+        const fromScrub = !detailGroupContext && !!scrubDetailGroup
+        const inGroup = !!groupCtx
+        const groupImages = groupCtx?.images || []
 
         // Resolve the *effective* image the panel renders. In grid-filmstrip
         // mode, a group-focused state renders the group's AI hero.
@@ -2033,13 +2811,24 @@ export default function App() {
         const groupIdx = inGroup ? groupImages.findIndex(img => img.id === panelImage.id) : -1
 
         // ── Atomic step over displayGridItems for grid-filmstrip mode ──
+        // A collapsed DecidedGroupTile (Maybe/Reject) isn't something
+        // DetailView can render or open (it has no single "hero" concept the
+        // way an undecided group does — reviewing it belongs to
+        // GroupPartnersOverlay, not the filmstrip) — so it isn't a filmstrip
+        // stop; skip past it in the step direction.
         const stepFilmstrip = (delta) => {
-          const next = displayGridItems[filmstripIndex + delta]
+          let next = displayGridItems[filmstripIndex + delta]
+          let skip = delta
+          while (next && next.type === 'decidedGroup') {
+            skip += delta
+            next = displayGridItems[filmstripIndex + skip]
+          }
           if (!next) return
           if (next.type === 'image') {
             const i = images.findIndex(img => img.id === next.image.id)
-            if (i >= 0) { setSelectedGroupId(null); setSelectedIdx(i) }
+            if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
           } else {
+            setSelectedDecidedGroupKey(null)
             setSelectedGroupId(next.group.best_image_id)
           }
         }
@@ -2061,11 +2850,12 @@ export default function App() {
 
         const pickFilmstripIndex = (idx) => {
           const item = displayGridItems[idx]
-          if (!item) return
+          if (!item || item.type === 'decidedGroup') return
           if (item.type === 'image') {
             const i = images.findIndex(img => img.id === item.image.id)
-            if (i >= 0) { setSelectedGroupId(null); setSelectedIdx(i) }
+            if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
           } else {
+            setSelectedDecidedGroupKey(null)
             setSelectedGroupId(item.group.best_image_id)
           }
         }
@@ -2087,13 +2877,18 @@ export default function App() {
             // In sticky-filmstrip mode there's no explicit detailOpen flag to
             // flip; closing means "go back to thumbnail grid".
             if (stickyFilmstrip) { setGridLayout('grid'); setDetailGroupContext(null); return }
-            setDetailOpen(false); setDetailGroupContext(null)
+            closeDetail()
           }}
-          onDecide={sendDecision}
+          onDecide={fromScrub ? scrubDetailDecide : sendDecision}
+          // A scrub-opened DetailView stays open through a decision: Space or
+          // Esc is the user's own way back to the panel, and closing out from
+          // under them would land them in the grid instead.
+          closeOnDecide={!fromScrub}
           onUndoImage={undoImage}
           onUndo={runUndo}
           onAmend={amendLastDecision}
           onRegisterDecisionIntent={registerDecisionIntent}
+          onMarkReviewed={markReviewed}
           onPrev={onPrev}
           onNext={onNext}
           hasPrev={!!onPrev}
@@ -2102,7 +2897,7 @@ export default function App() {
           onExplanationGenerated={(id, text) =>
             setImages(prev => prev.map(img => img.id === id ? { ...img, explanation: text } : img))
           }
-          groupContext={detailGroupContext}
+          groupContext={groupCtx}
           onPickGroupMember={inGroup ? (id) => {
             const i = images.findIndex(img => img.id === id)
             if (i >= 0) setSelectedIdx(i)
@@ -2176,6 +2971,7 @@ export default function App() {
           active so the selection toolbar (which lives in the filter row)
           stays reachable without scrolling back up. */}
       <div
+        ref={headerRef}
         className="sticky top-0 z-40 bg-[#101111] transition-transform duration-200 ease-out will-change-transform"
         style={{ transform: (headerHidden && !gridMultiSelect.isSelectMode) ? 'translateY(-100%)' : 'translateY(0)' }}
       >
@@ -2212,6 +3008,10 @@ export default function App() {
               } else {
                 setActiveTabId(tabId)
               }
+            }}
+            onTrailingPhotosClick={(tabId) => {
+              setActiveTabId(tabId)
+              startPhotosAnalysis(tabId)
             }}
           />
 
@@ -2258,7 +3058,7 @@ export default function App() {
                 Hidden in dev mode (port 5173) where the terminal is already visible. */}
             {window.location.port === '8000' && (
               <button
-                onClick={quitApp}
+                onClick={() => setQuitConfirmOpen(true)}
                 disabled={quitting}
                 className={`${BTN_ICON} hover:text-[#C97B7B] disabled:opacity-40`}
                 title="Quit KaMeRa"
@@ -2276,8 +3076,12 @@ export default function App() {
             DB's analysis_status='done' set; if the delta is > 0 we show
             a one-click resume. analyze_folder already skips done files,
             so resume == "re-POST analyze," nothing fancier. Hidden while
-            analyzing so the progress bar takes precedence. */}
+            analyzing so the progress bar takes precedence. Also hidden while
+            liveAnalyzing (watch-live import running against this same
+            folder) — otherwise a stale unfinishedCount snapshot offers to
+            "resume" a folder that's actively importing right now. */}
         {!analyzing
+          && !liveAnalyzing
           && activeTab
           && activeTab.status === 'ready'
           && activeTab.folderPath
@@ -2289,6 +3093,7 @@ export default function App() {
               </div>
               <button
                 type="button"
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => runAnalysisForTab(activeTab.id, activeTab.folderPath, activeTab.includeSubfolders)}
                 className="px-2.5 py-1 rounded-md text-xs font-medium bg-[rgba(232,184,74,0.20)] text-[#E8B84A] border border-[rgba(232,184,74,0.40)] hover:opacity-80 transition-opacity whitespace-nowrap"
                 title="Re-run analysis on this folder. Already-analyzed photos skip; only the unfinished ones get processed."
@@ -2301,10 +3106,37 @@ export default function App() {
 
         {/* Band 2 — Contextual toolbar */}
         {((analyzing && progress && progress.total > 0)
+          || liveAnalyzing
           || (!analyzing && analyzeResult && !analyzeResult.error && !resultDismissed)
           || (analyzeResult?.error && !resultDismissed)
         ) && (
         <div className="px-6 py-3 space-y-2">
+
+          {/* Watch-live progress bar — same visual language as the manual
+              progress bar below, but no fixed total (files trickle in as
+              they're imported) so there's no ETA/Stop, just a live count. */}
+          {liveAnalyzing && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs font-mono text-[#8a8a8a]">
+                <span className="truncate text-[#f0f0f0]">Analyzing imported photos…</span>
+                <span className="flex items-center gap-3 text-[#9c9c9d]">
+                  <span className="text-[#8a8a8a]">
+                    {Math.round((liveAnalyzed / Math.max(1, liveAnalyzed + liveLeft)) * 100)}%
+                    &nbsp;{liveAnalyzed}/{liveAnalyzed + liveLeft}
+                  </span>
+                </span>
+              </div>
+              <div className="w-full bg-[#1b1c1e] rounded-[3px] h-1.5">
+                <div
+                  className="bg-[#5BB8D4] h-1.5 rounded-[3px] transition-all duration-300"
+                  style={{ width: `${Math.round((liveAnalyzed / Math.max(1, liveAnalyzed + liveLeft)) * 100)}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-[#9c9c9d]">
+                New photos are analyzed as they arrive — this folder is being watched live.
+              </p>
+            </div>
+          )}
 
           {/* Progress bar + Stop button */}
           {analyzing && progress && progress.total > 0 && (
@@ -2462,6 +3294,7 @@ export default function App() {
             ].map(({ key, label, count, color, Icon }) => (
               <button
                 key={key ?? 'all'}
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => setDecisionFilter(prev => prev === key ? null : key)}
                 className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[14px] font-medium transition-colors whitespace-nowrap ${
                   decisionFilter === key ? 'bg-[#1b1c1e]' : 'hover:bg-[rgba(255,255,255,0.03)]'
@@ -2497,6 +3330,7 @@ export default function App() {
                   const disabled = n < 2 || overCap
                   return (
                     <button
+                      onMouseDown={(e) => e.preventDefault()}
                       onClick={bulkCompareFromSelection}
                       disabled={disabled}
                       title={
@@ -2511,6 +3345,7 @@ export default function App() {
                   )
                 })()}
                 <button
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => setMoveModalOpen(true)}
                   disabled={gridMultiSelect.size === 0}
                   title="Move the selection into an existing group"
@@ -2519,6 +3354,7 @@ export default function App() {
                   <FolderInputIcon size={14} /> Move into group…
                 </button>
                 <button
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => {
                     const ids = Array.from(gridMultiSelect.selected)
                     if (ids.length < 2) return
@@ -2532,13 +3368,39 @@ export default function App() {
                   <Plus size={14} /> New group
                 </button>
                 <button
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => gridMultiSelect.exit()}
                   className="px-2 py-1 rounded text-xs text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.05)] transition-colors"
                 >
                   Cancel
                 </button>
               </>
-            ) : null}
+            ) : (
+              /* Only unconfirmed — stacks on top of the decision filter and
+                 hides everything already carrying a human verdict. Cyan when
+                 on, per the "this control is narrowing" rule (ui/buttons.js).
+                 Kept out of select mode so it never competes with the bulk
+                 actions for the same corner. */
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setUnconfirmedOnly(v => !v)}
+                title={unconfirmedOnly
+                  ? 'Showing only photos you have not decided on yourself — click to show all'
+                  : 'Hide photos you have already decided on yourself, in every bucket'}
+                aria-pressed={unconfirmedOnly}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs border transition-colors ${
+                  unconfirmedOnly
+                    ? ACTIVE_PILL
+                    : 'bg-[#0d0e0f] border-[rgba(255,255,255,0.08)] text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.03)]'
+                }`}
+              >
+                <Eye size={14} />
+                Only unconfirmed
+                {unconfirmedCount > 0 && (
+                  <span className="font-mono tabular-nums">{unconfirmedCount}</span>
+                )}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -2554,14 +3416,50 @@ export default function App() {
               {decisionCounts.undecided} {decisionCounts.undecided === 1 ? 'photo' : 'photos'} undecided
             </span>
             <span className="text-[#6a6b6c] flex items-center gap-1.5">
-              Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">M</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to decide, or let the AI sort them
+              Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">M</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to decide{isPhotosTab(activeTab) ? '' : ', or let the AI sort them'}
             </span>
-            <button
-              onClick={() => setAutoCullOpen(true)}
-              className={`${BTN_PRIMARY} !py-1 !px-3 !text-xs`}
-            >
-              <WandSparkles size={15} /> Auto cull
-            </button>
+            {/* Auto cull runs on the personal model, which trains on the camera
+                corpus and has never seen a Photos album's distribution — so it
+                is absent here rather than present and disabled. */}
+            {!isPhotosTab(activeTab) && (
+              <button
+                onClick={() => setAutoCullOpen(true)}
+                className={`${BTN_PRIMARY} !py-1 !px-3 !text-xs`}
+              >
+                <WandSparkles size={15} /> Auto cull
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Bulk action bar — keep filter (mark reviewed) */}
+        {decisionFilter === 'keep' && needsReviewIds.length > 0 && (
+          <div className="mb-3 flex items-center gap-3 px-3 py-2 bg-[rgba(125,184,154,0.06)] border border-[rgba(125,184,154,0.20)] rounded-lg text-xs">
+            <span className="text-[#7DB89A]/70">
+              {needsReviewIds.length} auto-culled {needsReviewIds.length === 1 ? 'photo' : 'photos'} awaiting review
+            </span>
+            <span className="text-[#6a6b6c]">
+              Reviewed photos release to Provenance for archiving
+            </span>
+            {bulkConfirm === 'mark-all-reviewed' ? (
+              <div className="ml-auto flex items-center gap-2">
+                <span className="text-[#7DB89A]">Mark {needsReviewIds.length} reviewed?</span>
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => bulkMarkReviewed(needsReviewIds)} disabled={bulkRunning}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.20)] border border-[rgba(255,255,255,0.10)] text-[#7DB89A] hover:opacity-70 transition-opacity disabled:opacity-50">
+                  <Check size={14} />
+                  {bulkRunning ? 'Marking…' : 'Confirm'}
+                </button>
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
+                  <X size={14} /> Cancel
+                </button>
+              </div>
+            ) : (
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('mark-all-reviewed')}
+                className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.12)] border border-[rgba(125,184,154,0.30)] text-[#7DB89A] hover:opacity-70 transition-opacity">
+                <Check size={14} /> Mark all reviewed
+              </button>
+            )}
           </div>
         )}
 
@@ -2577,18 +3475,18 @@ export default function App() {
             {bulkConfirm === 'reject-maybes' ? (
               <div className="ml-auto flex items-center gap-2">
                 <span className="text-[#E8B84A]">Reject all {decisionCounts.maybe}?</span>
-                <button onClick={rejectAllMaybes} disabled={bulkRunning}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={rejectAllMaybes} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.20)] border border-[rgba(255,255,255,0.10)] text-[#C97B7B] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
                   {bulkRunning ? 'Moving…' : 'Confirm'}
                 </button>
-                <button onClick={() => setBulkConfirm(null)}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
                   <X size={14} /> Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setBulkConfirm('reject-maybes')}
+              <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('reject-maybes')}
                 className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(232,184,74,0.12)] border border-[rgba(232,184,74,0.30)] text-[#E8B84A] hover:opacity-70 transition-opacity">
                 <Trash2 size={14} /> Reject maybes
               </button>
@@ -2605,30 +3503,38 @@ export default function App() {
             {bulkConfirm === 'trash-rejects' ? (
               <div className="ml-auto flex items-center gap-2">
                 <span className="text-[#C97B7B]">Move {decisionCounts.reject} {decisionCounts.reject === 1 ? 'photo' : 'photos'} to Trash?</span>
-                <button onClick={trashAllRejects} disabled={bulkRunning}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={trashAllRejects} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.20)] border border-[rgba(255,255,255,0.10)] text-[#C97B7B] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
                   {bulkRunning ? 'Trashing…' : 'Confirm'}
                 </button>
-                <button onClick={() => setBulkConfirm(null)}
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
                   <X size={14} /> Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setBulkConfirm('trash-rejects')}
-                className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.12)] border border-[rgba(201,123,123,0.30)] text-[#C97B7B] hover:opacity-70 transition-opacity">
-                <Trash2 size={14} /> Move to Trash
-              </button>
+              !isPhotosTab(activeTab) && (
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('trash-rejects')}
+                  className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.12)] border border-[rgba(201,123,123,0.30)] text-[#C97B7B] hover:opacity-70 transition-opacity">
+                  <Trash2 size={14} /> Move to system trash
+                </button>
+              )
             )}
           </div>
+        )}
+
+        {activeView === 'grid' && isPhotosTab(activeTab) && (
+          <PhotosLibraryBanner sourceFolder={activeTab.folderPath} />
         )}
 
         {/* Personal-model status banner — visible in grid view until the
             model reaches the "ready" tier OR the user dismisses it. Hidden
             inside training mode (TrainingModeView already shows the full
-            PersonalModelPanel). */}
-        {activeView === 'grid' && images.length > 0 && !bannerDismissed && (decisionFilter === null || decisionFilter === 'undecided') && (
+            PersonalModelPanel), and on Photos tabs: it reports the camera
+            model's progress toward auto-cull, and neither the corpus nor the
+            auto-cull it promises applies there. */}
+        {activeView === 'grid' && images.length > 0 && !bannerDismissed && !isPhotosTab(activeTab) && (decisionFilter === null || decisionFilter === 'undecided') && (
           <PersonalModelBanner
             modelInfo={modelInfo}
             onDismiss={() => setBannerDismissConfirm(true)}
@@ -2809,7 +3715,7 @@ export default function App() {
                         Decisions immediately move files into{' '}
                         <span className="text-[#9c9c9d] font-mono text-[11px]">_Keeps</span>{' '}/{' '}
                         <span className="text-[#9c9c9d] font-mono text-[11px]">_Maybes</span>{' '}/{' '}
-                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Trash</span>.
+                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Rejects</span>.
                       </span>
                       </p>
                     </div>
@@ -2869,14 +3775,21 @@ export default function App() {
                 No photos matched <span className="text-[#cecece]">"{searchQuery}"</span> — try a broader description.
               </div>
             )}
-            {displayGridItems.length === 0 && searchMode !== 'semantic' && decisionFilter && (
+            {displayGridItems.length === 0 && searchMode !== 'semantic' && (decisionFilter || unconfirmedOnly) && (
               <div className="col-span-full flex flex-col items-center gap-3 py-16">
-                <span className="text-[#9c9c9d] text-sm">No photos in this filter.</span>
+                {/* An empty "only unconfirmed" view is a finished pass, not a
+                    dead end — say so, and offer the escape hatch that actually
+                    matches which filter emptied the grid. */}
+                <span className="text-[#9c9c9d] text-sm">
+                  {unconfirmedOnly
+                    ? 'Nothing left to confirm here'
+                    : 'No photos in this filter.'}
+                </span>
                 <button
-                  onClick={() => setDecisionFilter(null)}
+                  onClick={() => unconfirmedOnly ? setUnconfirmedOnly(false) : setDecisionFilter(null)}
                   className="text-sm text-[#5BB8D4] hover:text-[#7ECDE3] transition-colors"
                 >
-                  Clear filter
+                  {unconfirmedOnly ? 'Show confirmed photos too' : 'Clear filter'}
                 </button>
               </div>
             )}
@@ -2921,9 +3834,13 @@ export default function App() {
                 >
                   <GroupTile
                     group={item.group}
+                    undecidedImages={item.undecidedImages}
                     isSelected={selectedGroupId === item.group.best_image_id}
                     isSelectMode={gridMultiSelect.isSelectMode}
+                    showFilename={showFilenames}
+                    isAllView={decisionFilter === null}
                     isDropHover={dropHoverGroupId === item.group.best_image_id}
+                    scrub={groupScrub}
                     onSelect={() => {
                       setSelectedGroupId(item.group.best_image_id)
                     }}
@@ -2931,22 +3848,6 @@ export default function App() {
                       setSelectedGroupId(item.group.best_image_id)
                       enterLoupe(item.group.best_image_id)
                     }}
-                    filterContext={item.filterContext}
-                    quickDecide={
-                      // Enable on the Maybe filter only. Resolves to the
-                      // subset of members currently holding 'maybe', so
-                      // already-decided members in the same burst are not
-                      // re-decided. Skip in select mode (multi-select owns
-                      // batch operations there).
-                      decisionFilter === 'maybe' && !gridMultiSelect.isSelectMode
-                        ? (decision) => {
-                            const ids = item.group.images
-                              .filter(img => img.decision === 'maybe')
-                              .map(img => img.id)
-                            if (ids.length > 0) bulkDecide(ids, decision)
-                          }
-                        : null
-                    }
                     onDragOver={(e) => {
                       // Accept any drag carrying a photo payload. We don't
                       // inspect the payload here to keep the visual fast;
@@ -2980,17 +3881,68 @@ export default function App() {
                     }}
                   />
                 </div>
+              ) : item.type === 'decidedGroup' ? (
+                // A run of ≥2 same-group photos sharing this view's decision
+                // (Maybe/Reject), collapsed into one stacked tile — mirrors
+                // the undecided GroupTile above. Opening it (double-click /
+                // Enter) shows GroupPartnersOverlay, not GroupLoupe: these
+                // photos are already decided, so there's nothing to rank.
+                <div
+                  key={`decided-${item.groupKey}`}
+                  data-grid-idx={idx}
+                  role="gridcell"
+                  tabIndex={selectedGridIdx === idx ? 0 : -1}
+                  className="outline-none"
+                  onFocus={() => {
+                    if (selectedDecidedGroupKey === item.groupKey) return
+                    setSelectedGroupId(null)
+                    setSelectedDecidedGroupKey(item.groupKey)
+                  }}
+                >
+                  <DecidedGroupTile
+                    hero={item.hero}
+                    images={item.images}
+                    decision={item.decision}
+                    groupChip={item.groupChip}
+                    runImageIds={item.runImageIds}
+                    isSelected={selectedDecidedGroupKey === item.groupKey}
+                    isSelectMode={gridMultiSelect.isSelectMode}
+                    showFilename={showFilenames}
+                    scrub={groupScrub}
+                    onSelect={() => {
+                      setSelectedGroupId(null)
+                      setSelectedDecidedGroupKey(item.groupKey)
+                    }}
+                    onOpen={() => {
+                      setSelectedGroupId(null)
+                      setSelectedDecidedGroupKey(item.groupKey)
+                      setPartnersOverlay({ imageId: item.hero.id, viewDecision: item.decision })
+                    }}
+                    onBulkDecide={(imageIds, decision) => bulkDecide(imageIds, decision)}
+                  />
+                </div>
               ) : (
                 <div
                   key={item.image.id}
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className="outline-none"
+                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative group/run' : ''}${
+                    // Selection must win visually over the group-run border overlay
+                    // below (z-10, amber/coral) — otherwise the cyan ring is painted
+                    // first and gets covered on 3 of 4 edges, leaving only the
+                    // unclipped corner near the footer visible. Bumping the whole
+                    // tile above both the border overlay and the partner chip
+                    // (z-20) lets ImageCard's ring paint fully on top.
+                    (!gridMultiSelect.isSelectMode && selectedGroupId == null && selectedDecidedGroupKey == null && item.image.id === images[selectedIdx]?.id) ||
+                    gridMultiSelect.selected.has(item.image.id)
+                      ? ' z-30' : ''
+                  }`}
                   onFocus={() => {
                     const i = images.findIndex(img => img.id === item.image.id)
-                    if (selectedGroupId == null && selectedIdx === i) return
+                    if (selectedGroupId == null && selectedDecidedGroupKey == null && selectedIdx === i) return
                     setSelectedGroupId(null)
+                    setSelectedDecidedGroupKey(null)
                     if (i >= 0) setSelectedIdx(i)
                   }}
                   onClick={(e) => {
@@ -3010,7 +3962,7 @@ export default function App() {
                       e.preventDefault()
                       if (!gridMultiSelect.isSelectMode) {
                         gridMultiSelect.enter()
-                        const focusedId = (selectedGroupId == null && images[selectedIdx]?.id)
+                        const focusedId = (selectedGroupId == null && selectedDecidedGroupKey == null && images[selectedIdx]?.id)
                         if (focusedId && focusedId !== imgId) {
                           gridMultiSelect.toggle(focusedId)
                         }
@@ -3025,7 +3977,7 @@ export default function App() {
                         // Anchor the focused photo so the extend covers the
                         // range from "what I had focused" to "what I just
                         // shift-clicked", not just the shift-clicked tile.
-                        const focusedId = (selectedGroupId == null && images[selectedIdx]?.id)
+                        const focusedId = (selectedGroupId == null && selectedDecidedGroupKey == null && images[selectedIdx]?.id)
                         if (focusedId && focusedId !== imgId) {
                           gridMultiSelect.toggle(focusedId)
                         }
@@ -3108,22 +4060,70 @@ export default function App() {
                     } catch { /* silently ignore malformed payloads */ }
                   }}
                 >
+                  {/* Shared group-run border. One enclosure around a run of
+                      adjacent same-group tiles: a non-interactive overlay that
+                      bleeds ±7px into the 12px grid gutters so the top/bottom
+                      lines are continuous across members and the interior
+                      vertical seams disappear. Coloured to the view's decision
+                      (Rejects → coral, Maybes → amber) so it reads in-context.
+                      Kept as an absolute overlay (not a spanning cell) so the
+                      grid rhythm and the 1:1 data-grid-idx ↔ cell mapping that
+                      keyboard nav relies on stay intact; a run that wraps a row
+                      simply splits into two aligned strips. */}
+                  {item.groupRun && item.groupRun.position !== 'solo' && (
+                    <div
+                      aria-hidden="true"
+                      className={`pointer-events-none absolute inset-y-0 z-10 border-y-2 ${
+                        decisionFilter === 'reject' ? 'border-[#C97B7B]' : 'border-[#E8B84A]'
+                      } ${
+                        item.groupRun.position === 'start'
+                          ? 'left-0 -right-[7px] border-l-2 rounded-l-lg'
+                          : item.groupRun.position === 'end'
+                          ? '-left-[7px] right-0 border-r-2 rounded-r-lg'
+                          : '-left-[7px] -right-[7px]'
+                      }`}
+                    />
+                  )}
+                  {/* Group survivor chip — rendered ONCE per group, at the
+                      lower-left inside the run's first tile. Clicking it opens
+                      the partners overlay (differently-culled members + re-cull).
+                      z-20 floats it above the border overlay; pointer-events
+                      re-enabled just on the chip so the click lands. */}
+                  {item.groupChip && (
+                    <div className="absolute bottom-1.5 left-1.5 z-20">
+                      <PartnerCountChips
+                        counts={item.groupChip.counts}
+                        onOpen={() => setPartnersOverlay({ imageId: item.image.id, viewDecision: item.groupChip.viewDecision })}
+                      />
+                    </div>
+                  )}
+                  {/* Group bulk-action bar — hover-revealed at the run's top-left.
+                      Moves every member rendered in this run (this view's bucket)
+                      to a target decision in one call, leaving survivors culled
+                      into other buckets alone. Only on the first tile (where the
+                      run's ids are hung), and only while not multi-selecting so
+                      it never competes with the select flow. group-hover/run keys
+                      off the named group on the cell wrapper above. */}
+                  {item.runImageIds && item.runImageIds.length > 0 && !gridMultiSelect.isSelectMode && (
+                    <div className="absolute top-1.5 left-1.5 z-20 opacity-0 group-hover/run:opacity-100 transition-opacity">
+                      <GroupBulkBar
+                        count={item.runImageIds.length}
+                        viewDecision={decisionFilter}
+                        onDecide={(decision) => bulkDecide(item.runImageIds, decision)}
+                      />
+                    </div>
+                  )}
                   <ImageCard
                     image={item.image}
-                    isSelected={!gridMultiSelect.isSelectMode && selectedGroupId == null && item.image.id === images[selectedIdx]?.id}
+                    isSelected={!gridMultiSelect.isSelectMode && selectedGroupId == null && selectedDecidedGroupKey == null && item.image.id === images[selectedIdx]?.id}
                     isMultiSelected={gridMultiSelect.selected.has(item.image.id)}
                     isSelectMode={gridMultiSelect.isSelectMode}
                     isDropHover={dropHoverPhotoId === item.image.id}
                     searchQuery={searchQuery}
-                    modelInfo={modelInfo}
-                    quickDecide={
-                      // Solo-tile Maybe quick-decide: same gating as the
-                      // GroupTile path. bulkDecide handles undo + refresh +
-                      // toast, so we wrap the single id in an array.
-                      decisionFilter === 'maybe' && !gridMultiSelect.isSelectMode
-                        ? (decision) => bulkDecide([item.image.id], decision)
-                        : null
-                    }
+                    showFilename={showFilenames}
+                    isAllView={decisionFilter === null}
+                    inGroupBorder={!!item.groupRun && item.groupRun.position !== 'solo'}
+                    onMarkReviewed={markReviewed}
                     draggable
                     onDragStart={(e) => {
                       // Payload carries the entire current selection when
@@ -3176,10 +4176,10 @@ export default function App() {
         const inToolbar = detailOpen && bottomToolbarSlot
         const wrapperClass = inToolbar
           ? 'ml-auto flex items-center gap-1'
-          : 'fixed left-1/2 -translate-x-1/2 z-[60] flex items-center gap-1 px-2 py-1.5 bg-[#111214] border border-[#2a2b2d] rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.6)]'
+          : 'fixed left-1/2 -translate-x-1/2 z-40 flex items-center gap-1 px-2 py-1.5 bg-[#111214] border border-[#2a2b2d] rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.6)]'
         const wrapperStyle = inToolbar ? {} : { bottom: '8px' }
         const tree = (
-        <div style={wrapperStyle} className={wrapperClass}>
+        <div style={wrapperStyle} className={wrapperClass} data-bottom-bar={inToolbar ? undefined : 'true'}>
 
           {/* Sort dropdown — 2-level menu, leading direction toggle. State
               persists in localStorage via useSort(); same instance drives the
@@ -3202,17 +4202,56 @@ export default function App() {
           {activeView === 'grid' && <div className="w-px h-4 bg-[#2a2b2d] mx-1" />}
 
           {/* Filter pill — date / portraits / landscape / group / camera.
-              In-memory state on App; predicate composed into displayGridItems. */}
+              Multiple categories combine with AND; active filters render as
+              removable chips (below). In-memory state on App; predicate composed
+              into displayGridItems. */}
           {activeView === 'grid' && (
             <FilterPill
-              filter={filter}
-              setFilter={setFilter}
+              filters={filters}
+              setFilters={setFilters}
               images={images}
               open={filterOpen}
               onOpen={() => { setSortOpen(false); setViewOpen(false); setTabSettingsOpen(false); setFilterOpen(true) }}
               onClose={() => setFilterOpen(false)}
             />
           )}
+
+          {/* Active-filter chips — one removable chip per active filter, plus a
+              "Clear all" once 2+ are active. Sits between the funnel and the
+              next divider so it grows the pill row rather than the pill itself. */}
+          {activeView === 'grid' && !isFilterEmpty(filters) && (() => {
+            const chips = getActiveFilterChips(filters)
+            return (
+              <div className="flex items-center gap-1">
+                {chips.map(chip => (
+                  <span
+                    key={chip.key}
+                    className="inline-flex items-center gap-1 h-[22px] pl-2 pr-1 rounded-md text-[11px] whitespace-nowrap bg-[rgba(91,184,212,0.12)] border border-[rgba(91,184,212,0.30)] text-[#5BB8D4]"
+                  >
+                    <span className="font-medium">{chip.label}</span>
+                    <button
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setFilters(chip.next)}
+                      title={`Remove ${chip.label} filter`}
+                      aria-label={`Remove ${chip.label} filter`}
+                      className="inline-flex items-center rounded p-0.5 text-[rgba(91,184,212,0.7)] hover:text-[#5BB8D4] hover:bg-[rgba(91,184,212,0.18)] transition-colors"
+                    >
+                      <X size={12} />
+                    </button>
+                  </span>
+                ))}
+                {chips.length > 1 && (
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setFilters(EMPTY_FILTER)}
+                    className="px-1.5 h-[22px] rounded-md text-[11px] text-[#9c9c9d] hover:text-[#f0f0f0] hover:bg-[rgba(255,255,255,0.05)] transition-colors"
+                  >
+                    Clear all
+                  </button>
+                )}
+              </div>
+            )
+          })()}
 
           {/* Divider between Filter and the next group. Shown in both grid and
               DetailView (in DetailView there's no View pill, so this divider
@@ -3246,12 +4285,13 @@ export default function App() {
           {activeView === 'grid' && !detailOpen && (
             <>
               <button
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => gridMultiSelect.isSelectMode ? gridMultiSelect.exit() : gridMultiSelect.enter()}
-                className={`px-2 py-1 rounded-lg text-xs transition-opacity border whitespace-nowrap inline-flex items-center gap-1.5 ${gridMultiSelect.isSelectMode ? 'bg-[#1a1b1d] text-[#5BB8D4] border-[rgba(91,184,212,0.30)]' : 'text-[#cecece] border-transparent hover:opacity-70'}`}
+                className={`px-2 py-1 rounded-lg text-xs transition-colors border border-transparent whitespace-nowrap inline-flex items-center gap-1.5 ${gridMultiSelect.isSelectMode ? ACTIVE_TOGGLE : 'text-[#cecece] hover:opacity-70'}`}
                 title="Multi-select photos to act on as a batch"
                 aria-label="Select"
               >
-                <MousePointerSquareDashed size={13} />
+                <MousePointerSquareDashed size={13} strokeWidth={gridMultiSelect.isSelectMode ? 2.5 : 2} />
                 Select
               </button>
               <div className="w-px h-4 bg-[#2a2b2d] mx-1" />
@@ -3262,7 +4302,7 @@ export default function App() {
           {activeTab?.status === 'ready' && (() => {
             const watchingTab = tabs.find(t => t.watchLive)
             const watchingElsewhere = watchingTab && watchingTab.id !== activeTab.id
-            const canToggleHere = !!activeTab.folderPath
+            const canToggleHere = !!activeTab.folderPath && !isPhotosTab(activeTab)
             return (
             <div className="relative" data-dropdown="true">
               <button
@@ -3333,7 +4373,7 @@ export default function App() {
                   </div>
 
                   {/* ── Folders ── */}
-                  {activeTab?.folderPath && (
+                  {activeTab?.folderPath && !isPhotosTab(activeTab) && (
                     <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
                       <p className="label mb-1">Folders</p>
                       <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
@@ -3347,10 +4387,21 @@ export default function App() {
                     </div>
                   )}
 
+                  {isPhotosTab(activeTab) && (
+                    <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
+                      <p className="label mb-1">Decisions</p>
+                      <p className="text-xs text-[#9c9c9d] leading-relaxed">
+                        Each K / M / R writes a <span className="text-[#cecece]">KaMeRa:Keep</span> / <span className="text-[#cecece]">Maybe</span> / <span className="text-[#cecece]">Reject</span> keyword
+                        onto the photo in Photos. Files are never moved, and undo removes the keyword again.
+                        Build a Smart Album on a keyword to collect them.
+                      </p>
+                    </div>
+                  )}
+
                   {/* ── Groups ── */}
                   {enrichedGroups.length > 0 && (
                     <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
-                      <p className="label mb-1">Groups</p>
+                      <p className="label mb-1">Group formation by</p>
                       <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
                         Cluster by visual content (Bursts) or by who's in them (People). Open a group to fine-tune the clustering live.
                       </p>
@@ -3361,9 +4412,9 @@ export default function App() {
                           <button
                             key={mode}
                             onClick={() => setGroupMode(mode)}
-                            className={`px-3 py-1 rounded-md border text-xs transition-opacity capitalize ${
+                            className={`px-3 py-1 rounded-md border text-xs transition-colors capitalize ${
                               groupMode === mode
-                                ? 'border-[#5BB8D4] text-[#5BB8D4]'
+                                ? 'border-[rgba(91,184,212,0.30)] text-[#5BB8D4] font-bold'
                                 : 'border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70'
                             }`}
                           >{mode}</button>
@@ -3413,10 +4464,14 @@ export default function App() {
                 aria-label={searchExpanded ? 'Hide search' : 'Search'}
                 aria-expanded={searchExpanded}
                 className={`w-8 h-8 flex-shrink-0 rounded-lg inline-flex items-center justify-center transition-colors ${
-                  searchExpanded || searchInput ? 'text-[#f0f0f0]' : 'text-[#cecece] hover:bg-[rgba(255,255,255,0.06)] hover:text-[#f0f0f0]'
+                  searchInput
+                    ? ACTIVE_TOGGLE
+                    : searchExpanded
+                      ? 'text-[#f0f0f0]'
+                      : 'text-[#cecece] hover:bg-[rgba(255,255,255,0.06)] hover:text-[#f0f0f0]'
                 }`}
               >
-                {semanticLoading ? <Spinner size={12} /> : <Search size={15} strokeWidth={1.75} />}
+                {semanticLoading ? <Spinner size={12} /> : <Search size={15} strokeWidth={searchInput ? 2.5 : 1.75} />}
               </button>
 
               {/* Input + AI toggle. Always rendered so the width transition
@@ -3427,46 +4482,32 @@ export default function App() {
                   searchExpanded ? 'opacity-100 delay-75' : 'opacity-0 pointer-events-none'
                 }`}
               >
-                <div className={`relative flex-1 min-w-0 ${searchMode === 'semantic' ? 'ai-border-sm' : ''}`}>
+                {/* AI/semantic search hidden — filename search only. */}
+                <div className="relative flex-1 min-w-0">
                   <input
                     ref={searchInputRef}
                     type="text"
                     value={searchInput}
                     onChange={e => setSearchInput(e.target.value)}
                     tabIndex={searchExpanded ? 0 : -1}
-                    placeholder={searchMode === 'semantic' ? 'Describe a scene…' : 'Search filenames…'}
-                    className="w-full pl-2 pr-7 py-1 rounded text-xs bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] text-[#cecece] placeholder:text-[#4a4a4a] focus:outline-none focus:border-[rgba(91,184,212,0.40)] transition-colors"
-                    style={searchMode === 'semantic' ? { borderColor: 'transparent' } : {}}
+                    placeholder="Search filenames…"
+                    className={`w-full pl-2 pr-7 py-1 rounded text-xs placeholder:text-[#4a4a4a] focus:outline-none transition-colors ${
+                      // A query is an active filter — the input adopts the same
+                      // cyan chip vocabulary as the bar's filter chips.
+                      searchInput
+                        ? 'bg-[rgba(91,184,212,0.10)] border border-[rgba(91,184,212,0.40)] text-[#5BB8D4] font-medium'
+                        : 'bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] text-[#cecece] focus:border-[rgba(91,184,212,0.40)]'
+                    }`}
                   />
                   {searchInput && (
                     <button
                       onClick={() => { setSearchInput(''); setSearchQuery(''); setSemanticResults(null) }}
-                      className="absolute right-1.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded flex items-center justify-center text-[#6a6b6c] hover:text-[#cecece] hover:bg-[rgba(255,255,255,0.06)] transition-colors"
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded flex items-center justify-center transition-colors text-[rgba(91,184,212,0.7)] hover:text-[#5BB8D4] hover:bg-[rgba(91,184,212,0.18)]"
                       title="Clear search"
                       aria-label="Clear search"
                     ><X size={12} /></button>
                   )}
                 </div>
-                <button
-                  onClick={() => {
-                    const next = searchMode === 'filename' ? 'semantic' : 'filename'
-                    setSearchMode(next)
-                    setSemanticResults(null)
-                  }}
-                  tabIndex={searchExpanded ? 0 : -1}
-                  title={searchMode === 'semantic' ? 'AI search active — click for filename search' : 'Switch to AI semantic search'}
-                  className="ml-1 inline-flex items-center gap-1 px-1.5 py-1 rounded text-[10px] font-medium transition-colors"
-                  style={searchMode === 'semantic'
-                    ? { background: 'rgba(91,184,212,0.08)', border: '1px solid rgba(91,184,212,0.20)' }
-                    : { color: '#6a6b6c', background: 'transparent', border: '1px solid transparent' }
-                  }
-                >
-                  <Sparkles size={13} />
-                  {searchMode === 'semantic'
-                    ? <span className="ai-text-rainbow">AI</span>
-                    : 'AI'
-                  }
-                </button>
               </div>
             </div>
           </div>

@@ -41,3 +41,40 @@ export const BTN_DANGER        = `${BASE} px-3 py-1.5 font-medium text-[#C97B7B]
 // w-9 h-9 = 36px hit target (WCAG 2.5.8 compliant with surrounding spacing).
 // Use size={18} for the icon inside.
 export const BTN_ICON          = 'inline-flex items-center justify-center w-9 h-9 rounded-lg text-[#9c9c9d] hover:opacity-70 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed'
+
+// ── Active-control emphasis (single source of truth) ──────────────────────
+// Cyan is the "this control is ON / SET / narrowing what you see" signal.
+// One vocabulary, two intensities:
+//
+//   ACTIVE_PILL — the LOUD tier: cyan-tinted container + border + bold cyan
+//     text + heavier icon. Reserved for the FILTER pill — the single control
+//     whose active state means "you are viewing a narrowed subset." Pair with
+//     `strokeWidth={2.5}` on its leading icon.
+//
+//   ACTIVE_TOGGLE — the LIGHTER tier: bold cyan text + cyan icon, NO container
+//     fill. For binary mode toggles that are currently ON (Select mode, active
+//     Search, group-mode, Watch-live). Quieter than the filter so the filter
+//     stays the loudest "narrowing" signal.
+//
+// Do NOT apply either to always-has-a-value controls (Sort, View/size) — they
+// would read as active 100% of the time. Decision colors (K/M/R) and selection
+// rings are a separate vocabulary; leave them alone.
+export const ACTIVE_PILL   = 'bg-[rgba(91,184,212,0.12)] border-[rgba(91,184,212,0.30)] text-[#5BB8D4] font-bold'
+export const ACTIVE_TOGGLE = 'text-[#5BB8D4] font-bold'
+
+// ── Selection ring (single source of truth) ────────────────────────────────
+// The cyan "this is the currently-selected photo" ring, used on every
+// thumbnail across the grid, GroupLoupe, DetailView filmstrip, CompareView,
+// and PairwiseTrainingView. Was previously `ring-1` (1px), independently
+// hand-copied into 10+ call sites with no shared constant — bumped to `ring-2`
+// (2px) for legibility and consolidated here so all sites stay in sync.
+//
+//   SELECTION_RING         — standard selected/focused/multi-selected state.
+//   SELECTION_RING_STRONG  — heavier variant for drop-hover (an active drag
+//     target), kept visually louder than a plain selection.
+//   SELECTION_RING_INSET   — same ring, drawn inward. Use inside a shared
+//     group-run border (grid) so the cyan ring hugs the tile instead of
+//     colliding with the group frame in the gutter.
+export const SELECTION_RING        = 'ring-2 ring-[#5BB8D4]'
+export const SELECTION_RING_STRONG = 'ring-[3px] ring-[#5BB8D4]'
+export const SELECTION_RING_INSET  = 'ring-2 ring-[#5BB8D4] ring-inset'

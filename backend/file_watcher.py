@@ -12,6 +12,7 @@ Usage (called from main.py at startup):
     watcher.stop()
 """
 
+import queue
 import threading
 import time
 import logging
@@ -33,14 +34,74 @@ log = logging.getLogger(__name__)
 # error logs (e.g. /debug/last-errors).
 ErrorCallback = Callable[[dict], None]
 
-from backend.constants import SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS  # noqa: E402 — re-export for callers that imported from here historically
-# .hif is intentionally excluded — Fuji writes it next to every .RAF in RAW+HIF
-# mode. We treat HIF as a sidecar of the RAF (move-only, never analyzed).
+from backend.constants import (  # noqa: E402 — re-export for callers that imported from here historically
+    SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif,
+    is_raw_format, has_processed_sibling,
+)
+# .hif is analyzed standalone (X100VI/X Half HIF-only shooting) but skipped
+# when a same-stem .RAF sibling exists — then it's a RAW+HIF sidecar preview,
+# move-only (see file_mover.py). The standalone check happens in
+# _worker_loop AFTER the settle delay, not at event time: a card copy can
+# drop the RAF and HIF as separate events in either order, so checking too
+# early could misjudge a HIF as standalone before its RAF sibling has landed.
 
 # Delay before analyzing a newly detected file.
 # Cameras and card readers write files in chunks — analyzing mid-write gives corrupt results.
 # 2 seconds is enough for most JPEG transfers; RAW files may need more on slow readers.
 SETTLE_SECONDS = 2.0
+
+
+def _analysis_mode_is_jpeg_priority() -> bool:
+    """Deferred import — backend.routers.settings pulls in backend.state,
+    which imports FolderWatcher from this module, so a top-level import here
+    would be circular. Read fresh on every call (cheap: one SQLite lookup),
+    matching _is_sidecar_preview_preferred's own late-import pattern."""
+    from backend.routers.settings import get_analysis_mode
+    return get_analysis_mode() == "jpeg_priority"
+
+
+def _store_skipped(file_path: Path, db_path: Path) -> None:
+    """
+    Lightweight upsert for a RAW file skipped under analysis_mode=jpeg_priority
+    (see backend/routers/settings.py::analysis_mode) — EXIF only, no scorers,
+    analysis_status='skipped'. Mirrors _INSERT_SKIPPED_SQL in
+    backend/routers/analysis.py; kept separate because this module avoids the
+    heavy analysis.py import chain (rawpy/pyiqa/torch) for cheap watcher events.
+    """
+    path_str = str(file_path)
+    try:
+        exif = extract_exif(path_str)
+        with get_db(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO images (
+                    file_path, filename, format, source_folder, uuid,
+                    camera, shot_at, focal_length_mm, aperture, shutter_speed, iso,
+                    analysis_status, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', DATETIME('now'))
+                ON CONFLICT(file_path) DO UPDATE SET
+                    uuid            = COALESCE(images.uuid, excluded.uuid),
+                    camera          = excluded.camera,
+                    shot_at         = excluded.shot_at,
+                    focal_length_mm = excluded.focal_length_mm,
+                    aperture        = excluded.aperture,
+                    shutter_speed   = excluded.shutter_speed,
+                    iso             = excluded.iso,
+                    analysis_status = CASE images.analysis_status WHEN 'done' THEN 'done' ELSE 'skipped' END
+                """,
+                (
+                    path_str, file_path.name,
+                    file_path.suffix.lstrip(".").upper(),
+                    str(file_path.parent),
+                    str(_uuid.uuid4()),
+                    exif["camera"], exif["shot_at"],
+                    exif["focal_length_mm"], exif["aperture"],
+                    exif["shutter_speed"], exif["iso"],
+                ),
+            )
+        log.info("Watcher skipped scoring (jpeg_priority): %s", file_path.name)
+    except Exception:
+        log.exception("Watcher failed to store skipped RAW: %s", file_path.name)
 
 
 def _analyze_and_store(file_path: Path, db_path: Path,
@@ -145,13 +206,11 @@ def _analyze_and_store(file_path: Path, db_path: Path,
 class _PhotoEventHandler(FileSystemEventHandler):
     """Called by watchdog on file system events."""
 
-    def __init__(self, db_path: Path, on_error: Optional[ErrorCallback] = None,
-                 owner: Optional["FolderWatcher"] = None):
+    def __init__(self, db_path: Path, owner: "FolderWatcher"):
         super().__init__()
         self._db_path = db_path
-        self._on_error = on_error
-        # Back-reference so analyze threads can report in-flight / analyzed
-        # counts to the owning FolderWatcher (drives GET /watch-progress).
+        # Owning FolderWatcher — detected files go onto its analysis queue,
+        # which one worker thread drains sequentially (drives /watch-progress).
         self._owner = owner
 
     def _handle(self, path_str: str) -> None:
@@ -159,41 +218,15 @@ class _PhotoEventHandler(FileSystemEventHandler):
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             return
         # Skip files that already live in a decision subfolder (_Keeps/_Maybes/
-        # _Trash). A keep/maybe/reject MOVE into _Keeps fires on_moved with that
+        # _Rejects). A keep/maybe/reject MOVE into _Keeps fires on_moved with that
         # destination; re-analyzing it is both pointless (already decided) and
         # racy — an external archiver (Provenance) may move the keeper out of
         # _Keeps before our 2s settle elapses, making cv2.imread fail and toast
-        # a spurious "Could not load image". Dropping it here, before any thread
-        # spawns, fixes that at the source and keeps the counters honest.
+        # a spurious "Could not load image". Dropping it here, before anything
+        # is queued, fixes that at the source and keeps the counters honest.
         if any(part in DECISION_SUBFOLDERS for part in path.parts):
             return
-        # Run analysis in a daemon thread so we don't block the watchdog event loop
-        threading.Thread(
-            target=self._settle_then_analyze,
-            args=(path,),
-            daemon=True,
-        ).start()
-
-    def _settle_then_analyze(self, path: Path) -> None:
-        """Wait for the file to finish writing before analyzing.
-
-        In-flight is incremented at the very START (before the settle sleep) so a
-        burst of on_created events (e.g. a Fuji frame's fast JPG followed by its
-        slow RAF) keeps in_flight > 0 across the gap — the live "analyzing…"
-        indicator must not clear between them. The finally always decrements, so
-        a failing file can't strand the counter.
-        """
-        if self._owner is not None:
-            self._owner._enter_inflight()
-        analyzed = False
-        try:
-            time.sleep(SETTLE_SECONDS)
-            if path.exists():
-                _analyze_and_store(path, self._db_path, on_error=self._on_error)
-                analyzed = True
-        finally:
-            if self._owner is not None:
-                self._owner._exit_inflight(analyzed)
+        self._owner._enqueue(path)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -208,7 +241,7 @@ class _PhotoEventHandler(FileSystemEventHandler):
         # Fired when a file is deleted from the watched folder. Drop its row so
         # the grid stays in sync. Non-recursive observer → only top-level
         # deletes fire, which is what we want (K/X/M moves into _Keeps/_Maybes/
-        # _Trash subfolders are tracked separately as decisions, not deletes).
+        # _Rejects subfolders are tracked separately as decisions, not deletes).
         if event.is_directory:
             return
         path = Path(event.src_path)
@@ -227,6 +260,13 @@ class FolderWatcher:
     """
     Manages a watchdog Observer that monitors one folder at a time.
 
+    Detected files are queued and analyzed by ONE worker thread, sequentially.
+    The original thread-per-file design melted down on bulk drops: copying a
+    full card into the watched folder spawned one rawpy decode thread per file
+    (2026-07-19 incident: 263 files → 334 threads, 13 GB RSS, API wedged).
+    Sequential matches the batch loop — parallelism lives inside a photo's
+    scorer fan, never across photos.
+
     Thread-safe: start/stop can be called from the FastAPI main thread.
     """
 
@@ -235,9 +275,17 @@ class FolderWatcher:
         self._on_error  = on_error
         self._observer  = None
         self._watch_path: str | None = None
-        # Live-analysis counters for GET /watch-progress. _in_flight = analyze
-        # threads currently settling/running; _analyzed = files this session has
-        # finished. Guarded by _lock (touched from many daemon analyze threads).
+        # Analysis pipeline: watchdog event threads enqueue, one worker drains.
+        # _pending dedupes paths already queued (one copy can fire several
+        # events for the same file). start() creates a fresh queue + worker per
+        # session; stop() abandons the backlog via _worker_stop + sentinel.
+        self._queue: queue.Queue = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._worker_stop = threading.Event()
+        self._pending: set[str] = set()
+        # Live-analysis counters for GET /watch-progress. _in_flight = files
+        # queued or currently analyzing; _analyzed = files this session has
+        # finished. Guarded by _lock (touched from watchdog + worker threads).
         self._in_flight = 0
         self._analyzed  = 0
         self._lock = threading.Lock()
@@ -259,15 +307,71 @@ class FolderWatcher:
         with self._lock:
             return self._analyzed
 
-    def _enter_inflight(self) -> None:
-        with self._lock:
-            self._in_flight += 1
+    def _enqueue(self, path: Path) -> None:
+        """Queue a detected file for the worker. Dedupes repeat events.
 
-    def _exit_inflight(self, analyzed: bool) -> None:
+        In-flight is bumped at enqueue time so a burst of on_created events
+        (e.g. a Fuji frame's fast JPG followed by its slow RAF) keeps
+        in_flight > 0 across the gap — the live "analyzing…" indicator must
+        not clear between them.
+        """
+        key = str(path)
         with self._lock:
+            if key in self._pending:
+                return
+            self._pending.add(key)
+            self._in_flight += 1
+        self._queue.put((path, time.monotonic()))
+
+    def _finish(self, path: Path, analyzed: bool) -> None:
+        with self._lock:
+            self._pending.discard(str(path))
             self._in_flight = max(0, self._in_flight - 1)
             if analyzed:
                 self._analyzed += 1
+
+    def _worker_loop(self, q: queue.Queue, stop_evt: threading.Event) -> None:
+        """Drain the queue one file at a time until stopped.
+
+        SETTLE_SECONDS is measured from the file's event, not from dequeue —
+        under a backlog the settle window has long elapsed by the time a file
+        reaches the front, so the worker proceeds without sleeping.
+        """
+        while True:
+            item = q.get()
+            if item is None or stop_evt.is_set():
+                return
+            path, seen_at = item
+            analyzed = False
+            try:
+                remaining = SETTLE_SECONDS - (time.monotonic() - seen_at)
+                if remaining > 0:
+                    time.sleep(remaining)
+                if stop_evt.is_set():
+                    return
+                if path.exists():
+                    if path.suffix.lower() == ".hif" and not is_standalone_hif(path):
+                        pass  # RAW+HIF sidecar — its RAF will carry it on decision
+                    elif (
+                        is_raw_format(path.suffix.lstrip(".").upper())
+                        and _analysis_mode_is_jpeg_priority()
+                        and has_processed_sibling(path)
+                    ):
+                        # Same skip as the batch path (routers/analysis.py) —
+                        # a same-stem processed sibling (.jpg/.jpeg/.hif/.png/
+                        # .tif/.tiff) exists, so this RAW gets a lightweight
+                        # row instead of full scoring.
+                        _store_skipped(path, self._db_path)
+                        analyzed = True
+                    else:
+                        _analyze_and_store(path, self._db_path, on_error=self._on_error)
+                        analyzed = True
+            except Exception:
+                # _analyze_and_store handles its own errors; this guards the
+                # loop itself so one bad file can't kill the whole session.
+                log.exception("Watcher worker error on: %s", path.name)
+            finally:
+                self._finish(path, analyzed)
 
     def start(self, folder_path: str) -> None:
         """Start watching a folder. Stops any existing watch first."""
@@ -276,14 +380,23 @@ class FolderWatcher:
         if not path.is_dir():
             raise ValueError(f"Not a directory: {folder_path}")
 
-        # Fresh session → reset counters so /watch-progress reflects only this
-        # watch's activity.
+        # Fresh session → zeroed counters for /watch-progress, and a fresh
+        # queue + worker (the old queue may still hold the stop sentinel).
         with self._lock:
             self._in_flight = 0
             self._analyzed = 0
+            self._pending.clear()
+        self._queue = queue.Queue()
+        self._worker_stop = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            args=(self._queue, self._worker_stop),
+            daemon=True,
+            name="watcher-analyze",
+        )
+        self._worker.start()
 
-        handler = _PhotoEventHandler(self._db_path, on_error=self._on_error,
-                                     owner=self)
+        handler = _PhotoEventHandler(self._db_path, owner=self)
         self._observer = Observer()
         self._observer.schedule(handler, str(path), recursive=False)
         self._observer.start()
@@ -296,4 +409,11 @@ class FolderWatcher:
             self._observer.stop()
             self._observer.join()
             self._observer = None
+        if self._worker is not None:
+            # Signal first, then unblock the blocking get(). The worker drops
+            # any backlog and exits after at most the file it is currently
+            # analyzing (a RAW decode is uncancellable, same as the batch).
+            self._worker_stop.set()
+            self._queue.put(None)
+            self._worker = None
         self._watch_path = None

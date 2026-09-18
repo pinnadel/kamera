@@ -34,6 +34,7 @@ loaded without importing this module (forward-compatible if the class moves).
 
 import pickle
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -227,12 +228,21 @@ class PersonalModel:
     """
     Wraps the sklearn pipeline for training, predicting, saving, and loading.
 
-    One global instance is created at backend startup and shared across
-    all requests (no locking needed — the model is only written during
-    POST /train-model, which is a synchronous endpoint that blocks).
+    One global instance is created at backend startup and shared across all
+    requests. Training also happens off the request thread — auto_trainer's
+    background daemon thread retrains and swaps in a new pipeline whenever
+    enough new decisions have accumulated. That write can land in the middle
+    of a long-running read (e.g. a 300-photo auto-cull batch predicting one
+    row at a time), so every read (`predict_*`) and write (`train*`, `reset`,
+    `load`) of `_pipeline` / `_uncertainty_ensemble` / `_meta` takes `_lock`.
+    Without it, a batch could see the old pipeline for some rows and the new
+    one for others — different photos in the same run scored on different
+    models. Reentrant because `predict_with_uncertainty` etc. read `self.ready`
+    then act on the pipeline within the same locked section.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._pipeline: Optional[Pipeline] = None
         self._meta: dict = {}
         # Per-image score cache: image_id → personal_score (or None for rows
@@ -250,26 +260,31 @@ class PersonalModel:
     @property
     def ready(self) -> bool:
         """True once the model has been trained at least once."""
-        return self._pipeline is not None
+        with self._lock:
+            return self._pipeline is not None
 
     @property
     def training_size(self) -> int:
-        return self._meta.get("training_size", 0)
+        with self._lock:
+            return self._meta.get("training_size", 0)
 
     @property
     def trained_at(self) -> Optional[str]:
-        return self._meta.get("trained_at")
+        with self._lock:
+            return self._meta.get("trained_at")
 
     @property
     def beats_baseline(self) -> bool:
         """True if the last training run validated better than the threshold baseline."""
-        v = self._meta.get("validation", {})
-        return bool(v.get("beats_baseline", False))
+        with self._lock:
+            v = self._meta.get("validation", {})
+            return bool(v.get("beats_baseline", False))
 
     @property
     def validation_info(self) -> dict:
         """Return the validation metadata dict from the last training run."""
-        return self._meta.get("validation", {})
+        with self._lock:
+            return self._meta.get("validation", {})
 
     # ── Train ────────────────────────────────────────────────────────────────
 
@@ -322,22 +337,24 @@ class PersonalModel:
             validation["beats_baseline"],
         )
 
-        self._pipeline = pipeline
-        self._uncertainty_ensemble = _fit_uncertainty_ensemble(X, y)
-        self._meta = {
-            "training_size":          len(rows),
-            "trained_at":             datetime.now().isoformat(timespec="seconds"),
-            "feature_importances":    importances,
-            "validation":             validation,
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
-        }
-        # Predictions from the previous model are now wrong by definition.
-        self._cache.clear()
+        with self._lock:
+            self._pipeline = pipeline
+            self._uncertainty_ensemble = _fit_uncertainty_ensemble(X, y)
+            self._meta = {
+                "training_size":          len(rows),
+                "trained_at":             datetime.now().isoformat(timespec="seconds"),
+                "feature_importances":    importances,
+                "validation":             validation,
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            }
+            # Predictions from the previous model are now wrong by definition.
+            self._cache.clear()
+            meta_copy = dict(self._meta)
         logger.info(
             "Personal model trained on %d decisions (ensemble: %d members)",
             len(rows), len(self._uncertainty_ensemble),
         )
-        return dict(self._meta)
+        return meta_copy
 
     def train_from_samples(
         self,
@@ -441,32 +458,35 @@ class PersonalModel:
             validation["beats_baseline"],
         )
 
-        self._pipeline = pipeline
-        self._uncertainty_ensemble = _fit_uncertainty_ensemble(X, y, sample_weight=sample_weight)
-        self._meta = {
-            "training_size":          feature_vectors.shape[0],
-            "trained_at":             datetime.now().isoformat(timespec="seconds"),
-            "feature_importances":    importances,
-            "validation":             validation,
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
-        }
-        self._cache.clear()
+        with self._lock:
+            self._pipeline = pipeline
+            self._uncertainty_ensemble = _fit_uncertainty_ensemble(X, y, sample_weight=sample_weight)
+            self._meta = {
+                "training_size":          feature_vectors.shape[0],
+                "trained_at":             datetime.now().isoformat(timespec="seconds"),
+                "feature_importances":    importances,
+                "validation":             validation,
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            }
+            self._cache.clear()
+            meta_copy = dict(self._meta)
         logger.info(
             "Personal model trained on %d durable samples (ensemble: %d members)",
             feature_vectors.shape[0], len(self._uncertainty_ensemble),
         )
-        return dict(self._meta)
+        return meta_copy
 
     # ── Predict ──────────────────────────────────────────────────────────────
 
     def predict_personal_score(self, row: dict) -> Optional[float]:
         """Single-row prediction. Returns None if model isn't ready."""
-        if not self.ready:
-            return None
         base = row.get("overall_score")
         if base is None:
             return None
-        raw   = float(self._pipeline.predict(extract(row).reshape(1, -1))[0])
+        with self._lock:
+            if self._pipeline is None:
+                return None
+            raw = float(self._pipeline.predict(extract(row).reshape(1, -1))[0])
         delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
         return float(np.clip(base + delta, 0.0, 100.0))
 
@@ -479,37 +499,41 @@ class PersonalModel:
         Rows without an `id` key (callers passing synthetic dicts) bypass the
         cache entirely. Returns None for rows where overall_score is NULL.
         """
-        if not self.ready or not rows:
-            return [None] * len(rows)
+        if not rows:
+            return []
 
-        results: list[Optional[float]] = [None] * len(rows)
-        miss_indices: list[int] = []
-        miss_rows: list[dict] = []
+        with self._lock:
+            if self._pipeline is None:
+                return [None] * len(rows)
 
-        for i, row in enumerate(rows):
-            image_id = row.get("id")
-            if image_id is not None and image_id in self._cache:
-                results[i] = self._cache[image_id]
-            else:
-                miss_indices.append(i)
-                miss_rows.append(row)
+            results: list[Optional[float]] = [None] * len(rows)
+            miss_indices: list[int] = []
+            miss_rows: list[dict] = []
 
-        if miss_rows:
-            X       = extract_batch(miss_rows)        # (M, len(_COLUMNS))
-            raw_arr = self._pipeline.predict(X)       # (M,)
-            for i, row, raw in zip(miss_indices, miss_rows, raw_arr):
-                base = row.get("overall_score")
-                if base is None:
-                    score = None
-                else:
-                    delta = float(np.clip(float(raw) * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-                    score = float(np.clip(base + delta, 0.0, 100.0))
-                results[i] = score
+            for i, row in enumerate(rows):
                 image_id = row.get("id")
-                if image_id is not None:
-                    self._cache[image_id] = score
+                if image_id is not None and image_id in self._cache:
+                    results[i] = self._cache[image_id]
+                else:
+                    miss_indices.append(i)
+                    miss_rows.append(row)
 
-        return results
+            if miss_rows:
+                X       = extract_batch(miss_rows)        # (M, len(_COLUMNS))
+                raw_arr = self._pipeline.predict(X)       # (M,)
+                for i, row, raw in zip(miss_indices, miss_rows, raw_arr):
+                    base = row.get("overall_score")
+                    if base is None:
+                        score = None
+                    else:
+                        delta = float(np.clip(float(raw) * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
+                        score = float(np.clip(base + delta, 0.0, 100.0))
+                    results[i] = score
+                    image_id = row.get("id")
+                    if image_id is not None:
+                        self._cache[image_id] = score
+
+            return results
 
     # ── Uncertainty (ensemble) ───────────────────────────────────────────────
 
@@ -520,24 +544,31 @@ class PersonalModel:
         hasn't been retrained yet) — caller treats 0.0 as "no signal" and
         falls back to the hard decision.
         """
-        if not self.ready:
-            return None
         base = row.get("overall_score")
         if base is None:
             return None
         feats = extract(row).reshape(1, -1)
-        raw = float(self._pipeline.predict(feats)[0])
+
+        with self._lock:
+            if self._pipeline is None:
+                return None
+            raw = float(self._pipeline.predict(feats)[0])
+            ensemble = list(self._uncertainty_ensemble)
+
         delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
         score = float(np.clip(base + delta, 0.0, 100.0))
 
-        if not self._uncertainty_ensemble:
+        if not ensemble:
             return (score, 0.0)
 
         # Ensemble predictions, mapped to personal-score space the same way
         # the main pipeline is. std_dev is computed over the personal-score
         # values so the threshold setting is in user-facing 0–100 units.
+        # `ensemble` is a snapshot taken under the lock above, so it's
+        # internally consistent even if a retrain swaps _uncertainty_ensemble
+        # for a new list right after we release the lock.
         member_scores: list[float] = []
-        for member in self._uncertainty_ensemble:
+        for member in ensemble:
             raw_m = float(member.predict(feats)[0])
             delta_m = float(np.clip(raw_m * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
             member_scores.append(float(np.clip(base + delta_m, 0.0, 100.0)))
@@ -551,18 +582,21 @@ class PersonalModel:
         paths only — does NOT use the personal_score cache (which stores only
         the main-pipeline score, not std_dev).
         """
-        if not self.ready or not rows:
-            return [None] * len(rows)
+        if not rows:
+            return []
 
         X = extract_batch(rows)            # (N, len(_COLUMNS))
-        raw_arr = self._pipeline.predict(X)  # (N,)
-        # Ensemble predictions: (E, N) array
-        if self._uncertainty_ensemble:
-            ensemble_raw = np.stack(
-                [m.predict(X) for m in self._uncertainty_ensemble], axis=0
-            )
-        else:
-            ensemble_raw = None
+        with self._lock:
+            if self._pipeline is None:
+                return [None] * len(rows)
+            raw_arr = self._pipeline.predict(X)  # (N,)
+            # Ensemble predictions: (E, N) array
+            if self._uncertainty_ensemble:
+                ensemble_raw = np.stack(
+                    [m.predict(X) for m in self._uncertainty_ensemble], axis=0
+                )
+            else:
+                ensemble_raw = None
 
         results: list[Optional[tuple[float, float]]] = [None] * len(rows)
         for i, row in enumerate(rows):
@@ -588,16 +622,19 @@ class PersonalModel:
 
     def invalidate(self, image_id: int) -> None:
         """Drop the cached score for one image — call after re-analysis."""
-        self._cache.pop(image_id, None)
+        with self._lock:
+            self._cache.pop(image_id, None)
 
     def invalidate_many(self, image_ids: list[int]) -> None:
         """Drop cached scores for multiple images — call after a folder clear."""
-        for image_id in image_ids:
-            self._cache.pop(image_id, None)
+        with self._lock:
+            for image_id in image_ids:
+                self._cache.pop(image_id, None)
 
     def clear_cache(self) -> None:
         """Drop the entire cache — call after a full /clear."""
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
     def reset(self, path: Path = _MODEL_PATH) -> None:
         """Wipe all learned state in-place and delete the on-disk pickle.
@@ -607,10 +644,11 @@ class PersonalModel:
         Call after the training_samples table has been cleared so the next
         auto-train pass starts from zero.
         """
-        self._pipeline = None
-        self._meta = {}
-        self._uncertainty_ensemble = []
-        self._cache.clear()
+        with self._lock:
+            self._pipeline = None
+            self._meta = {}
+            self._uncertainty_ensemble = []
+            self._cache.clear()
         try:
             path.unlink()
         except FileNotFoundError:
@@ -618,7 +656,7 @@ class PersonalModel:
 
     # ── Persist ──────────────────────────────────────────────────────────────
 
-    def save(self, path: Path = _MODEL_PATH) -> None:
+    def save(self, path: Path = _MODEL_PATH, *, allow_shrink: bool = False) -> None:
         """Persist the fitted pipeline atomically.
 
         Writes to a sibling `<name>.tmp` and then `os.replace()`s into place.
@@ -626,21 +664,51 @@ class PersonalModel:
         volume), so a Force Quit during the save can't leave a half-written
         pickle that fails to load on next launch. With auto-training writing
         every ~10 decisions in the background, this guard matters.
+
+        Shrink guard: refuse to overwrite an on-disk model that was fit on
+        MORE samples than the one being saved. The durable training_samples
+        table only grows during normal use, so a fit on fewer samples than the
+        last one means something went wrong upstream (a stale corpus snapshot,
+        a partially-cleared table, a left-over bootstrap fit) — and silently
+        clobbering a well-trained model with that is exactly the data-loss
+        incident this guards against (a 1839-sample model once got replaced by
+        a 30-sample fit). The legitimate shrink is a user reset, which calls
+        `reset()` (deletes the pickle directly) and never routes through here;
+        the rare intentional case can still pass allow_shrink=True.
         """
+        with self._lock:
+            pipeline, meta, ensemble = self._pipeline, self._meta, self._uncertainty_ensemble
+            training_size = meta.get("training_size", 0)
+
+        if not allow_shrink and path.exists():
+            try:
+                with open(path, "rb") as f:
+                    existing_size = pickle.load(f).get("meta", {}).get("training_size", 0)
+            except Exception:
+                existing_size = 0  # unreadable/old pickle — let the save proceed
+            if training_size < existing_size:
+                logger.warning(
+                    "Refusing to overwrite personal model: on-disk fit has %d "
+                    "samples but this save has only %d. Skipping save to avoid "
+                    "clobbering a better model. Pass allow_shrink=True to force.",
+                    existing_size, training_size,
+                )
+                return
+
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "wb") as f:
             pickle.dump({
-                "pipeline":             self._pipeline,
-                "meta":                 self._meta,
-                "uncertainty_ensemble": self._uncertainty_ensemble,
+                "pipeline":             pipeline,
+                "meta":                 meta,
+                "uncertainty_ensemble": ensemble,
             }, f)
             f.flush()
             import os as _os
             _os.fsync(f.fileno())
         import os as _os
         _os.replace(tmp, path)
-        logger.info("Personal model saved → %s (%d samples)", path, self.training_size)
+        logger.info("Personal model saved → %s (%d samples)", path, training_size)
 
     def load(self, path: Path = _MODEL_PATH) -> bool:
         """Load a previously saved model. Returns True on success, False if file
@@ -685,15 +753,17 @@ class PersonalModel:
                 )
                 return False
 
-            self._pipeline = pipeline
-            self._meta     = meta
-            # Ensemble is optional — pre-PR3 pickles don't have the key.
-            # predict_with_uncertainty returns (score, 0.0) when empty,
-            # which the auto-cull boundary router treats as "no signal".
-            self._uncertainty_ensemble = data.get("uncertainty_ensemble", []) or []
+            ensemble = data.get("uncertainty_ensemble", []) or []
+            with self._lock:
+                self._pipeline = pipeline
+                self._meta     = meta
+                # Ensemble is optional — pre-PR3 pickles don't have the key.
+                # predict_with_uncertainty returns (score, 0.0) when empty,
+                # which the auto-cull boundary router treats as "no signal".
+                self._uncertainty_ensemble = ensemble
             logger.info(
                 "Personal model loaded ← %s (%d samples, %d ensemble members)",
-                path, self.training_size, len(self._uncertainty_ensemble),
+                path, self.training_size, len(ensemble),
             )
             return True
         except Exception as exc:

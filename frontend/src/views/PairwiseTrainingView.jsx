@@ -4,6 +4,7 @@ import { ArrowLeft, Check, LogOut } from 'lucide-react'
 import { API } from '../api'
 import { ScoreBadge, DecisionBadge } from '../ui/primitives'
 import { pickHeadlineScore } from '../ui/format'
+import { SELECTION_RING } from '../ui/buttons'
 
 // PairwiseTrainingView — A/B training mode.
 //
@@ -140,7 +141,7 @@ export function PairwiseTrainingView({ images, sourceFolder, onExit, modelInfo }
                 className={`
                   relative flex flex-col rounded-lg overflow-hidden cursor-pointer transition-all
                   ${selected
-                    ? 'ring-1 ring-[#5BB8D4] scale-[1.01]'
+                    ? `${SELECTION_RING} scale-[1.01]`
                     : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(91,184,212,0.35)] hover:scale-[1.003]'
                   }
                 `}

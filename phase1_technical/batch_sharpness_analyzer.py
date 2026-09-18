@@ -24,6 +24,18 @@ from pathlib import Path
 import csv
 from datetime import datetime
 
+# This module doubles as a standalone calibration CLI
+# (`python phase1_technical/batch_sharpness_analyzer.py <folder>`), where
+# sys.path[0] is phase1_technical/ and the repo root is not importable. Put
+# the root on the path so the shared RAW-format constants resolve both when
+# imported as part of the package and when run directly.
+import sys as _sys
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+
+from backend.constants import RAW_DECODE_SUFFIXES, RAW_FORMATS, SUPPORTED_EXTENSIONS
+
 # Per-format normalized sharpness thresholds.
 # Score = geometric mean of per-megapixel Laplacian variance, Tenengrad, and
 # Modified Laplacian, each divided by its empirical scale constant so the three
@@ -34,12 +46,16 @@ from datetime import datetime
 # known-sharp and known-blurry photos and pick a threshold around the split.
 # Previous single-measure threshold was 2.3 (Laplacian-only); the new combined
 # score lands in a similar 1–10 band, so 2.3 is a reasonable starting point.
+#
+# Every format currently calibrates to the same 2.3, so get_threshold()'s
+# JPG fallback already covered the RAW formats missing from this table. The
+# RAW entries are filled in from RAW_FORMATS anyway so a future per-format
+# recalibration has a visible slot for each, rather than a silent fallback.
 THRESHOLDS = {
     'JPG':  2.3,
     'JPEG': 2.3,
-    'RAF':  2.3,
-    'NEF':  2.3,
 }
+THRESHOLDS.update({fmt: 2.3 for fmt in sorted(RAW_FORMATS)})
 
 # Tile grid and aggregation percentile for regional focus measurement.
 # 16×16 = 256 tiles; p90 = "sharpest 10%" ≈ 25 tiles — a realistic floor for
@@ -64,6 +80,27 @@ _TILE_PERCENTILE = 90.0
 _LAP_SCALE = 12.0      # p90 of per-tile Laplacian variance
 _TEN_SCALE = 1200.0    # p90 of per-tile Tenengrad (Sobel² mean)
 _MLAP_SCALE = 7.0      # p90 of per-tile Modified Laplacian
+
+# Micro-texture false-sharp guard (2026-07-26).
+# The Laplacian/Tenengrad focus measures fire on per-pixel contrast, which a
+# defocused frame full of fine, dense micro-texture (fabric weave, dotted
+# pattern, sensor noise) produces *everywhere* — so the p90 tile aggregation,
+# meant to rescue a sharp subject from bokeh, instead reads the uniform texture
+# as uniform sharpness and saturates the score. DSCF0976.JPG (a completely
+# out-of-focus string-lights shot) fused to 18.1 (≈8× threshold → score 100)
+# purely on this artifact; its TOPIQ-NR IQA was 25.6.
+#
+# Fingerprint: real focus keeps structure after a 4× box-downsample; fooling
+# micro-texture collapses (its energy lives entirely in the finest band). We
+# measure the ratio of fine-scale (full-res) to coarse-scale (¼-res) p90
+# Tenengrad. Calibrated on the user's library (2026-07-26): the worst
+# false-sharp cases land at ratio 8.5–20.4, while every genuinely-sharp photo
+# (high IQA) stays ≤ 4.9 — so a 6.0 cutoff catches the extreme micro-texture
+# tail with zero true-sharp collateral. Deliberately conservative: the
+# decision-layer low-IQA guard (Settings → Model) is the primary safety net;
+# this only rescues the metric itself from the most egregious inflation.
+_MICROTEXTURE_RATIO = 6.0     # fine/coarse p90-Tenengrad above this = suspect
+_MICROTEXTURE_CAP   = 1.4     # cap normalized_score here (maps to ~30/100 "Blurry")
 
 
 def _per_tile(arr: np.ndarray, reducer) -> np.ndarray:
@@ -129,6 +166,82 @@ def _compute_focus_measures(gray: np.ndarray) -> dict:
     }
 
 
+def _microtexture_ratio(gray: np.ndarray) -> float:
+    """
+    Fine-to-coarse Tenengrad ratio — the micro-texture false-sharp fingerprint.
+
+    Genuine focus survives a 4× box-downsample (real edges are multi-pixel);
+    fine, dense micro-texture / noise collapses because its energy lives only
+    in the finest band. So a high ratio of full-res p90 Tenengrad to ¼-res p90
+    Tenengrad flags a frame whose "sharpness" is per-pixel texture, not focus.
+    See _MICROTEXTURE_RATIO for calibration. Returns 0.0 on any failure so the
+    caller falls back to the uncapped score (fail-open — never lose a photo to
+    a guard bug).
+    """
+    try:
+        gray64 = gray.astype(np.float64)
+        gx = cv2.Sobel(gray64, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray64, cv2.CV_64F, 0, 1, ksize=3)
+        fine = float(np.percentile(gx * gx + gy * gy, _TILE_PERCENTILE))
+
+        small = cv2.resize(
+            gray64,
+            (max(1, gray64.shape[1] // 4), max(1, gray64.shape[0] // 4)),
+            interpolation=cv2.INTER_AREA,
+        )
+        gxc = cv2.Sobel(small, cv2.CV_64F, 1, 0, ksize=3)
+        gyc = cv2.Sobel(small, cv2.CV_64F, 0, 1, ksize=3)
+        coarse = float(np.percentile(gxc * gxc + gyc * gyc, _TILE_PERCENTILE))
+        return fine / max(coarse, 1.0)
+    except Exception:
+        return 0.0
+
+
+def _score_from_gray(gray: np.ndarray) -> dict:
+    """
+    Shared sharpness scoring on a grayscale image — the common tail of both
+    detect_sharpness() (file path) and detect_sharpness_array() (pre-decoded
+    RGB). Computes the tile-based p90 fusion, then applies the micro-texture
+    cap so a defocused frame full of fine texture can't saturate the score.
+    """
+    height, width = gray.shape
+    tile_measures = _compute_focus_measures(gray)
+
+    p90_lap  = float(np.percentile(tile_measures['laplacian_variance'],  _TILE_PERCENTILE))
+    p90_ten  = float(np.percentile(tile_measures['tenengrad'],           _TILE_PERCENTILE))
+    p90_mlap = float(np.percentile(tile_measures['modified_laplacian'],  _TILE_PERCENTILE))
+
+    normalized_score = float(np.cbrt(
+        (p90_lap  / _LAP_SCALE)
+        * (p90_ten  / _TEN_SCALE)
+        * (p90_mlap / _MLAP_SCALE)
+    ))
+
+    # Micro-texture guard: cap an inflated score when the frame's apparent
+    # sharpness is fine per-pixel texture rather than real focus. Only ever
+    # lowers a score, and only when it's already above the cap — a genuinely
+    # sharp photo (ratio ≤ ~5) is never touched.
+    microtexture_ratio = _microtexture_ratio(gray)
+    microtexture_capped = (
+        microtexture_ratio >= _MICROTEXTURE_RATIO
+        and normalized_score > _MICROTEXTURE_CAP
+    )
+    if microtexture_capped:
+        normalized_score = _MICROTEXTURE_CAP
+
+    return {
+        'raw_score': p90_lap,
+        'normalized_score': normalized_score,
+        'p90_laplacian_variance': p90_lap,
+        'p90_tenengrad': p90_ten,
+        'p90_modified_laplacian': p90_mlap,
+        'microtexture_ratio': round(microtexture_ratio, 2),
+        'microtexture_capped': microtexture_capped,
+        'width': width,
+        'height': height,
+    }
+
+
 def get_threshold(image_path, thresholds=None):
     """Return the sharpness threshold for a given file format."""
     ext = image_path.suffix.lstrip('.').upper()
@@ -153,12 +266,14 @@ def detect_sharpness(image_path):
             'p90_laplacian_variance'    — p90 of per-tile Laplacian variance
             'p90_tenengrad'             — p90 of per-tile Tenengrad
             'p90_modified_laplacian'    — p90 of per-tile Modified Laplacian
+            'microtexture_ratio'        — fine/coarse Tenengrad (false-sharp fingerprint)
+            'microtexture_capped'       — True if the micro-texture guard fired
             'width', 'height'           — image dimensions
         or None on error.
     """
     try:
         # Load image (raw via rawpy demosaic, with thumbnail fallback)
-        if image_path.suffix.upper() in ['.RAF', '.NEF']:
+        if image_path.suffix.lower() in RAW_DECODE_SUFFIXES:
             try:
                 with rawpy.imread(str(image_path)) as raw:
                     rgb = raw.postprocess(
@@ -175,40 +290,20 @@ def detect_sharpness(image_path):
         else:
             rgb = cv2.imread(str(image_path))
             if rgb is None:
-                return None
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                # OpenCV has no built-in HEIF/HIF decoder — falls through here
+                # for .hif (and any other format Pillow can read but cv2
+                # can't). pillow-heif's opener is registered globally in
+                # backend/main.py.
+                from PIL import Image as _PILImage
+                with _PILImage.open(str(image_path)) as pil_img:
+                    rgb = np.array(pil_img.convert("RGB"))
+            else:
+                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        height, width = gray.shape
-
-        tile_measures = _compute_focus_measures(gray)
-
-        # p90 across all 256 tiles for each measure. Percentile (not max)
-        # because max is fooled by a single noisy tile; p90 needs ~25 tiles to
-        # be in focus, matching the minimum realistic subject-in-focus area.
-        p90_lap = float(np.percentile(tile_measures['laplacian_variance'], _TILE_PERCENTILE))
-        p90_ten = float(np.percentile(tile_measures['tenengrad'], _TILE_PERCENTILE))
-        p90_mlap = float(np.percentile(tile_measures['modified_laplacian'], _TILE_PERCENTILE))
-
-        # Geometric mean of scale-normalized p90 values. Geometric mean still
-        # penalizes any single weak measure, but since all three are now
-        # computed on the same sharp-region tiles, a truly sharp subject
-        # pushes all three up together — they no longer fight each other.
-        normalized_score = float(np.cbrt(
-            (p90_lap / _LAP_SCALE)
-            * (p90_ten / _TEN_SCALE)
-            * (p90_mlap / _MLAP_SCALE)
-        ))
-
-        return {
-            'raw_score': p90_lap,
-            'normalized_score': normalized_score,
-            'p90_laplacian_variance': p90_lap,
-            'p90_tenengrad': p90_ten,
-            'p90_modified_laplacian': p90_mlap,
-            'width': width,
-            'height': height,
-        }
+        # Tile-based p90 fusion + micro-texture cap — shared with the
+        # pre-decoded path in detect_sharpness_array via _score_from_gray.
+        return _score_from_gray(gray)
     except Exception as e:
         print(f"   ⚠️  Error processing {image_path.name}: {e}")
         return None
@@ -224,29 +319,8 @@ def detect_sharpness_array(rgb: np.ndarray) -> dict | None:
     """
     try:
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        height, width = gray.shape
-
-        tile_measures = _compute_focus_measures(gray)
-
-        p90_lap  = float(np.percentile(tile_measures['laplacian_variance'],   _TILE_PERCENTILE))
-        p90_ten  = float(np.percentile(tile_measures['tenengrad'],            _TILE_PERCENTILE))
-        p90_mlap = float(np.percentile(tile_measures['modified_laplacian'],   _TILE_PERCENTILE))
-
-        normalized_score = float(np.cbrt(
-            (p90_lap  / _LAP_SCALE)
-            * (p90_ten  / _TEN_SCALE)
-            * (p90_mlap / _MLAP_SCALE)
-        ))
-
-        return {
-            'raw_score': p90_lap,
-            'normalized_score': normalized_score,
-            'p90_laplacian_variance': p90_lap,
-            'p90_tenengrad': p90_ten,
-            'p90_modified_laplacian': p90_mlap,
-            'width': width,
-            'height': height,
-        }
+        # Same tile-based p90 fusion + micro-texture cap as the file path.
+        return _score_from_gray(gray)
     except Exception as e:
         print(f"   ⚠️  Sharpness array analysis error: {e}")
         return None
@@ -267,13 +341,12 @@ def analyze_folder(folder_path, thresholds=None, output_csv=True):
     folder = Path(folder_path)
     thresholds = thresholds or THRESHOLDS
 
-    # Supported formats
-    formats = ['.jpg', '.jpeg', '.JPG', '.JPEG', '.RAF', '.NEF', '.nef']
-
-    # Find all photos
-    photos = []
-    for fmt in formats:
-        photos.extend(folder.glob(f'*{fmt}'))
+    # Find all photos. Case-insensitive on the extension so a folder mixing
+    # .JPG and .jpg (or .DNG and .dng) is walked once, not once per casing.
+    photos = sorted(
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
 
     if not photos:
         print(f"❌ No photos found in {folder}")
@@ -401,6 +474,15 @@ def detect_camera(filename):
 if __name__ == "__main__":
     import sys
 
+    # backend/main.py normally registers this at app import; the standalone CLI
+    # never loads the app, so without it every .hif in the folder fails its
+    # Pillow fallback and is silently dropped from the calibration set.
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
+
     # Usage: python phase1_technical/batch_sharpness_analyzer.py /path/to/folder [threshold]
 
     if len(sys.argv) < 2:
@@ -414,7 +496,9 @@ if __name__ == "__main__":
     jpg_threshold = float(sys.argv[2]) if len(sys.argv) > 2 else THRESHOLDS['JPG']
     raw_threshold = float(sys.argv[3]) if len(sys.argv) > 3 else THRESHOLDS['RAF']
 
+    # The [raw_threshold] argument applies to every RAW format, not just the
+    # two that used to be spelled out here.
     custom_thresholds = {**THRESHOLDS, 'JPG': jpg_threshold, 'JPEG': jpg_threshold,
-                         'RAF': raw_threshold, 'NEF': raw_threshold}
+                         **{fmt: raw_threshold for fmt in RAW_FORMATS}}
 
     analyze_folder(folder_path, thresholds=custom_thresholds)

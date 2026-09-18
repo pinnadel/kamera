@@ -105,6 +105,105 @@ routed. The routing only fires when the personal model is in "Ready" state
 ([decisions.py:208](backend/routers/decisions.py#L208)). Below readiness the
 ensemble isn't consulted.
 
+### Why did auto-cull keep several near-identical photos from one burst — or send some to Reject?
+
+Auto-cull scores every photo **independently**, so a run of near-identical
+frames (same pose, seconds apart) can each clear the Keep cutoff on their own.
+The **Deduplicate Keeps within a burst** pass (Settings → Model → Decision
+thresholds, on by default) reconciles that against the burst grouping you see
+in the UI. For each burst it:
+
+- Always keeps the single best photo (same priority as the group's amber-star
+  hero pick).
+- Lets a few **extra** frames also Keep — but only genuinely strong ones: each
+  must clear the Keep cutoff by a margin *and* score close to the burst's best
+  frame, up to a maximum number of Keeps per burst.
+- **Rejects near-pixel-identical duplicates** outright: if two frames are
+  visually near-identical (cosine ≥ 0.97, the same test the AI burst ranker
+  uses), the lower-scoring one is redundant regardless of its score and goes
+  straight to Reject.
+- Demotes the rest, **graded**: a close alternate goes to **Maybe**; a clearly
+  weaker frame (well below the best, or under the Maybe cutoff) goes to
+  **Reject**. And once the burst has already kept a few Maybe alternates, every
+  *further* redundant frame is Rejected too — this is what stops a 30-frame
+  burst from dumping 29 Maybes on you. A big tight burst ends up roughly *1
+  Keep + 2 Maybes + the rest Reject* instead of *1 Keep + 29 Maybes*.
+
+**Distinct scenes within one burst keep their own budget.** The time-gap
+grouping can lump *visually different* shots into one burst — you shoot one
+angle, pan, and shoot a completely different angle a few seconds later, still
+inside the burst's time window. The dedup pass detects those distinct sub-scenes
+(cosine union-find at 0.94, stricter than the 0.90 that forms the burst) and
+gives **each scene its own Keep/Maybe budget**. So a burst that's really two
+different framings can auto-Keep two photos — one per scene — instead of
+rejecting the second as a "redundant" copy of the first. A burst that's genuinely
+one moment still collapses to a single Keep. A frame the model can't place
+visually (missing embedding) gets its own scene and is kept, never auto-rejected.
+
+Five knobs sit under the toggle. The score-based ones read `personal_score`
+points once the model is Ready, `overall_score` points before that:
+
+- **Max Keeps per burst** (default `2`) — how many photos from one burst may
+  auto-Keep, counting the best. **Set to `1`** to keep only the single best
+  photo per burst (the original behaviour).
+- **Max Maybe alternates per burst** (default `2`) — after the Keeps, how many
+  more frames may stay as Maybe for review before the rest auto-Reject. **Set
+  to `0`** to reject every non-kept frame; raise it for a wider safety net.
+- **Extra-keep margin above cutoff** (default `8`) — how far over the Keep
+  cutoff an extra frame must score to survive. Higher = pickier.
+- **Extra-keep closeness to best** (default `6`) — how close to the best frame
+  an extra frame must be. Lower = only near-identical-quality frames double-keep.
+- **Reject when this far below best** (default `20`) — a non-surviving frame
+  more than this far below the best (or below the Maybe cutoff) is Rejected
+  instead of routed to Maybe. Raise it to make this specific Reject rarer.
+
+The pass uses whichever score drove each photo's Keep verdict —
+`personal_score` once the model is Ready, `overall_score` in threshold-fallback
+mode. It runs in both the live preview and the committed run, so the counts you
+see before committing match what happens. See
+[`_cap_burst_keeps`](backend/routers/decisions.py) and the burst keep-guarantee
+floor pass, which still rescues a burst that would otherwise end up with zero
+Keeps.
+
+### Does the grouping Time-gap slider affect auto-cull?
+
+**No — auto-cull dedup ignores the Time-gap entirely.** That slider (Settings →
+Grouping) only shapes the groups you *browse* in Bursts / GroupLoupe. Auto-cull's
+burst dedup groups by **visual similarity only**.
+
+This is deliberate. The Time-gap can only ever split bursts *coarser* than the
+camera's inter-frame spacing — and continuous shooting fires several frames
+within one EXIF second (timestamps are second-resolution), so those frames share
+a timestamp and **no gap can separate them**. On a library of fast bursts the
+slider was effectively inert for auto-cull. Cosine similarity, by contrast, *can*
+tell those frames apart. So auto-cull forms its groups with the **Similarity**
+threshold and decides how many survive within each group via the **Max Keeps /
+Max Maybe alternates per burst** budgets. Those are the real levers.
+
+("But won't similarity-only grouping merge two separate moments minutes apart
+into one giant burst?" — no: the dedup pass then splits each group into distinct
+visual sub-scenes at cosine 0.94 and budgets each scene separately, so distinct
+moments each keep their own photos. See the burst-dedup FAQ above.)
+
+### Why does the auto-cull Keep/Maybe/Reject count barely move when I change grouping?
+
+Because burst dedup can only re-decide photos that were **already Keeps**. The
+Auto-cull preview's Rejects come from two independent sources:
+
+1. **Per-photo quality rejects** (the personal model's own call, or the quality
+   thresholds below readiness) — usually the large majority. These are decided
+   photo-by-photo and **no grouping change can touch them**. If the model
+   already rejected a soft or badly-exposed frame, it stays rejected.
+2. **Redundant burst-frame rejects** — the only ones grouping affects. Raise the
+   **Similarity** threshold or lower the **Max Keeps / Max Maybe** budgets → more
+   redundant frames demoted; loosen them → fewer.
+
+The Auto-cull modal shows this split explicitly (a line like *"12 rejected as
+redundant burst frames · 281 from per-photo quality"*), plus a "Redundant burst
+frame" row in **Why rejected?**. If the counts barely move, it's telling you your
+model is doing most of the culling on its own — the burst dedup is a small
+top-up, and the lever to make it more aggressive is Similarity + the budgets.
+
 ### Does auto-cull teach the personal model?
 
 No. The personal model learns **only** from your manual K/M/X decisions —
@@ -128,9 +227,47 @@ touched contributes nothing to training.
 
 ## Files & workflow
 
+### Which file formats can KaMeRa analyze?
+
+**Short answer:** RAF · NEF · 3FR · DNG · ARW · CR2 · CR3 · JPG/JPEG · PNG ·
+TIFF · HIF. `.3FR` (Hasselblad X2D II) and `.DNG` (DJI drones, Adobe DNG
+Converter output, natively-DNG cameras) are both fully supported.
+
+The single source of truth is
+[constants.py::RAW_FORMATS](backend/constants.py#L30). Two other constants are
+*derived* from it and should never be edited by hand:
+
+- `RAW_DECODE_SUFFIXES` — lowercase, dot-prefixed mirror, for matching
+  `path.suffix.lower()`. Every scorer's RAW decode branch imports this.
+- `SUPPORTED_EXTENSIONS` — the union of `RAW_DECODE_SUFFIXES` and the
+  processed formats. This is the gate the analyzer, the file watcher, and
+  `GET /images`' folder scan walk with.
+
+**Why the derivation matters:** the two constants used to be maintained
+separately, and a format could be listed as decodable in `RAW_FORMATS` while
+being missing from `SUPPORTED_EXTENSIONS` — in which case the files were never
+*discovered*, which on screen is indistinguishable from an empty folder. That's
+exactly what happened to `.dng`/`.arw`/`.cr2`/`.cr3` until 2026-08-28.
+`tests/test_raw_format_coverage.py` now fails if they drift apart, or if any
+scorer reintroduces a hardcoded `('.RAF', '.NEF', '.3FR')` tuple.
+
+**Adding a new RAW format** is a one-line change to `RAW_FORMATS` — provided
+rawpy/LibRaw can decode it. Verify with `analyze_photo_quality()` on a real
+file, not `rawpy.imread()`: the former is the actual call site and exercises
+all seven scorers.
+
+Two formats that look supported but aren't analyzed standalone: `.hif` *is*
+analyzed on its own (X100VI / X Half can shoot HIF-only), but becomes
+move-only when a same-stem RAW sits beside it — see
+[is_standalone_hif](backend/constants.py#L77). `.phos` is a Hasselblad
+edit-file and is never analyzed.
+
+Note: ARW / CR2 / CR3 are wired through the same derivation but have never been
+run against real Sony or Canon files.
+
 ### What gets written to disk on every K/M/X decision?
 
-1. **The RAW + sidecar move** to `_Keeps/`, `_Maybes/`, or `_Trash/` (or
+1. **The RAW + sidecar move** to `_Keeps/`, `_Maybes/`, or `_Rejects/` (or
    per-folder overrides). The Fuji `.HIF` companion moves with the RAW when
    present.
 2. **`XMP:Rating` (5/3/1) and `XMP:Label` (Green/Yellow/Red)** to a `.xmp`
@@ -145,8 +282,90 @@ touched contributes nothing to training.
    below.
 
 If `reject_to_system_trash` is enabled, the reject branch routes through
-`send2trash` instead of `_Trash/` and skips the XMP write (the file is no
+`send2trash` instead of `_Rejects/` and skips the XMP write (the file is no
 longer addressable).
+
+### In what order should I work through the buckets after an auto-cull?
+
+**Short answer:** turn on **Only unconfirmed** and the order stops mattering.
+Without it, the one order that never shows you the same photo twice is
+**Rejects → Maybes → Keeps**.
+
+The naive instinct is to rank the buckets by importance. The useful question is
+where a photo *goes* when you touch it. Every bucket feeds the other two —
+Rejects promote to Keep, Maybes split both ways, Keeps demote — so on paper no
+linear order is safe: whatever you visit last receives photos from everything
+before it.
+
+What breaks the tie is that a human verdict is recorded per photo, not per
+bucket. `decisions.reason` is `'manual'` after any K/M/R you press and after
+Mark reviewed, and names the auto-cull rule (`personal_keep`, `closed_eyes`,
+`burst_duplicate`, `uncertain`, …) otherwise
+([decisions.py:600](backend/routers/decisions.py#L600)). The **Only unconfirmed**
+pill in the filter bar filters on exactly that, in every bucket at once
+([format.js::isUnconfirmed](frontend/src/ui/format.js)). With it on, a photo
+you decide leaves the view immediately and never comes back, wherever it
+landed — so you can work the buckets in any order, and the All view plus the
+filter is your whole remaining workload in one list.
+
+**If you'd rather not use the filter,** Rejects → Maybes → Keeps still works,
+for a specific reason:
+
+1. **Rejects** is untouched, so it holds only machine verdicts. A rescue (R→K)
+   goes straight to `_Keeps/_Keeps_reviewed` because manual keeps skip the
+   review gate ([decisions.py:387](backend/routers/decisions.py#L387)) — so it
+   won't show up as awaiting-review work in step 3. Sort by `personal_score`
+   descending and the model's most likely mistakes come first. The one rule:
+   don't press M here, or you'll refill the bucket you visit next.
+2. **Maybes** still holds only auto-Maybes; step 1 pushed nothing into it. K
+   exits to the reviewed folder, R exits into a bucket you're already done with.
+3. **Keeps** last, because both earlier passes feed it. Everything you promoted
+   by hand is already marked reviewed, so the "N auto-culled photos awaiting
+   review" bar scopes itself to the genuine leftovers. Demotions from here fall
+   into finished buckets.
+
+**Pressing the same key again is a confirmation, and it trains.** K on a photo
+auto-culled to Keep writes a `training_samples` row — a human label at the
+model's decision boundary, which is the most valuable kind. **Mark reviewed**
+(the ✓ on hover) is the other half of the pair: it marks the photo as seen
+*without* writing a training sample, so a bulk review can never feed the model
+its own output. Both set `reason = 'manual'`, so both remove the photo from the
+unconfirmed filter.
+
+There is deliberately no "confirm all Maybes/Rejects" button. That would be
+rubber-stamping at scale and would defeat the guard described in "Does
+auto-cull teach the personal model?" above.
+
+### How do I re-test auto-cull on an already-analysed group without re-analysing?
+
+**Short answer:** Multi-select the group's photos, press **U** (or **Cmd+Z**)
+to send them all back to undecided in one keystroke, then run **Auto cull**
+again. Undo only reverses the *decision* — it never touches the analysis, so
+no photos get re-decoded.
+
+Why it's safe to loop: undo (`/undo-decision` →
+[`_apply_undo`](backend/routers/decisions.py#L622)) moves the file back home
+out of `_Keeps`/`_Maybes`/`_Rejects`, deletes the `decisions` row, and drops the
+`training_samples` row for that photo — but it leaves the `images` row
+completely intact. Every score, feature, and embedding stays frozen from the
+original analysis, so the next auto-cull run re-decides from the *same*
+numbers. That's exactly what you want when tuning thresholds or testing a new
+auto-cull rule: change the setting, revert the group, re-cull, compare.
+
+**Bulk undo acts on the whole selection, in every view.** This mirrors K/M/R:
+once a multi-selection is active, one keystroke acts on all selected photos.
+In the grid the multi-select branch runs *before* the undo stack
+([useKeyboard.js:230](frontend/src/hooks/useKeyboard.js#L230) →
+[`bulkSendUndo`](frontend/src/App.jsx#L1664)); the GroupLoupe binds the same
+selection-aware undo. Already-undecided members in the selection are skipped
+(nothing to reverse).
+
+One quirk to expect: a **group tile only ever shows *undecided* members**, so
+once auto-cull has decided a group the photos split out into individual cards
+in the Keep / Maybe / Reject (and All) views. You select *those cards* to
+revert — and because group membership is merged from live state
+([`enrichedGroups`](frontend/src/hooks/useGroups.js#L154)), the reverted photos
+rejoin their group tile immediately, with no folder reload.
 
 ### What happens if I move my photos in Finder after analyzing?
 
@@ -212,6 +431,49 @@ investigating. `GET /analyze-progress` also exposes a live
 `elapsed_seconds` field that grows in real time while the batch runs and
 freezes at the final wall-clock total once `running` flips to `false`.
 
+### Why would TOPIQ and Aesthetic be blank for every photo in a batch?
+
+**Short answer:** A model that failed to load stays failed for the whole
+process, by design. Before 2026-08-28 a thread race could cause that on cold
+start; it's fixed now. If you still see it, restart the app and check
+`data/app.log` for the *first* load error.
+
+`iqa_scorer` and `aesthetic_scorer` each latch a `_load_failed` flag on a fatal
+load error, so subsequent photos short-circuit instead of re-attempting the
+load 700 times ([iqa_scorer.py:79](../phase2_quality/iqa_scorer.py#L79)). That
+guard is deliberate — but it means **one** bad load blanks the column for the
+entire run, and the UI just shows empty values rather than an error.
+
+The race that used to trigger it: `accelerate` initialises weights on the meta
+device via a **global** monkey-patch of `torch.nn.Module.register_parameter`.
+With the seven scorers fanned across a six-worker pool, SigLIP loading in one
+thread made pyiqa build its net on the meta device in another, and that
+thread's `.to(device)` failed with `Cannot copy out of meta tensor`. Every
+torch loader now holds one process-wide lock across construction
+([model_loading.py](../phase2_quality/model_loading.py)); the per-module locks
+that preceded it couldn't help, because the collision was *between* modules.
+
+Recovery if a load fails for some other reason (bad torch upgrade, corrupted
+weight cache): **Settings → Model → Reload models** clears `_load_failed` via
+`reset_load_failed()` and retries, without restarting the app.
+
+### What happens when I drop a whole card into the watched folder at once?
+
+The files queue up and get analyzed **one at a time** by a single worker
+thread — the "analyzing… (N left)" pill counts the backlog down honestly.
+Detected files go onto a `queue.Queue` in
+[backend/file_watcher.py](../backend/file_watcher.py) (`FolderWatcher._enqueue`
+→ `_worker_loop`); repeat events for the same file are deduped via a pending
+set, and the 2s write-settle wait is measured from each file's arrival, so a
+long backlog doesn't re-pay it per file. Expect a few seconds per RAF, ~1s
+per JPEG — a 260-file card takes a while, but the UI stays responsive the
+whole time and progress is visible.
+
+Before 2026-07-19 this spawned one analysis thread **per file**, so a bulk
+card drop launched hundreds of simultaneous RAW decodes and wedged the whole
+backend (334 threads / 16 GB RAM / frozen UI). If the watcher ever looks
+stuck again, check thread count and `data/app.log` before assuming it's dead.
+
 ---
 
 ## Grouping & comparison
@@ -256,6 +518,83 @@ of cosine. See [backend/routers/model.py](../backend/routers/model.py)
 [phase2_quality/similarity_scorer.py](../phase2_quality/similarity_scorer.py)
 `group_by_similarity` (manual-anchor reconciliation phase).
 
+### How do I move a whole group of Maybes (or Rejects) at once?
+
+Two places, both acting on the group members *you can currently see* — a
+survivor culled into a different bucket is left alone:
+
+- **In the grid** (Maybes or Rejects view): hover the amber/coral-bordered
+  run and a small action bar appears at its top-left — "Keep all" and
+  "Reject all" on the Maybes view, "Keep all" / "Maybe all" on the Rejects
+  view (it only offers the two decisions that aren't the one you're
+  looking at). One click moves every visible member of that run.
+- **In the "Group members" overlay** (opened by clicking the survivor chip,
+  e.g. "1 Keep"): each section header (Keeps / Maybes / Rejects) with two or
+  more photos gets the same "…all" buttons, so you can move a whole bucket
+  without touching each row.
+
+Both route through the same undoable `bulkDecide` batch path (one round-trip,
+one Undo entry), so `U` / Cmd+Z reverses the whole move. The grid bar hangs on
+the run's first tile via `runImageIds`; controls live in
+[frontend/src/ui/TileChips.jsx](../frontend/src/ui/TileChips.jsx) `GroupBulkBar`
+and [frontend/src/modals/GroupPartnersOverlay.jsx](../frontend/src/modals/GroupPartnersOverlay.jsx)
+`SectionBulkBar`.
+
+### Why do burst frames look ungrouped in the Keeps view?
+
+They aren't — the **Keeps view deliberately doesn't draw groups**. Three gates
+in [frontend/src/App.jsx](../frontend/src/App.jsx) stack up:
+
+1. `gridItems` ([App.jsx:896](../frontend/src/App.jsx#L896)) emits a `group`
+   tile only from *undecided* members. Any decided photo becomes an
+   individual `{type:'image'}` card, so a fully-culled burst produces zero
+   group tiles.
+2. `displayGridItems` ([App.jsx:1009](../frontend/src/App.jsx#L1009)) drops
+   surviving group tiles under any decision filter other than Undecided.
+3. The re-clustering pass that rebuilds a visual enclosure for *decided*
+   photos (`DecidedGroupTile` + survivor chip) is gated to
+   `reject`/`maybe` only ([App.jsx:1064](../frontend/src/App.jsx#L1064)).
+
+The rationale: on Rejects/Maybes you want to confirm "did a groupmate
+survive?", which is what the chip answers. On Keeps every member already
+survived, so there was nothing to reassure you about. Consequence: the Keeps
+view is the one place where burst membership is invisible.
+
+To see the real grouping, switch the filter to **All** or **Undecided**, or
+open the group in GroupLoupe. To verify from the outside:
+
+```bash
+curl -s "localhost:8000/similarity-groups?threshold=0.90&time_gap_seconds=60" \
+  | python3 -c "import json,sys; [print(g['size'], sorted(i['filename'] for i in g['images'])) for g in json.load(sys.stdin)['groups']]"
+```
+
+### Why did two frames seconds apart still land in different groups?
+
+Three independent gates must all pass, and any one can split a burst. In
+order:
+
+1. **Time gap** — the primary split
+   ([similarity_scorer.py:625](../phase2_quality/similarity_scorer.py#L625)).
+   Default 60s ([useGroups.js:62](../frontend/src/hooks/useGroups.js#L62)).
+   A 61-second gap splits; there is no tolerance band.
+2. **SigLIP cosine ≥ threshold** (default 0.90). Note union-find is
+   *transitive*: two frames at cosine 0.81 still share a group if a chain of
+   intermediate frames links them. So a low pairwise score proves nothing on
+   its own.
+3. **The layered union gate**
+   ([`_pairwise_can_union`](../phase2_quality/similarity_scorer.py#L414)),
+   which runs on every edge that already cleared the cosine threshold:
+   - both frames have a FaceNet embedding → require face cosine ≥ 0.50
+     ([`_FACE_IDENTITY_COS`](../phase2_quality/similarity_scorer.py#L312));
+   - otherwise → scene-tag blocker, then a strict RGB-histogram cosine ≥ 0.90.
+
+Gate 3 is the common surprise. A frame where the subject turns away or gets
+small can score face-cosine ~0.4 against its own neighbour and be denied
+despite a 0.96 SigLIP match — the identity gate reads it as a different
+person. A frame with **no face detected at all** falls to the histogram path
+instead, where a background or exposure change (hist cosine ~0.77) splits it
+off.
+
 ### The grouping defaults look wrong on my library. Can I tune them?
 
 Yes — Settings → Model → Grouping section has the Similarity threshold
@@ -272,7 +611,18 @@ The hero tile in a group is selected by `personal_score` when the model is
 ready, otherwise by `overall_score`. When a vision model is installed in Ollama,
 opening GroupLoupe fires a comparative LLM rank (see "How does AI burst ranking
 work?" below) and the rank-1 photo from that overrides the score-based pick.
-Amber ring + corner star in both Survey and Loupe filmstrip mark the pick.
+Amber ring + corner star in both Survey and Loupe filmstrip mark the pick, and
+both modes now also show the LLM's one-line reason ("AI pick — sharpest eyes,
+subject leaning into frame") — as a small badge under the star in Survey, and
+as a caption over the big preview in Filmstrip mode while the hero photo is
+focused. Non-hero photos the LLM ranked also carry a small numbered badge
+(`2`, `3`, …) so a burst reads as fully triaged, not just "one winner picked."
+
+Press **A** to accept the AI's pick in one keystroke: keeps the hero, rejects
+the rest of the burst, closes the loupe. Same underlying call as the "Keep
+best · Reject rest" toolbar button — the hotkey just skips the mouse. See
+[frontend/src/views/GroupLoupe.jsx](../frontend/src/views/GroupLoupe.jsx)
+`runBatch`, `rankById`.
 
 ### How does AI burst ranking work?
 
@@ -301,6 +651,48 @@ See [phase2_quality/burst_ranker.py](../phase2_quality/burst_ranker.py),
 [backend/group_scoring.py](../backend/group_scoring.py) for the pre-filter helper,
 [backend/routers/model.py](../backend/routers/model.py) `rank_burst_endpoint`,
 [frontend/src/views/GroupLoupe.jsx](../frontend/src/views/GroupLoupe.jsx) `BurstRankStatus`.
+
+### Does the AI burst ranking ever influence auto-cull decisions?
+
+No, and this is deliberate. `/rank-burst` only ever affects the loupe UI (which
+tile gets the amber "AI pick" star, and the hero used by the "Keep best ·
+Reject rest" batch action) — it never writes a decision on its own, and
+`_compute_auto_decision`/`_apply_decision`
+([backend/routers/decisions.py](../backend/routers/decisions.py)) contain no
+reference to it. The personal GBR model (trained only on your own manual
+decisions) is the only thing that drives auto-cull.
+
+The reasoning: `qwen2.5vl` is a generic vision model with generic "good photo"
+priors, not your taste specifically. Letting it influence a *committed*
+decision — even just as a tiebreaker in the burst-keep-guarantee post-pass,
+which only ever promotes to Maybe — would mean a generic model's judgment
+quietly shapes which photos later become training samples (a promoted Maybe
+you confirm or override still trains the model). That's a slow-taste-dilution
+risk, not a performance one, so the LLM stays confined to the one place you're
+actually looking at the photo and can accept or reject its suggestion
+yourself — see the "AI pick" hotkey (**A**) above.
+
+### How do I see why a photo got a particular auto-cull decision?
+
+Two places, with different lifetimes:
+
+- **`decisions.reason`** — the rule that produced the *current* decision
+  (`manual`, `personal_keep`, `closed_eyes`, `burst_keep_guarantee`,
+  `uncertain`, …). Overwritten on re-decision; cleared by Clear Analysis or
+  closing a tab, same as the decision itself.
+- **`auto_decision_log`** — an append-only history of every decision ever
+  made, manual and auto alike (with an `is_auto` flag), keyed on the photo's
+  `uuid` so it survives re-imports. Unlike `decisions`, this table is *not*
+  wiped by Clear Analysis or tab-close — same durability convention as
+  `training_samples`/`shooting_log`. This is what makes questions like "how
+  often does the keep-guarantee actually fire" or "how often do I override
+  auto-cull" answerable from the database instead of guessed at. No UI reads
+  it yet as of 2026-07-25 — it's a foundation for future dashboard/analytics
+  work.
+
+See migrations v49/v50 in [backend/database.py](../backend/database.py) and
+`_apply_decision()` in
+[backend/routers/decisions.py](../backend/routers/decisions.py).
 
 ### When does AI burst ranking start running for a freshly analyzed folder?
 
@@ -421,4 +813,4 @@ picture pane) or Esc close DetailView.
 
 ---
 
-*Last updated: 2026-05-15*
+*Last updated: 2026-07-27*

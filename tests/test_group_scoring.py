@@ -113,7 +113,22 @@ def test_score_candidate_handles_none_without_raising():
 
 def test_top_n_returns_full_list_when_n_exceeds_input():
     images = [_img(id=i, overall_score=i) for i in range(3)]
-    assert len(top_n_candidates(images, 10)) == 3
+    result = top_n_candidates(images, 10)
+    assert len(result) == 3
+    # Regression: the full list must come back in priority order (best first),
+    # not the input order. A prior short-circuit skipped the sort when
+    # n >= len(images) and returned input order, silently making
+    # _collapse_near_duplicates keep the wrong burst representative.
+    assert [im["id"] for im in result] == [2, 1, 0]
+
+
+def test_top_n_sorts_when_n_equals_len():
+    """n == len(images) is the exact case _collapse_near_duplicates hits.
+    The result must still be best-first, regardless of input order."""
+    worse = _img(id=1, sharpness_score=10, overall_score=10)
+    better = _img(id=2, sharpness_score=99, overall_score=99)
+    result = top_n_candidates([worse, better], 2)  # n == len, best listed last
+    assert [im["id"] for im in result] == [2, 1]
 
 
 def test_top_n_picks_highest_by_priority():

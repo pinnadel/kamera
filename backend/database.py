@@ -536,6 +536,82 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
     # default. No-op if it was never set.
     (48, "Drop write_xmp_ratings setting row",
          "DELETE FROM settings WHERE key = 'write_xmp_ratings'"),
+    # v49: Record WHY each current decision was made. The reason names the rule
+    # that fired ('manual', 'auto', 'uncertain', 'burst_keep_guarantee',
+    # 'closed_eyes', 'personal_keep', …). This is CURRENT-STATE only — it lives
+    # on the decisions row and is overwritten on re-decision and deleted when
+    # the tab/analysis is cleared. For durable history see auto_decision_log
+    # (v50). Nullable: pre-existing decision rows have no recorded reason.
+    (49, "Add reason column to decisions",
+         "ALTER TABLE decisions ADD COLUMN reason TEXT"),
+    # v50: Durable append-only audit of every decision (auto AND manual). Unlike
+    # the decisions table, rows here are NEVER overwritten or deleted by closing
+    # a tab / Clear Analysis — keyed on sample_uuid with no FK to images, same
+    # survival semantics as training_samples and shooting_log. This is what
+    # answers "how often does each auto-cull path fire" and "how often do I
+    # override an auto-decision" (is_auto flag + the later manual row on the
+    # same uuid). Append-only: no UNIQUE on sample_uuid, because one photo
+    # legitimately gets many log rows over its life (auto-reject → manual keep).
+    (50, "Create auto_decision_log table",
+         """
+         CREATE TABLE IF NOT EXISTS auto_decision_log (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             sample_uuid   TEXT,
+             image_id      INTEGER,
+             decision      TEXT    NOT NULL CHECK (decision IN ('keep', 'maybe', 'reject')),
+             reason        TEXT,
+             is_auto       INTEGER NOT NULL DEFAULT 0,
+             decided_at    DATETIME NOT NULL DEFAULT (DATETIME('now'))
+         )
+         """),
+    (50, "Index on auto_decision_log.sample_uuid",
+         "CREATE INDEX IF NOT EXISTS idx_auto_decision_log_uuid ON auto_decision_log(sample_uuid)"),
+    (50, "Index on auto_decision_log.decided_at",
+         "CREATE INDEX IF NOT EXISTS idx_auto_decision_log_decided_at ON auto_decision_log(decided_at)"),
+    # v51: Reject destination folder renamed _Trash → _Rejects so the folder on
+    # disk matches the "Reject" verb in the UI. Rewrite any persisted reject
+    # override whose path still ends in the old default subfolder; a genuinely
+    # custom reject destination (anything not ending in /_Trash) is left alone.
+    (51, "Rename reject override paths _Trash → _Rejects",
+         "UPDATE folder_settings SET dest_folder = "
+         "substr(dest_folder, 1, length(dest_folder) - length('/_Trash')) || '/_Rejects' "
+         "WHERE decision = 'reject' AND dest_folder LIKE '%/_Trash'"),
+    # v52: a photo can now come from somewhere that is not a folder on disk.
+    # `source_type` is the DB's source of truth for which write-back backend a
+    # decision uses (backend/sources/) — never parse source_folder for this.
+    # Existing rows are all folder-sourced, which the DEFAULT backfills in one
+    # statement.
+    (52, "Add source_type to images",
+         "ALTER TABLE images ADD COLUMN source_type TEXT NOT NULL DEFAULT 'folder'"),
+    # The Apple Photos asset UUID. Deliberately NOT unique: the same asset can
+    # sit in two albums, i.e. two images rows. images.uuid stays a fresh uuid4
+    # because it is UNIQUE and is the join key for training_samples /
+    # auto_decision_log — coupling that to a foreign namespace would collide.
+    (52, "Add photos_uuid to images",
+         "ALTER TABLE images ADD COLUMN photos_uuid TEXT"),
+    (52, "Index on images.source_type",
+         "CREATE INDEX IF NOT EXISTS idx_images_source_type ON images(source_type)"),
+    (52, "Index on images.photos_uuid",
+         "CREATE INDEX IF NOT EXISTS idx_images_photos_uuid ON images(photos_uuid)"),
+    # Keeps the taste model honest: an iPhone HEIC and a RAF score on entirely
+    # different sharpness/aperture/iso distributions, so Photos decisions train
+    # their own corpus rather than polluting the camera model. Same reasoning as
+    # the RAW+JPEG companion's _train=False in decisions.py.
+    (52, "Add corpus to training_samples",
+         "ALTER TABLE training_samples ADD COLUMN corpus TEXT NOT NULL DEFAULT 'folder'"),
+    # source_folder for a Photos tab is an opaque 'photos://<lib>/<album_uuid>'
+    # key, so the human-readable album name and the owning library need a home.
+    (52, "Create photos_albums table",
+         """
+         CREATE TABLE IF NOT EXISTS photos_albums (
+             source_folder  TEXT PRIMARY KEY,
+             library_path   TEXT NOT NULL,
+             album_uuid     TEXT NOT NULL,
+             album_name     TEXT NOT NULL,
+             album_path     TEXT,
+             last_synced_at DATETIME
+         )
+         """),
 ]
 
 
@@ -657,15 +733,15 @@ def write_shooting_log(
 _DECISION_TO_OVERRIDE_KEY: dict[str, str] = {
     "keep":   "keeps_folder",
     "maybe":  "maybes_folder",
-    "reject": "trash_folder",
+    "reject": "rejects_folder",
 }
 
 
 def get_folder_overrides(source_folder: str, db_path: Path = DEFAULT_DB_PATH) -> dict[str, str]:
     """Return active per-decision overrides for one source folder.
 
-    Result keys are the legacy override names (`keeps_folder`, `maybes_folder`,
-    `trash_folder`) so this slots straight into `resolve_dest_folder`. Missing
+    Result keys are the override names (`keeps_folder`, `maybes_folder`,
+    `rejects_folder`) so this slots straight into `resolve_dest_folder`. Missing
     keys mean "use default subfolder."
     """
     with get_db(db_path) as conn:
@@ -753,7 +829,7 @@ CREATE TABLE IF NOT EXISTS images (
     shake_detected      INTEGER DEFAULT 0,          -- 1 = likely camera shake (SQLite has no BOOL)
 
     -- Pipeline state
-    analysis_status     TEXT    NOT NULL DEFAULT 'pending',  -- 'pending' | 'done' | 'error'
+    analysis_status     TEXT    NOT NULL DEFAULT 'pending',  -- 'pending' | 'done' | 'error' | 'skipped'
     imported_at         DATETIME NOT NULL DEFAULT (DATETIME('now'))
 );
 
@@ -840,7 +916,7 @@ CREATE TABLE IF NOT EXISTS training_samples (
 -- ============================================================
 -- folder_settings
 -- Per-source_folder overrides for K/M/X destination paths.
--- Missing row = use default subfolder (_Keeps / _Maybes / _Trash)
+-- Missing row = use default subfolder (_Keeps / _Maybes / _Rejects)
 -- inside the source_folder. Keyed by (source_folder, decision) so
 -- each analysis carries its own routing without affecting others.
 -- ============================================================

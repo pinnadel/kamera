@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react'
 import { API } from '../api'
-import { formatShutter, iqaLabel, aestheticLabel, faceQualityScore, pickHeadlineScore } from '../ui/format'
+import { formatShutter, iqaLabel, aestheticLabel, faceQualityScore, pickHeadlineScore, needsReview } from '../ui/format'
 import { ScoreBar, InfoTooltip, HoverPopover, ScoreBadge, DecisionBadge, DecisionWord } from '../ui/primitives'
 import { PullVisionModelButton } from '../ui/PullVisionModelButton'
 import { InstallOllamaCTA } from '../ui/InstallOllamaCTA'
@@ -21,6 +21,7 @@ import { THUMB_ASPECT, FILMSTRIP_CHROME_WITH_BADGES, stripHeight } from '../ui/f
 import { Filmstrip, FILMSTRIP_TOOLBAR_HEIGHT } from '../ui/Filmstrip'
 import { CollapsibleSection, Chevron } from '../ui/CollapsibleSection'
 import { useLocalStorageState } from '../hooks/useLocalStorageState'
+import { SELECTION_RING } from '../ui/buttons'
 
 // Fullscreen photo zoom cycle — same model as GroupLoupe + CompareView so
 // click-on-photo behaves consistently app-wide. 1× = fit-to-viewport.
@@ -38,7 +39,7 @@ const FS_ZOOM_SCALES = [1, 1.5, 3]
 // hop between siblings without losing the detail panel context. Without
 // `groupContext`, DetailView behaves exactly as before — prev/next walk
 // the global images array.
-export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, onUndo, onAmend = null, onRegisterDecisionIntent = null, onPrev, onNext, hasPrev, hasNext, autoGenerate, onExplanationGenerated, groupContext = null, onPickGroupMember = null, gridFilmstrip = null, onBulk = null, addToast = null, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, setFilmstripCollapsed = null, onStartStripResize = null, setBottomToolbarSlot = null, suppressPanelResize = false }) {
+export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, onUndo, onAmend = null, onRegisterDecisionIntent = null, onMarkReviewed = null, onPrev, onNext, hasPrev, hasNext, autoGenerate, onExplanationGenerated, groupContext = null, closeOnDecide = true, onPickGroupMember = null, gridFilmstrip = null, onBulk = null, addToast = null, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, setFilmstripCollapsed = null, onStartStripResize = null, setBottomToolbarSlot = null, suppressPanelResize = false }) {
   const shutter = formatShutter(image.shutter_speed)
   // Click on the in-panel photo enters fullscreen (true fullscreen overlay,
   // no info panel, no chrome — UX feedback 2026-05-06). Inside fullscreen,
@@ -266,11 +267,24 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
     const amended = await amendPromise
     if (amended) return
     onDecide(d)
-    if (groupContext) onClose()
-  }, [gridFilmstrip, groupContext, onDecide, onClose, onAmend, onRegisterDecisionIntent])
+    // Group mode normally closes on a decision because App.sendDecision
+    // advances the GLOBAL grid cursor, which would jump out of the group.
+    // A caller that advances within the group itself (the scrub panel's
+    // DetailView) passes closeOnDecide={false} and stays put.
+    if (groupContext && closeOnDecide) onClose()
+  }, [gridFilmstrip, groupContext, closeOnDecide, onDecide, onClose, onAmend, onRegisterDecisionIntent])
   useHotkeys('k', () => decideFromDetail('keep'),   { enableOnFormTags: false }, [decideFromDetail])
   useHotkeys('m', () => decideFromDetail('maybe'),  { enableOnFormTags: false }, [decideFromDetail])
   useHotkeys('r', () => decideFromDetail('reject'), { enableOnFormTags: false }, [decideFromDetail])
+
+  // Mark reviewed — releases an auto-culled keeper (plain _Keeps) into
+  // _Keeps/_Keeps_reviewed so Provenance picks it up. Only ever shown when
+  // needsReview(image) is true (see the button render below), so no guard
+  // needed here beyond onMarkReviewed being wired.
+  const showMarkReviewed = needsReview(image)
+  const markReviewedFromDetail = useCallback(() => {
+    onMarkReviewed?.(image.id)
+  }, [onMarkReviewed, image])
 
   // O — open the focused group in GroupLoupe. Only active when DetailView
   // is showing a group entry from the grid filmstrip; silent no-op for solo
@@ -549,7 +563,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
             const isFocused = img.id === image.id
             const isHero    = img.id === groupContext.best_image_id
             const ring = isFocused
-              ? 'ring-1 ring-[#5BB8D4]'
+              ? SELECTION_RING
               : isHero
                 ? 'ring-1 ring-[rgba(255,255,255,0.20)]'
                 : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.20)]'
@@ -696,20 +710,35 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
             // -mx-3 widens the row 12 px past the header padding so the
             // K/M/R buttons line up with the Section cards in the body,
             // which use the same -mx-3 trick.
-            <div className="-mx-3 flex gap-1.5">
-              {DECISION_BTNS.map(({ d, label, hotkey, activeClass, idleClass }) => (
+            <div className="-mx-3 flex flex-col gap-1.5">
+              <div className="flex gap-1.5">
+                {DECISION_BTNS.map(({ d, label, hotkey, activeClass, idleClass }) => (
+                  <button
+                    key={d}
+                    onClick={() => decideFromDetail(d)}
+                    className={`flex-1 py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1 ${image.decision === d ? activeClass : idleClass}`}
+                  >
+                    <span
+                      className="inline-flex items-center justify-center w-[18px] h-[18px] bg-gradient-to-b from-[#121212] to-[#0d0d0d] rounded-[4px] text-[11px] font-semibold mr-1"
+                      style={{boxShadow:'0 1.5px 0.5px 2.5px rgba(0,0,0,0.4),inset 0 1px 0 rgba(255,255,255,0.08),inset 0 -1px 0 rgba(0,0,0,0.4),0 1px 0 rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.04)'}}
+                    >{hotkey}</span>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {/* Mark reviewed — only for auto-culled keepers still sitting in
+                  plain _Keeps (see docs/PLAN-keeps-reviewed.md). A manual keep
+                  never shows this; it already skipped straight to
+                  _Keeps_reviewed. */}
+              {showMarkReviewed && (
                 <button
-                  key={d}
-                  onClick={() => decideFromDetail(d)}
-                  className={`flex-1 py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1 ${image.decision === d ? activeClass : idleClass}`}
+                  onClick={markReviewedFromDetail}
+                  className="w-full py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1.5 bg-[rgba(125,184,154,0.10)] text-[#7DB89A] border-[rgba(125,184,154,0.30)] hover:opacity-70"
+                  title="Release this photo to Provenance for archiving"
                 >
-                  <span
-                    className="inline-flex items-center justify-center w-[18px] h-[18px] bg-gradient-to-b from-[#121212] to-[#0d0d0d] rounded-[4px] text-[11px] font-semibold mr-1"
-                    style={{boxShadow:'0 1.5px 0.5px 2.5px rgba(0,0,0,0.4),inset 0 1px 0 rgba(255,255,255,0.08),inset 0 -1px 0 rgba(0,0,0,0.4),0 1px 0 rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.04)'}}
-                  >{hotkey}</span>
-                  {label}
+                  <CheckIcon size={13} /> Mark reviewed
                 </button>
-              ))}
+              )}
             </div>
           )}
         </div>
@@ -960,7 +989,7 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
       renderThumb={(item, idx) => {
         const isFocused = idx === focusedIndex
         const ring = isFocused
-          ? 'ring-1 ring-[#5BB8D4]'
+          ? SELECTION_RING
           : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.20)]'
         if (item.type === 'group') {
           const group = item.group
@@ -1000,6 +1029,36 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
                 <span className="absolute top-1 right-1 px-1 py-px rounded text-[9px] font-semibold leading-none bg-[rgba(7,8,10,0.75)] text-[#cecece] ring-1 ring-[rgba(255,255,255,0.10)]">
                   {group.size}
                 </span>
+              </div>
+              <div className="px-1 py-0.5 text-[9px] text-[#9c9c9d] uppercase tracking-wider text-center">
+                Group
+              </div>
+            </div>
+          )
+        }
+        if (item.type === 'decidedGroup') {
+          // A collapsed run of already-decided same-group photos (Maybe/
+          // Reject views). DetailView has no single-hero concept for it and
+          // reviewing it belongs to GroupPartnersOverlay, not this filmstrip
+          // — so it's a non-interactive placeholder, not a navigable stop
+          // (stepFilmstrip/pickFilmstripIndex above skip past it).
+          return (
+            <div
+              key={`dg-${item.groupKey}`}
+              data-filmstrip-idx={idx}
+              style={{ width: `${thumbW}px` }}
+              className="relative flex-shrink-0 rounded-md bg-[#161718] ring-1 ring-[rgba(255,255,255,0.06)] opacity-60 cursor-default"
+              title={`Group of ${item.images.length} ${item.decision === 'reject' ? 'rejects' : 'maybes'}`}
+            >
+              <div
+                style={{ height: `${thumbH}px` }}
+                className="relative bg-[#07080a] flex items-center justify-center overflow-hidden rounded-t-md"
+              >
+                <img
+                  src={`${API}/previews/${item.hero.id}`}
+                  alt=""
+                  className="max-h-full max-w-full object-contain"
+                />
               </div>
               <div className="px-1 py-0.5 text-[9px] text-[#9c9c9d] uppercase tracking-wider text-center">
                 Group

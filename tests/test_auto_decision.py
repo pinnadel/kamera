@@ -29,6 +29,8 @@ DEFAULT_T = {
     "face_sharpness_floor":         40.0,
     "reject_soft_face":             False,
     "reject_blurry_frame":          False,
+    "reject_low_iqa":               False,   # opt-in per test
+    "iqa_floor":                    30.0,
     "reject_closed_eyes":           False,
     "reject_closed_eyes_all_faces": False,
     "reject_reciprocal_rule":       False,
@@ -69,6 +71,7 @@ def _row(**overrides) -> dict:
         "background_distraction_score": None,
         "faces_eyes_open_json": None,
         "personal_score": None,
+        "iqa_score": 60,
     }
     base.update(overrides)
     return base
@@ -200,6 +203,42 @@ def test_soft_face_not_triggered_when_whole_frame_is_blurry():
     )
     decision, reason = _compute_auto_decision(row, _t(reject_soft_face=True))
     assert reason != "soft_face"
+
+
+# ---------------------------------------------------------------------------
+# Low-IQA instant reject — catches the false-sharp failure mode (a defocused
+# frame full of fine micro-texture that fools the Phase-1 sharpness metric but
+# scores low on TOPIQ-NR perceptual quality). On by default in production.
+# ---------------------------------------------------------------------------
+
+
+def test_low_iqa_rejects_even_when_sharpness_score_is_high():
+    # The exact DSCF0976 pathology: sharpness pinned to 100, IQA in the tank.
+    row = _row(sharpness_score=100, overall_score=99, iqa_score=25.6)
+    assert _compute_auto_decision(row, _t(reject_low_iqa=True)) == (
+        "reject", "low_iqa",
+    )
+
+
+def test_low_iqa_at_floor_does_not_reject():
+    # Boundary is strict-less-than, so a photo exactly at the floor survives.
+    row = _row(sharpness_score=100, iqa_score=30.0)
+    decision, reason = _compute_auto_decision(row, _t(reject_low_iqa=True, iqa_floor=30.0))
+    assert reason != "low_iqa"
+
+
+def test_low_iqa_disabled_does_not_reject():
+    row = _row(sharpness_score=100, overall_score=99, iqa_score=10)
+    decision, reason = _compute_auto_decision(row, _t(reject_low_iqa=False))
+    assert reason != "low_iqa"
+
+
+def test_low_iqa_null_score_never_rejects():
+    # Older rows / analysis errors carry iqa_score=None — a missing signal
+    # must never cull a photo.
+    row = _row(sharpness_score=100, iqa_score=None)
+    decision, reason = _compute_auto_decision(row, _t(reject_low_iqa=True))
+    assert reason != "low_iqa"
 
 
 # ---------------------------------------------------------------------------

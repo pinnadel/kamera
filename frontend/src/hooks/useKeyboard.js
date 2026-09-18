@@ -13,14 +13,24 @@
 //
 // Selection model: each grid cell carries a roving tabIndex (one cell at
 // tabIndex=0, others at tabIndex=-1). Arrow keys walk `displayGridItems` —
-// landing on a photo sets `selectedIdx`, landing on a group sets
-// `selectedGroupId`. K/M/R only act on photos. Enter or Space on a focused
-// group opens the GroupLoupe; Space on a focused photo toggles DetailView —
-// unless 2+ photos are staged for comparison, in which case Space opens the
-// Compare overlay (matches the floating "Compare N" button).
+// landing on a photo sets `selectedIdx`, landing on an undecided group sets
+// `selectedGroupId`, landing on a collapsed same-decision group (Maybe/Reject
+// views) sets `selectedDecidedGroupKey`. K/M/R only act on photos — neither
+// group kind has a single decision to apply. Enter or Space on a focused
+// undecided group opens GroupLoupe; on a focused decided group it opens
+// GroupPartnersOverlay (already-decided members, nothing to rank); Space on a
+// focused photo toggles DetailView — unless 2+ photos are staged for
+// comparison, in which case Space opens the Compare overlay (matches the
+// floating "Compare N" button).
 //
 // When GroupLoupe is open, this hook backs off entirely — the loupe owns
 // K/M/X/arrows/Enter/S/Z/Esc via its own useHotkeys calls (see GroupLoupe.jsx).
+//
+// Same for the group hover-scrub panel (`scrubOpen`): while it's on screen it
+// owns arrows / K/M/R / U / Space / Enter / Esc against the frame IT is
+// showing (ui/GroupScrubPreview.jsx). Hovering a group tile is an explicit
+// "I mean this burst" — the grid's own cursor, which may be parked anywhere,
+// must not answer the same keypress as well.
 
 import { useHotkeys } from 'react-hotkeys-hook'
 
@@ -28,13 +38,17 @@ export function useKeyboard({
   activeView,
   detailOpen,
   setDetailOpen,
+  closeDetail,
   images,
   selectedIdx,
   setSelectedIdx,
   selectedGroupId,
   setSelectedGroupId,
+  selectedDecidedGroupKey,
+  setSelectedDecidedGroupKey,
   displayGridItems,
   enterLoupe,
+  openPartnersOverlay,
   sendDecision,
   setUserCols,
   undoImage,
@@ -42,11 +56,14 @@ export function useKeyboard({
   cols,
   gridRef,
   loupeOpen,
+  scrubOpen,
   multiSelectActive,
   bulkSendDecision,
+  bulkSendUndo,
   runUndo,
   amendLastDecision,
   registerDecisionIntent,
+  toggleFilenames,
 }) {
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -64,6 +81,11 @@ export function useKeyboard({
         item => item.type === 'group' && item.group.best_image_id === selectedGroupId
       )
     }
+    if (selectedDecidedGroupKey != null) {
+      return displayGridItems.findIndex(
+        item => item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
+      )
+    }
     const photo = images[selectedIdx]
     if (!photo) return -1
     return displayGridItems.findIndex(
@@ -72,15 +94,22 @@ export function useKeyboard({
   }
 
   // Apply selection to whatever item sits at `targetIdx`. Photo → set
-  // selectedIdx + clear group cursor. Group → set selectedGroupId. Out-of-
-  // bounds is a no-op (don't wrap; the user can see they're at an edge).
+  // selectedIdx + clear both group cursors. Undecided group → set
+  // selectedGroupId. Collapsed decided group (Maybe/Reject) → set
+  // selectedDecidedGroupKey. Out-of-bounds is a no-op (don't wrap; the user
+  // can see they're at an edge).
   const focusItemAt = (targetIdx) => {
     if (targetIdx < 0 || targetIdx >= displayGridItems.length) return
     const item = displayGridItems[targetIdx]
     if (item.type === 'group') {
+      setSelectedDecidedGroupKey(null)
       setSelectedGroupId(item.group.best_image_id)
+    } else if (item.type === 'decidedGroup') {
+      setSelectedGroupId(null)
+      setSelectedDecidedGroupKey(item.groupKey)
     } else {
       setSelectedGroupId(null)
+      setSelectedDecidedGroupKey(null)
       const i = images.findIndex(img => img.id === item.image.id)
       if (i >= 0) setSelectedIdx(i)
     }
@@ -89,44 +118,46 @@ export function useKeyboard({
   // ── Arrow navigation ─────────────────────────────────────────────────────
 
   useHotkeys('arrowRight', () => {
-    if (loupeOpen || activeView !== 'grid' || detailOpen) return
+    if (loupeOpen || scrubOpen || activeView !== 'grid' || detailOpen) return
     if (!gridHasFocus()) return
     const cur = findCurrentIdx()
     if (cur < 0) { focusItemAt(0); return }
     focusItemAt(cur + 1)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId])
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
   useHotkeys('arrowLeft', () => {
-    if (loupeOpen || activeView !== 'grid' || detailOpen) return
+    if (loupeOpen || scrubOpen || activeView !== 'grid' || detailOpen) return
     if (!gridHasFocus()) return
     const cur = findCurrentIdx()
     if (cur < 0) { focusItemAt(0); return }
     focusItemAt(cur - 1)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId])
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
   useHotkeys('arrowDown', (e) => {
-    if (loupeOpen || activeView !== 'grid' || detailOpen) return
+    if (loupeOpen || scrubOpen || activeView !== 'grid' || detailOpen) return
     if (!gridHasFocus()) return
     e.preventDefault()
     const cur = findCurrentIdx()
     if (cur < 0) { focusItemAt(0); return }
     const target = Math.min(cur + cols(), displayGridItems.length - 1)
     focusItemAt(target)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, cols])
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey, cols])
 
   useHotkeys('arrowUp', (e) => {
-    if (loupeOpen || activeView !== 'grid' || detailOpen) return
+    if (loupeOpen || scrubOpen || activeView !== 'grid' || detailOpen) return
     if (!gridHasFocus()) return
     e.preventDefault()
     const cur = findCurrentIdx()
     if (cur < 0) { focusItemAt(0); return }
     const target = Math.max(cur - cols(), 0)
     focusItemAt(target)
-  }, [loupeOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, cols])
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey, cols])
 
   // ── Decision keys (K / R / M) ────────────────────────────────────────────
-  // No-op when a group tile is focused — per-photo decisions live inside the
-  // loupe. Also gated on grid focus so K from the search bar etc. is inert.
+  // No-op when a group tile (undecided OR a collapsed decided group) is
+  // focused — neither has a single photo to decide on; re-culling members of
+  // a decided group happens via GroupPartnersOverlay or the bulk-action bar,
+  // not K/M/R. Also gated on grid focus so K from the search bar etc. is inert.
 
   // Decision keys take the bulk path when a multi-selection is active —
   // K/M/R applies to every selected photo and the selection stays in place.
@@ -154,58 +185,74 @@ export function useKeyboard({
     const amended = await amendPromise
     if (amended) return
     if (multiSelectActive) { bulkSendDecision?.(decision); return }
-    if (selectedGroupId != null) return
+    if (selectedGroupId != null || selectedDecidedGroupKey != null) return
     sendDecision(decision)
   }
 
   useHotkeys('k', () => {
-    if (loupeOpen || detailOpen || activeView !== 'grid') return
+    if (loupeOpen || scrubOpen || detailOpen || activeView !== 'grid') return
     if (!gridHasFocus()) return
     decideOrAmend('keep')
-  }, [loupeOpen, detailOpen, activeView, selectedGroupId, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
+  }, [loupeOpen, scrubOpen, detailOpen, activeView, selectedGroupId, selectedDecidedGroupKey, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
 
   useHotkeys('r', () => {
-    if (loupeOpen || detailOpen || activeView !== 'grid') return
+    if (loupeOpen || scrubOpen || detailOpen || activeView !== 'grid') return
     if (!gridHasFocus()) return
     decideOrAmend('reject')
-  }, [loupeOpen, detailOpen, activeView, selectedGroupId, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
+  }, [loupeOpen, scrubOpen, detailOpen, activeView, selectedGroupId, selectedDecidedGroupKey, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
 
   useHotkeys('m', () => {
-    if (loupeOpen || detailOpen || activeView !== 'grid') return
+    if (loupeOpen || scrubOpen || detailOpen || activeView !== 'grid') return
     if (!gridHasFocus()) return
     decideOrAmend('maybe')
-  }, [loupeOpen, detailOpen, activeView, selectedGroupId, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
+  }, [loupeOpen, scrubOpen, detailOpen, activeView, selectedGroupId, selectedDecidedGroupKey, sendDecision, multiSelectActive, bulkSendDecision, amendLastDecision])
 
   // ── Open / detail / escape ───────────────────────────────────────────────
-  // Space and Enter both open the focused thing: a group → GroupLoupe, a
-  // photo → DetailView. Symmetric "open this cell" gesture.
+  // Space and Enter both open the focused thing: an undecided group →
+  // GroupLoupe, a collapsed decided group → GroupPartnersOverlay, a photo →
+  // DetailView. Symmetric "open this cell" gesture.
 
   useHotkeys('space', (e) => {
-    if (loupeOpen) return
+    if (loupeOpen || scrubOpen) return
     if (activeView !== 'grid') return
+    // Closing DetailView is NOT gated on grid focus — same as escape below.
+    // DetailView is a full-screen surface, so whatever holds focus behind it
+    // is irrelevant, and a scrub-opened one has a panel to hand back to.
+    if (detailOpen) { e.preventDefault(); closeDetail(); return }
     if (!gridHasFocus()) return
     e.preventDefault()
     if (selectedGroupId != null) {
       enterLoupe?.(selectedGroupId)
       return
     }
-    setDetailOpen(o => !o)
-  }, [loupeOpen, activeView, selectedGroupId, enterLoupe])
+    if (selectedDecidedGroupKey != null) {
+      openPartnersOverlay?.(selectedDecidedGroupKey)
+      return
+    }
+    setDetailOpen(true)
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, closeDetail, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openPartnersOverlay])
 
   useHotkeys('enter', (e) => {
-    if (loupeOpen) return
+    if (loupeOpen || scrubOpen) return
     if (activeView !== 'grid') return
     if (detailOpen) return
     if (!gridHasFocus()) return
-    if (selectedGroupId == null) return
-    e.preventDefault()
-    enterLoupe?.(selectedGroupId)
-  }, [loupeOpen, activeView, detailOpen, selectedGroupId, enterLoupe])
+    if (selectedGroupId != null) {
+      e.preventDefault()
+      enterLoupe?.(selectedGroupId)
+      return
+    }
+    if (selectedDecidedGroupKey != null) {
+      e.preventDefault()
+      openPartnersOverlay?.(selectedDecidedGroupKey)
+    }
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openPartnersOverlay])
 
   useHotkeys('escape', () => {
-    if (detailOpen) { setDetailOpen(false); return }
+    if (scrubOpen) return
+    if (detailOpen) { closeDetail(); return }
     if (loupeOpen) return
-  }, [loupeOpen, detailOpen])
+  }, [loupeOpen, scrubOpen, detailOpen, closeDetail])
 
   // ── Undo (Cmd+Z / U) ─────────────────────────────────────────────────────
   //
@@ -215,25 +262,29 @@ export function useKeyboard({
   // cell is a group (group has no single decision to revert) or when the
   // photo has no decision yet.
 
-  // U / Cmd+Z pops the app-global undo stack (last K/M/R or group action,
-  // single or bulk, from any surface). When the stack is empty, fall back
-  // to per-photo undo for whatever's currently focused — preserves the
-  // "I just decided this photo, take it back" gesture for users who
-  // didn't realise there's a stack now.
+  // Priority order mirrors decideOrAmend so U/Cmd+Z stays consistent with
+  // K/M/R:
+  //  1. Multi-selection active → revert EVERY selected photo to undecided.
+  //     This is an explicit "these photos" instruction and must win over the
+  //     stack, exactly as bulk K/M/R wins over the single-photo path.
+  //  2. Otherwise pop the app-global undo stack (last K/M/R or group action).
+  //  3. Stack empty → per-photo undo for whatever's currently focused,
+  //     preserving the "I just decided this photo, take it back" gesture.
   const runUndoGated = async () => {
-    if (loupeOpen || activeView !== 'grid') return
+    if (loupeOpen || scrubOpen || activeView !== 'grid') return
+    if (multiSelectActive) { bulkSendUndo?.(); return }
     if (runUndo) {
       const handled = await runUndo()
       if (handled) return
     }
-    if (selectedGroupId != null) return
+    if (selectedGroupId != null || selectedDecidedGroupKey != null) return
     const img = images[selectedIdx]
     if (!img) return
     undoImage(img.id)
   }
 
-  useHotkeys('meta+z', runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo])
-  useHotkeys('u',      runUndoGated, [loupeOpen, activeView, selectedGroupId, images, selectedIdx, undoImage, runUndo])
+  useHotkeys('meta+z', runUndoGated, [loupeOpen, scrubOpen, activeView, selectedGroupId, selectedDecidedGroupKey, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
+  useHotkeys('u',      runUndoGated, [loupeOpen, scrubOpen, activeView, selectedGroupId, selectedDecidedGroupKey, images, selectedIdx, undoImage, runUndo, multiSelectActive, bulkSendUndo])
 
   // ── Thumbnail size (= / -) ───────────────────────────────────────────────
 
@@ -241,11 +292,21 @@ export function useKeyboard({
     if (loupeOpen || activeView !== 'grid') return
     e.preventDefault()
     setUserCols(c => Math.max(2, (c ?? 6) - 1))
-  }, [loupeOpen, activeView])
+  }, [loupeOpen, scrubOpen, activeView])
 
   useHotkeys('-', (e) => {
     if (loupeOpen || activeView !== 'grid') return
     e.preventDefault()
     setUserCols(c => Math.min(8, (c ?? 6) + 1))
-  }, [loupeOpen, activeView])
+  }, [loupeOpen, scrubOpen, activeView])
+
+  // ── Filename visibility (F) ──────────────────────────────────────────────
+  // Toggles the filename row under every grid tile. Grid-only, like the
+  // thumbnail-size keys. Not gated on grid focus: it's a view preference the
+  // user expects to flip from anywhere in the grid view, same as = / -.
+  useHotkeys('f', (e) => {
+    if (loupeOpen || activeView !== 'grid') return
+    e.preventDefault()
+    toggleFilenames?.()
+  }, [loupeOpen, scrubOpen, activeView, toggleFilenames])
 }

@@ -21,6 +21,7 @@ from pathlib import Path
 from PIL import Image
 
 from phase2_quality.model_status import begin as _begin, end as _end
+from phase2_quality.model_loading import MODEL_LOAD_LOCK
 
 
 # TOPIQ is pinned to CPU. pyiqa's TOPIQ model wraps a CLIP semantic backbone
@@ -68,6 +69,12 @@ _MAX_SIDE = 1024
 _metric = None
 _load_failed = False  # Set after a fatal load error so we don't retry every photo.
 
+# Serialises the lazy load against EVERY other torch model load in the
+# process, not just this module's. The race is with SigLIP/transformers, not
+# with a second TOPIQ load — see phase2_quality/model_loading.py for the
+# accelerate-global-state root cause and the reproduction.
+_load_lock = MODEL_LOAD_LOCK
+
 
 def _get_metric():
     """Load TOPIQ no-reference metric, or return the already-loaded instance.
@@ -81,23 +88,26 @@ def _get_metric():
     after the user fixes the underlying problem (e.g. torch version).
     """
     global _metric, _load_failed
-    if _load_failed:
-        raise RuntimeError("TOPIQ model failed to load earlier in this session.")
-    if _metric is None:
-        import torch
-        import pyiqa
-        downloading = not _is_topiq_cached()
-        _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
-        try:
-            logger.info("Loading TOPIQ model (first use — may download ~100 MB)…")
-            _metric = pyiqa.create_metric("topiq_nr", device=_get_device())
-            logger.info("TOPIQ model ready.")
-        except Exception:
-            _load_failed = True
-            logger.exception("TOPIQ model load failed — disabling for this session.")
-            raise
-        finally:
-            _end(_MODEL_ID)
+    if _metric is not None:   # fast path — no lock once loaded
+        return _metric
+    with _load_lock:
+        if _load_failed:
+            raise RuntimeError("TOPIQ model failed to load earlier in this session.")
+        if _metric is None:
+            import torch
+            import pyiqa
+            downloading = not _is_topiq_cached()
+            _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
+            try:
+                logger.info("Loading TOPIQ model (first use — may download ~100 MB)…")
+                _metric = pyiqa.create_metric("topiq_nr", device=_get_device())
+                logger.info("TOPIQ model ready.")
+            except Exception:
+                _load_failed = True
+                logger.exception("TOPIQ model load failed — disabling for this session.")
+                raise
+            finally:
+                _end(_MODEL_ID)
     return _metric
 
 
@@ -131,7 +141,7 @@ def _load_and_downscale(image_path: str):
     path = Path(image_path)
     suffix = path.suffix.lower()
 
-    if suffix in (".raf", ".nef", ".cr2", ".arw", ".dng"):
+    if suffix in (".raf", ".nef", ".3fr", ".cr2", ".arw", ".dng"):
         import rawpy
         with rawpy.imread(str(path)) as raw:
             rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)

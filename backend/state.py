@@ -53,6 +53,17 @@ _progress: dict = {
 # is for the scorers running on the worker pool.
 _stop_event: threading.Event = threading.Event()
 
+# Guards the window between "file physically moved on disk" and "images.file_path
+# updated to match" in _apply_decision. POST /sync-folder drops any row whose
+# file_path doesn't exist on disk — if it reads mid-move, a photo that was just
+# safely relocated to _Keeps/ looks "missing" at its old path and its row (plus
+# decisions/burst_members/bursts) gets permanently deleted, even though the file
+# is fine. Both sides take this lock around their move+update / read+delete
+# sections so sync-folder never observes torn state. See 2026-07-23 incident:
+# 109 rows deleted this way while a scripted batch of decisions raced a
+# sync-folder call triggered by tab focus.
+_decision_move_lock: threading.Lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Per-file error log — appended by batch loop and watcher, read by
 # /debug/last-errors. Defined here so the watcher on_error callback can

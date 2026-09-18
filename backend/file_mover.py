@@ -20,35 +20,83 @@ logger = logging.getLogger(__name__)
 _DECISION_FOLDERS: dict[str, str] = {
     "keep":   "_Keeps",
     "maybe":  "_Maybes",
-    "reject": "_Trash",
+    "reject": "_Rejects",
 }
 
 _DECISION_SETTING_KEY: dict[str, str] = {
     "keep":   "keeps_folder",
     "maybe":  "maybes_folder",
-    "reject": "trash_folder",
+    "reject": "rejects_folder",
 }
+
+# Nested under whatever the "keep" folder currently resolves to (default
+# subfolder OR an active override) — see resolve_dest_folder(reviewed=True).
+# Provenance watches <keep folder>/_Keeps_reviewed and archives from there;
+# plain _Keeps is left alone so an un-reviewed auto-cull keeper never gets
+# archived out from under KaMeRa. See docs/PLAN-keeps-reviewed.md.
+_KEEPS_REVIEWED_SUBFOLDER = "_Keeps_reviewed"
 
 
 def resolve_dest_folder(
     decision: str,
     source_folder: str | Path,
     overrides: dict[str, str] | None = None,
+    *,
+    reviewed: bool = False,
 ) -> Path:
     """
     Return the absolute destination folder for a decision.
 
-    overrides is a dict with optional keys: keeps_folder, maybes_folder, trash_folder.
+    overrides is a dict with optional keys: keeps_folder, maybes_folder, rejects_folder.
     If the key for this decision is present and non-empty, use it as an absolute path.
     Otherwise create the default subfolder inside source_folder.
+
+    `reviewed=True` only applies to decision == "keep": returns the
+    "_Keeps_reviewed" subfolder nested under wherever "keep" resolves to
+    (default or overridden), instead of the keep folder itself.
     """
     key = _DECISION_SETTING_KEY[decision]
     if overrides and overrides.get(key):
-        return Path(overrides[key])
-    return Path(source_folder) / _DECISION_FOLDERS[decision]
+        base = Path(overrides[key])
+    else:
+        base = Path(source_folder) / _DECISION_FOLDERS[decision]
+    if decision == "keep" and reviewed:
+        base = base / _KEEPS_REVIEWED_SUBFOLDER
+    # Catches a folder_settings override aimed into a Photos library before the
+    # destination ever reaches move_photo's mkdir.
+    _assert_outside_photos_library(base)
+    return base
 
 
 _SIDECAR_EXTS: tuple[str, ...] = (".hif", ".HIF")
+
+
+def _assert_outside_photos_library(path: str | Path) -> None:
+    """
+    Refuse any filesystem mutation on a file inside an Apple Photos library.
+
+    A `.photoslibrary` package is a database, not a folder. Photos tracks every
+    asset by path in its own sqlite catalogue; moving, renaming or trashing a
+    file inside the package corrupts that catalogue irrecoverably — the photo
+    becomes an unreferenced blob and the library needs a rebuild to notice.
+
+    This module is the process's ONLY filesystem-mutation surface for photos
+    (nothing else in the repo calls shutil.move or send2trash on an image), so
+    refusing here makes library damage impossible for any caller, present or
+    future — not merely avoided by whoever remembered to check. The Photos
+    source type writes decisions as keywords via AppleScript and never routes
+    through this module at all; this guard exists for the paths that *don't*
+    know about Photos, e.g. a folder_settings override pointing into a library.
+
+    Matched on the parts of the RESOLVED path, so a symlink aimed into a
+    library is caught too, and a file merely *named* "...photoslibrary.RAF"
+    is not.
+    """
+    for part in Path(path).resolve(strict=False).parts:
+        if part.lower().endswith(".photoslibrary"):
+            raise OSError(
+                f"Refusing to touch a file inside a Photos library package: {path}"
+            )
 
 
 def move_photo(current_path: str | Path, dest_folder: str | Path) -> str:
@@ -70,6 +118,9 @@ def move_photo(current_path: str | Path, dest_folder: str | Path) -> str:
     """
     src = Path(current_path)
     dst_dir = Path(dest_folder)
+
+    _assert_outside_photos_library(src)
+    _assert_outside_photos_library(dst_dir)
 
     if src.is_symlink():
         raise OSError(f"Refusing to move symlink: {src}")
@@ -118,6 +169,7 @@ def trash_photo(current_path: str | Path) -> str:
     caller since the file is no longer addressable in the working tree.
     """
     src = Path(current_path)
+    _assert_outside_photos_library(src)
     if src.is_symlink():
         raise OSError(f"Refusing to trash symlink: {src}")
     if not src.exists():
@@ -140,6 +192,7 @@ def trash_photo(current_path: str | Path) -> str:
     logger.info("Trashed %s (system trash)", src)
     for sidecar in sidecars:
         try:
+            _assert_outside_photos_library(sidecar)
             send2trash(str(sidecar))
             logger.info("Trashed sidecar %s", sidecar.name)
         except OSError as e:

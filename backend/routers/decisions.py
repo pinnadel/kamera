@@ -11,9 +11,12 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.constants import is_raw_format, companion_stem_matches, shot_at_to_unix as _shot_at_to_unix
 from backend.database import get_db, get_folder_overrides, get_setting
-from backend.file_mover import move_photo, resolve_dest_folder, trash_photo
-from backend.state import _personal_model
+from backend.constants import is_photos_source_folder
+from backend.sources import sink_for
+from backend.routers.settings import get_raw_jpeg_display_mode
+from backend.state import _decision_move_lock, _personal_model
 from phase3_learning.auto_trainer import maybe_train_async
 from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION, serialize_features
 
@@ -36,6 +39,16 @@ class DecisionRequest(BaseModel):
 class BulkDecisionRequest(BaseModel):
     image_ids: list[int]
     decision: str
+
+
+class MarkReviewedRequest(BaseModel):
+    """Body expected by POST /mark-reviewed."""
+    image_id: int
+
+
+class BulkMarkReviewedRequest(BaseModel):
+    """Body expected by POST /bulk-mark-reviewed."""
+    image_ids: list[int]
 
 
 class UndoDecisionRequest(BaseModel):
@@ -96,17 +109,6 @@ def _all_faces_eyes_closed(row: dict, face_count: int) -> bool:
     return face_count <= 1
 
 
-def _reject_to_system_trash_enabled() -> bool:
-    """Read the `reject_to_system_trash` toggle. Default False — preserve the
-    existing _Trash/ folder behaviour for users who want their rejects on
-    disk. When True, rejected photos go to the OS system Trash via
-    send2trash instead, and can be recovered from the Trash / Recycle Bin."""
-    raw = get_setting("reject_to_system_trash")
-    if raw is None:
-        return False
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
 def _compute_auto_decision(
     row: dict, thresholds: dict | None = None
 ) -> tuple[str, str]:
@@ -114,7 +116,7 @@ def _compute_auto_decision(
     Map stored scores for one image → ('keep' | 'maybe' | 'reject', reason).
 
     `reason` names the rule that fired:
-      closed_eyes · soft_face · iso_ceiling · reciprocal_rule ·
+      closed_eyes · soft_face · low_iqa · iso_ceiling · reciprocal_rule ·
       cluttered_background · personal_keep · personal_maybe ·
       personal_reject · blurry_frame · threshold_keep ·
       threshold_maybe · threshold_reject
@@ -151,6 +153,16 @@ def _compute_auto_decision(
                 return "reject", "closed_eyes"
         if t["reject_soft_face"] and face_sharp < t["face_sharpness_floor"] and sharpness >= t["fallback_sharpness_floor"]:
             return "reject", "soft_face"
+
+    # Low-IQA instant reject — catches the false-sharp failure mode the Phase-1
+    # sharpness metric misses (a defocused frame full of fine micro-texture
+    # scores high on sharpness but low on TOPIQ-NR perceptual quality). Fires in
+    # both personal-model and threshold mode. Skipped when iqa_score is NULL
+    # (older rows / analysis errors) so a missing signal never culls a photo.
+    if t.get("reject_low_iqa"):
+        iqa = row.get("iqa_score")
+        if iqa is not None and iqa < t.get("iqa_floor", 30.0):
+            return "reject", "low_iqa"
 
     # EXIF-based instant rejects — opt-in, off by default.
     if t.get("reject_above_iso_ceiling") and t.get("iso_ceiling", 0) > 0:
@@ -217,7 +229,72 @@ def _compute_auto_decision(
     return "reject", "threshold_reject"
 
 
-def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict:
+def _find_companion_image_id(image_row: dict) -> int | None:
+    """
+    Find the paired RAW/processed row for `image_row` (same source_folder,
+    same filename stem, opposite side of the RAW/processed split).
+
+    Used to mirror K/M/R decisions onto the hidden half of a pair when
+    raw_jpeg_display_mode isn't 'both' — see _apply_decision. Returns None
+    if no such row exists (the photo is an orphan, or has more than one
+    same-stem candidate, which we don't try to disambiguate).
+    """
+    source_folder = image_row.get("source_folder")
+    filename = image_row["filename"]
+    want_raw = not is_raw_format(image_row.get("format"))  # companion is the OTHER side
+
+    with get_db() as conn:
+        candidates = conn.execute(
+            "SELECT id, filename, format FROM images WHERE source_folder IS ? AND id != ?",
+            (source_folder, image_row["id"]),
+        ).fetchall()
+
+    matches = [
+        dict(c) for c in candidates
+        if companion_stem_matches(filename, c["filename"])
+        and is_raw_format(c["format"]) == want_raw
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]["id"]
+
+
+def _companion_is_skipped_stub(companion_id: int) -> bool:
+    """
+    True if `companion_id` is an unscored analysis_mode=jpeg_priority row
+    (analysis_status='skipped') — a RAW whose processed sibling got the full
+    analysis and whose own row exists only so a decision can mirror onto it
+    and move it. It never reaches analysis_status='done', so it never gets an
+    independent verdict of its own; mirroring is the only path to a decision.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT analysis_status FROM images WHERE id = ?", (companion_id,)
+        ).fetchone()
+    return row is not None and row["analysis_status"] == "skipped"
+
+
+def _companion_is_hidden(companion_id: int) -> bool:
+    """
+    True if `companion_id` isn't independently visible/reviewable, so a
+    decision/undo on its sibling should mirror onto it instead of leaving it
+    untouched. Two cases: raw_jpeg_display_mode is hiding it from the grid,
+    or it's a skipped analysis_mode=jpeg_priority stub (see
+    _companion_is_skipped_stub) that can never be independently judged.
+    """
+    if get_raw_jpeg_display_mode() != "both":
+        return True
+    return _companion_is_skipped_stub(companion_id)
+
+
+def _apply_decision(
+    image_id: int,
+    decision: str,
+    is_auto: bool = False,
+    reason: str | None = None,
+    _mirror: bool = True,
+    _train: bool = True,
+) -> dict:
     """
     Move the file to its destination folder and record the decision in DB.
     Shared by POST /decision and POST /auto-cull so the file-move + decisions
@@ -230,6 +307,27 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
     the user later manually changes (or confirms) an auto-cull decision, that
     manual call writes the training sample as normal.
 
+    `reason` names why this decision was made (e.g. 'manual', 'personal_keep',
+    'closed_eyes', 'burst_keep_guarantee', 'uncertain'). Written to
+    decisions.reason (current-state, overwritten on re-decision, cleared on
+    Clear Analysis) AND appended to auto_decision_log (durable, survives
+    Clear Analysis — see database.py migration v50). Callers that don't know
+    a specific rule name should still pass something meaningful ('manual' for
+    plain user K/M/X) so the log stays queryable.
+
+    `_mirror` / `_train` are internal-only (never set by callers outside this
+    module). When raw_jpeg_display_mode hides one half of a RAW+JPEG pair,
+    the visible photo's decision mirrors onto its companion so both files
+    move together and the DB stays consistent — but the companion's own
+    feature vector is never written to training_samples (RAW vs. processed
+    sharpness/exposure differ systematically for the same shot, e.g. an
+    unprocessed RAF scoring ~46 vs. its camera JPEG scoring ~99 — mirroring
+    that pair into training would teach the model contradictory sharpness
+    labels for what is compositionally one photo). `_mirror=False` on the
+    recursive companion call prevents it from trying to mirror back;
+    `_train=False` forces the training write off for that companion call
+    regardless of is_auto.
+
     Raises HTTPException on 404 / 409 / 500.
     """
     with get_db() as conn:
@@ -241,54 +339,60 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
         raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
     image_row = dict(image)
-    current_path  = image_row["file_path"]
-    source_folder = image_row.get("source_folder")
 
-    use_system_trash = decision == "reject" and _reject_to_system_trash_enabled()
+    # Where this decision is committed depends on where the photo came from:
+    # a folder move, or a keyword on an Apple Photos asset. See
+    # backend/sources/base.py.
+    sink = sink_for(image_row)
+    sink.preflight()
 
-    if use_system_trash:
-        try:
-            new_path = trash_photo(current_path)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"Trash failed: {exc}")
-    else:
-        # Default subfolder lives next to the photo at *ingest time* — mirrors
-        # the subfolder shape from recursive analysis (a photo in /root/Italy/
-        # goes to /root/Italy/_Keeps/ not /root/_Keeps/) while staying correct
-        # on re-decisions. Using `Path(current_path).parent` here would nest
-        # _Keeps/_Maybes/ when K→M because the photo has already been moved
-        # into _Keeps. `images.source_folder` is the durable ingest parent,
-        # captured at analysis time (analysis.py:424), so it always points to
-        # the original location regardless of intermediate moves.
-        photo_parent = source_folder or str(Path(current_path).parent)
-        overrides = get_folder_overrides(photo_parent)
-        dest_folder = resolve_dest_folder(decision, photo_parent, overrides)
+    # Hold _decision_move_lock across "file physically moved" → "images.file_path
+    # updated to match". POST /sync-folder checks Path(file_path).exists() to
+    # find rows to drop; without this lock it can read the OLD path in that
+    # exact window, see nothing there (the file's already at its new path),
+    # and delete a row for a photo that's perfectly safe on disk. See the
+    # incident note on _decision_move_lock in backend/state.py.
+    with _decision_move_lock:
+        new_path = sink.apply(image_row, decision, is_auto=is_auto)
 
-        try:
-            new_path = move_photo(current_path, dest_folder)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
-
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE images SET file_path = ? WHERE id = ?",
+                (new_path, image_id),
+            )
+    # Lock released — file_path on disk and in the DB agree again, so
+    # sync-folder can safely run its existence check from here on. The
+    # remaining writes (decisions, training_samples) don't touch file_path
+    # and don't need the lock.
     with get_db() as conn:
-        conn.execute(
-            "UPDATE images SET file_path = ? WHERE id = ?",
-            (new_path, image_id),
-        )
         try:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO decisions
-                    (image_id, decision, decided_at)
-                VALUES (?, ?, DATETIME('now'))
+                    (image_id, decision, reason, decided_at)
+                VALUES (?, ?, ?, DATETIME('now'))
                 """,
-                (image_id, decision),
+                (image_id, decision, reason),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=422, detail="decision must be 'keep', 'reject', or 'maybe'")
+
+        # Durable audit log — never overwritten or deleted by Clear Analysis /
+        # tab close (unlike the decisions row above). Answers "how often does
+        # each auto-cull path fire" and "how often do I override an
+        # auto-decision" (join on sample_uuid across is_auto=1 then is_auto=0
+        # rows). Best-effort: never fail the user's decision over a log write.
+        try:
+            conn.execute(
+                """
+                INSERT INTO auto_decision_log
+                    (sample_uuid, image_id, decision, reason, is_auto, decided_at)
+                VALUES (?, ?, ?, ?, ?, DATETIME('now'))
+                """,
+                (image_row.get("uuid"), image_id, decision, reason, int(is_auto)),
+            )
+        except Exception as exc:
+            logger.exception("auto_decision_log write failed for image %s: %s", image_id, exc)
 
         # Durable training corpus — survives Clear Analysis and folder moves.
         # Captured here so the photo's analyzed features are frozen at the
@@ -299,21 +403,28 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
         # only from the user's own judgments, not from its own predictions.
         # A later manual decision on the same photo (override or confirm)
         # comes through with is_auto=False and INSERTs the sample then.
+        #
+        # `corpus` partitions the training set by source_type. An iPhone HEIC
+        # out of a Photos album and a RAF off the camera score on entirely
+        # different sharpness / aperture / iso distributions, so folding them
+        # into one GBR would teach it contradictory labels — the same reason
+        # the RAW+JPEG companion mirror passes _train=False.
         sample_uuid = image_row.get("uuid")
-        if is_auto:
-            pass  # system decision — not a training sample
+        if is_auto or not _train:
+            pass  # system decision, or a mirrored companion write — not a training sample
         elif sample_uuid:
             try:
                 conn.execute(
                     """
                     INSERT INTO training_samples
-                        (sample_uuid, decision, features_json, overall_score, schema_version, decided_at)
-                    VALUES (?, ?, ?, ?, ?, DATETIME('now'))
+                        (sample_uuid, decision, features_json, overall_score, schema_version, corpus, decided_at)
+                    VALUES (?, ?, ?, ?, ?, ?, DATETIME('now'))
                     ON CONFLICT(sample_uuid) DO UPDATE SET
                         decision       = excluded.decision,
                         features_json  = excluded.features_json,
                         overall_score  = excluded.overall_score,
                         schema_version = excluded.schema_version,
+                        corpus         = excluded.corpus,
                         decided_at     = excluded.decided_at
                     """,
                     (
@@ -322,6 +433,7 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
                         serialize_features(image_row),
                         image_row.get("overall_score"),
                         FEATURE_SCHEMA_VERSION,
+                        image_row.get("source_type") or "folder",
                     ),
                 )
             except Exception as exc:
@@ -335,12 +447,124 @@ def _apply_decision(image_id: int, decision: str, is_auto: bool = False) -> dict
                 "Image %s has no UUID — skipping training_samples write", image_id
             )
 
+    # Mirror onto the paired RAW/processed companion when it's not being
+    # independently reviewed — either the display setting is hiding one side,
+    # or the companion is an unscored analysis_mode=jpeg_priority row (skipped
+    # RAW rows can never be independently judged, so mirroring is the only
+    # way they ever get moved; see settings.py::analysis_mode). The user only
+    # saw and judged one tile, but both files represent the same shot and
+    # should carry the same decision. Best-effort: a companion-move failure
+    # must never fail the visible photo's own (already-committed) decision.
+    # Gated on the sink: a RAW/JPEG pair in a FOLDER is two files that must move
+    # together. In a Photos album there is nothing to keep in sync — and
+    # _find_companion_image_id matches on source_folder + filename stem, so two
+    # same-stem assets in one album would pair up and mirror a keyword onto a
+    # photo the user never judged.
+    if _mirror and sink.supports_companion_mirror:
+        companion_id = _find_companion_image_id(image_row)
+        if companion_id is not None and _companion_is_hidden(companion_id):
+            try:
+                _apply_decision(companion_id, decision, is_auto=is_auto, reason=reason, _mirror=False, _train=False)
+            except HTTPException as exc:
+                logger.warning(
+                    "Companion mirror failed for image %s → %s: %s",
+                    image_id, companion_id, exc.detail,
+                )
+
     # Fire-and-forget auto-train. Internally gated by sample count and a
     # retrain-delta floor, so the daemon thread only actually runs when
     # there's meaningful new data. Never blocks the user.
     maybe_train_async(_personal_model)
 
     return {"image_id": image_id, "decision": decision, "new_path": new_path}
+
+
+def _move_to_reviewed(image_id: int, _mirror: bool = True) -> dict:
+    """
+    Move an already-kept photo from `_Keeps` into `_Keeps/_Keeps_reviewed`.
+
+    The human counterpart to Piece 1's automatic routing: for photos that
+    landed in `_Keeps` via auto-cull, this is the "I looked, this is
+    correct" action that releases the photo to Provenance's archive watch.
+    Requires the photo's current decision to be 'keep' and its current
+    `file_path` to sit directly under a `_Keeps` folder (not already under
+    `_Keeps_reviewed`) — both are 400s, not silent no-ops, since calling
+    this on the wrong photo is a caller bug, not a race.
+
+    Also stamps `decisions.reason = 'manual'` so the photo counts as
+    human-confirmed everywhere the UI asks that question — no training
+    sample is written (see the inline note below).
+
+    Mirrors onto a hidden RAW/JPEG companion the same way _apply_decision
+    does, so both files of a pair release to Provenance together.
+    """
+    with get_db() as conn:
+        image = conn.execute(
+            "SELECT * FROM images WHERE id = ?", (image_id,)
+        ).fetchone()
+    if image is None:
+        raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+
+    image_row = dict(image)
+
+    sink = sink_for(image_row)
+    if not sink.supports_mark_reviewed:
+        # No _Keeps folder exists to promote out of. A Photos album records the
+        # decision as a keyword; there is no second location to move it to.
+        raise HTTPException(
+            status_code=400,
+            detail="Mark reviewed is not available for this source",
+        )
+    sink.preflight()
+
+    with get_db() as conn:
+        decision_row = conn.execute(
+            "SELECT decision FROM decisions WHERE image_id = ?", (image_id,)
+        ).fetchone()
+    if decision_row is None or decision_row["decision"] != "keep":
+        raise HTTPException(status_code=400, detail="Photo is not decided 'keep'")
+
+    with _decision_move_lock:
+        new_path = sink.mark_reviewed(image_row)
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE images SET file_path = ? WHERE id = ?",
+                (new_path, image_id),
+            )
+            # Stamp the decision as human-seen. 'manual' is the frontend's
+            # single source of truth for "I already looked at this photo"
+            # (ui/format.js::isUnconfirmed), so the "only unconfirmed" grid
+            # filter can hide it in every bucket without re-deriving the
+            # answer from the file path. Deliberately does NOT write a
+            # training sample: marking reviewed means "I looked", not "here
+            # is a label" — a bulk review must never feed the model its own
+            # auto-cull output (see _apply_decision's is_auto note). The
+            # pre-review reason ('personal_keep', etc.) is not lost; it lives
+            # on in the durable auto_decision_log row written back when the
+            # auto-cull decided this photo.
+            conn.execute(
+                "UPDATE decisions SET reason = 'manual' WHERE image_id = ?",
+                (image_id,),
+            )
+
+    # Gated on the sink: a RAW/JPEG pair in a FOLDER is two files that must move
+    # together. In a Photos album there is nothing to keep in sync — and
+    # _find_companion_image_id matches on source_folder + filename stem, so two
+    # same-stem assets in one album would pair up and mirror a keyword onto a
+    # photo the user never judged.
+    if _mirror and sink.supports_companion_mirror:
+        companion_id = _find_companion_image_id(image_row)
+        if companion_id is not None and _companion_is_hidden(companion_id):
+            try:
+                _move_to_reviewed(companion_id, _mirror=False)
+            except HTTPException as exc:
+                logger.warning(
+                    "Mark-reviewed companion mirror failed for image %s → %s: %s",
+                    image_id, companion_id, exc.detail,
+                )
+
+    return {"image_id": image_id, "new_path": new_path}
 
 
 # ---------------------------------------------------------------------------
@@ -357,15 +581,41 @@ def save_decision(request: DecisionRequest):
     Raises 409 if the file is missing from disk.
     Raises 500 for unexpected filesystem errors.
     """
-    result = _apply_decision(request.image_id, request.decision)
+    result = _apply_decision(request.image_id, request.decision, reason="manual")
     return {"status": "ok", **result}
 
 
-@router.post("/undo-decision")
-def undo_decision(request: UndoDecisionRequest):
+@router.post("/mark-reviewed")
+def mark_reviewed(request: MarkReviewedRequest):
+    """
+    Release a kept photo from `_Keeps` into `_Keeps/_Keeps_reviewed`.
+
+    For photos that landed in `_Keeps` via auto-cull (a manual keep already
+    goes straight to `_Keeps_reviewed` — see /decision), this is the "I
+    looked, this is correct" action. Provenance watches `_Keeps_reviewed`
+    and archives from there.
+
+    Raises 400 if the photo isn't decided 'keep' or isn't currently under
+    `_Keeps` (already reviewed, or was never kept).
+    Raises 404 if image_id is unknown. 409 if the file is missing from disk.
+    """
+    result = _move_to_reviewed(request.image_id)
+    return {"status": "ok", **result}
+
+
+def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) -> dict:
     """
     Reverse a decision: move the file back to `previous_path`, clear the
     `decisions` row, and drop the durable training_samples row keyed by UUID.
+
+    `_mirror` is internal-only: when raw_jpeg_display_mode hides one half of
+    a RAW+JPEG pair, undoing the visible photo's decision also undoes its
+    companion's mirrored decision, keeping the pair in sync (they were
+    decided together by _apply_decision, so they're undone together too).
+    The recursive companion call always passes previous_path=None — the
+    caller's previous_path is scoped to the *visible* photo's filename and
+    would be wrong for the companion, so we fall back to the same
+    parent-parent reconstruction used for photos with no supplied path.
 
     Errors:
       404 — image_id unknown.
@@ -373,9 +623,6 @@ def undo_decision(request: UndoDecisionRequest):
             or destination parent folder no longer exists.
       500 — unexpected filesystem failure during move.
     """
-    image_id      = request.image_id
-    previous_path = request.previous_path
-
     with get_db() as conn:
         image = conn.execute(
             "SELECT * FROM images WHERE id = ?",
@@ -394,55 +641,22 @@ def undo_decision(request: UndoDecisionRequest):
     current_path  = image_row["file_path"]
     sample_uuid   = image_row.get("uuid")
 
-    # Per-photo undo path: when the caller didn't supply a previous_path
-    # (i.e. the undo isn't replaying a recent action, it's "send this
-    # photo home"), move the file UP one level — out of the K/M/R
-    # subfolder it was sorted into. This handles three cases correctly:
-    #   - Default subfolders: .../source/_Keeps/photo.JPG → .../source/photo.JPG
-    #   - Subfolder analysis: .../source/sub/_Keeps/photo.JPG → .../source/sub/photo.JPG
-    #   - Custom override:    /any/where/MyKeeps/photo.JPG  → /any/where/photo.JPG
-    # Using `images.source_folder + filename` would flatten subfolder structure
-    # and break custom-override undo. Filename comes from the live file (not the
-    # DB) so any de-dup suffix added by `_claim_path` during the original move
-    # comes along for the round trip.
-    if previous_path is None:
-        filename = Path(current_path).name
-        parent_parent = Path(current_path).parent.parent
-        previous_path = str(parent_parent / filename)
+    sink = sink_for(image_row)
+    sink.preflight()
 
-    # Already at home (e.g. someone manually moved the file back, or path
-    # normalization quirks): skip the move and just clear DB state.
-    already_home = (
-        os.path.normpath(current_path).lower()
-        == os.path.normpath(previous_path).lower()
-    )
+    # Same move-then-update race as _apply_decision — see the incident note
+    # on _decision_move_lock in backend/state.py.
+    with _decision_move_lock:
+        new_path = sink.undo(image_row, previous_path)
 
-    new_path = current_path
-    if not already_home:
-        if not Path(current_path).exists():
-            raise HTTPException(
-                status_code=409,
-                detail="File missing — cannot undo (may be in system Trash)",
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE images SET file_path = ? WHERE id = ?",
+                (new_path, image_id),
             )
-        prev_parent = Path(previous_path).parent
-        if not prev_parent.exists():
-            raise HTTPException(
-                status_code=409,
-                detail=f"Source folder no longer exists: {prev_parent}",
-            )
-        try:
-            new_path = move_photo(current_path, prev_parent)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
 
     with get_db() as conn:
         conn.execute("DELETE FROM decisions WHERE image_id = ?", (image_id,))
-        conn.execute(
-            "UPDATE images SET file_path = ? WHERE id = ?",
-            (new_path, image_id),
-        )
         # Remove the durable training_samples row so the model doesn't keep
         # learning from a judgment the user took back.
         if sample_uuid:
@@ -457,12 +671,44 @@ def undo_decision(request: UndoDecisionRequest):
                     image_id, exc,
                 )
 
+    # Mirror the undo onto the paired RAW/processed companion, if any —
+    # symmetric with the mirrored decision made in _apply_decision (same
+    # companion-hidden test: display setting OR an unscored jpeg_priority
+    # skip row). Best-effort: a companion with nothing to undo (409) or a
+    # missing companion file is silently skipped rather than failing this undo.
+    # Gated on the sink: a RAW/JPEG pair in a FOLDER is two files that must move
+    # together. In a Photos album there is nothing to keep in sync — and
+    # _find_companion_image_id matches on source_folder + filename stem, so two
+    # same-stem assets in one album would pair up and mirror a keyword onto a
+    # photo the user never judged.
+    if _mirror and sink.supports_companion_mirror:
+        companion_id = _find_companion_image_id(image_row)
+        if companion_id is not None and _companion_is_hidden(companion_id):
+            try:
+                _apply_undo(companion_id, None, _mirror=False)
+            except HTTPException as exc:
+                logger.warning(
+                    "Companion undo-mirror failed for image %s → %s: %s",
+                    image_id, companion_id, exc.detail,
+                )
+
     # Retrain the personal model so it stops weighting the undone sample.
     # Same fire-and-forget pattern as _apply_decision — gated internally on
     # sample count + retrain-delta floor, never blocks the user.
     maybe_train_async(_personal_model)
 
     return {"status": "ok", "image_id": image_id, "decision": None, "new_path": new_path}
+
+
+@router.post("/undo-decision")
+def undo_decision(request: UndoDecisionRequest):
+    """
+    Reverse a decision and immediately move the file back.
+
+    See _apply_undo for the full contract (also mirrors onto a RAW/JPEG
+    companion when raw_jpeg_display_mode hides one half of the pair).
+    """
+    return _apply_undo(request.image_id, request.previous_path)
 
 
 @router.post("/bulk-decision")
@@ -477,11 +723,37 @@ def bulk_decision(request: BulkDecisionRequest):
     moved, errors = 0, []
     for image_id in request.image_ids:
         try:
-            _apply_decision(image_id, request.decision)
+            _apply_decision(image_id, request.decision, reason="manual")
             moved += 1
         except HTTPException as exc:
             errors.append({"id": image_id, "error": exc.detail})
     return {"moved": moved, "errors": errors}
+
+
+@router.post("/bulk-mark-reviewed")
+def bulk_mark_reviewed(request: BulkMarkReviewedRequest):
+    """
+    Release a batch of kept photos from `_Keeps` into `_Keeps/_Keeps_reviewed`
+    — batch version of POST /mark-reviewed, for "mark all reviewed" over a
+    filtered Keeps view.
+
+    Idempotent: a photo already in `_Keeps_reviewed` is silently skipped
+    (not counted as an error) so re-running over a view that mixes
+    already-reviewed and not-yet-reviewed photos is safe. Photos that
+    aren't decided 'keep' at all, or that fail to move, are reported in
+    `errors`.
+    """
+    moved, skipped, errors = 0, 0, []
+    for image_id in request.image_ids:
+        try:
+            _move_to_reviewed(image_id)
+            moved += 1
+        except HTTPException as exc:
+            if exc.status_code == 400 and "already in _Keeps_reviewed" in exc.detail:
+                skipped += 1
+            else:
+                errors.append({"id": image_id, "error": exc.detail})
+    return {"moved": moved, "skipped": skipped, "errors": errors}
 
 
 @router.post("/trash-rejects")
@@ -489,18 +761,28 @@ def trash_rejects():
     """
     Send all rejected files to the system Trash (recoverable via Trash bin).
 
-    For each image with decision='reject':
-      1. Moves the RAW file to the system Trash via send2trash.
-      2. Deletes the DB row (file is gone from our managed set).
+    For each image with decision='reject', route through file_mover.trash_photo
+    so the send2trash call — and its .HIF sidecar handling — is identical to a
+    single per-photo R press with reject_to_system_trash on. The DB row is
+    deleted ONLY when trash_photo confirms the file reached the Trash.
 
-    Files that are already missing from disk are silently skipped.
+    Failure honesty (data-loss adjacent, so we never lie about success):
+      - A file that trash_photo can't verifiably move to Trash (send2trash
+        raised, permission denied, or the file already vanished from disk —
+        e.g. a folder-watching app like Luminar grabbed it first) is reported
+        as an error and its DB row is KEPT. The photo stays in your reject
+        list so you can see it didn't make it, rather than silently
+        disappearing from the app while still sitting on disk.
+
+    Returns per-outcome counts so the UI can report the truth:
+      - trashed:         verifiably sent to the system Trash
+      - skipped_missing: the file was already gone from disk (row kept)
+      - failed:          send2trash/OS error (row kept)
     """
-    from send2trash import send2trash as _send2trash
-
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT i.id, i.file_path
+            SELECT i.id, i.file_path, i.source_type
             FROM images i
             INNER JOIN decisions d ON d.image_id = i.id
             WHERE d.decision = 'reject'
@@ -508,19 +790,38 @@ def trash_rejects():
         ).fetchall()
 
     trashed: int = 0
+    skipped_missing: int = 0
+    skipped_unsupported: int = 0
     errors: list[dict] = []
     ids_to_delete: list[int] = []
 
     for row in rows:
         file_path = row["file_path"]
+        # This endpoint is not tab-scoped — it sweeps every reject in the DB.
+        # A source that cannot delete (Apple Photos: neither AppleScript nor,
+        # from this process, PhotoKit can remove an asset) is skipped rather
+        # than attempted, and its row is kept so the rejection survives.
+        sink = sink_for(dict(row))
+        if not sink.supports_bulk_trash:
+            skipped_unsupported += 1
+            continue
         try:
-            if Path(file_path).exists():
-                _send2trash(file_path)
+            sink.bulk_trash(dict(row))
             ids_to_delete.append(row["id"])
             trashed += 1
+        except FileNotFoundError:
+            # File already gone from disk — do NOT claim we trashed it and do
+            # NOT delete the row. Surfaced so the user can investigate (a
+            # folder-watching app may have moved it out from under us).
+            skipped_missing += 1
+            errors.append({"file": file_path, "error": "file already missing from disk"})
+            logger.warning("trash-rejects: file already missing, keeping row: %s", file_path)
         except Exception as exc:
             errors.append({"file": file_path, "error": str(exc)})
+            logger.warning("trash-rejects: send2trash failed, keeping row: %s (%s)", file_path, exc)
 
+    # Only rows whose file verifiably reached the Trash are removed from the
+    # managed set. Missing/failed rows stay so the app's view matches reality.
     if ids_to_delete:
         placeholders = ",".join("?" * len(ids_to_delete))
         with get_db() as conn:
@@ -533,17 +834,37 @@ def trash_rejects():
                 ids_to_delete,
             )
 
-    return {"trashed": trashed, "errors": errors}
+    return {
+        "trashed": trashed,
+        "skipped_missing": skipped_missing,
+        "skipped_unsupported": skipped_unsupported,
+        "failed": len(errors) - skipped_missing,
+        "errors": errors,
+    }
 
 
 @router.get("/auto-cull/preview")
-def auto_cull_preview(source_folder: str | None = None):
+def auto_cull_preview(
+    source_folder: str | None = None,
+    threshold: float = 0.90,
+):
     """
     Dry-run: compute which K/M/X each undecided photo would receive.
 
     Uses the personal model when trained (≥20 decisions); falls back to
     the built-in threshold logic. No files are moved and no DB rows are written.
+
+    `threshold` is the cosine-similarity cutoff the burst-dedup post-pass groups
+    on — the Similarity knob (the frontend passes its current value). Auto-cull
+    dedup deliberately does NOT use the grouping time-gap (see
+    _group_undecided_into_bursts); grouping here is visual-similarity only.
     """
+    if is_photos_source_folder(source_folder):
+        raise HTTPException(
+            status_code=400,
+            detail="Auto-cull is not available for Photos albums — it runs on "
+                   "the personal model, which is trained on camera photos only",
+        )
     with get_db() as conn:
         if source_folder is not None:
             rows = conn.execute(
@@ -551,6 +872,10 @@ def auto_cull_preview(source_folder: str | None = None):
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                   AND i.source_folder = ?
                 """,
                 (source_folder,),
@@ -561,6 +886,10 @@ def auto_cull_preview(source_folder: str | None = None):
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                 """
             ).fetchall()
 
@@ -582,11 +911,23 @@ def auto_cull_preview(source_folder: str | None = None):
         "closed_eyes":          "closed_eyes",
         "soft_face":            "soft_face",
         "blurry_frame":         "blurry_frame",
+        # A low-IQA reject is a poor/soft frame — folds into the blurry bucket
+        # so the preview's "blurry" count reflects it and the modal copy stays
+        # simple (no separate category for what reads to the user as blur).
+        "low_iqa":              "blurry_frame",
         "cluttered_background": "cluttered_background",
         "iso_ceiling":          "low_score",
         "reciprocal_rule":      "low_score",
         "personal_reject":      "low_score",
         "threshold_reject":     "low_score",
+        # Burst-redundancy rejects — decent frames that lost to a clearly-better
+        # sibling in the same burst (graded demotion), were near-pixel-identical
+        # to a better frame (Stage A collapse), or overflowed the burst's Maybe
+        # review budget (Stage B). Not low-quality photos — their own bucket so
+        # the modal can say "redundant burst frame", not "low score".
+        "burst_keep_reject":    "burst_duplicate",
+        "burst_near_duplicate": "burst_duplicate",
+        "burst_redundant":      "burst_duplicate",
     }
     rule_counts: dict[str, int] = {
         "closed_eyes": 0,
@@ -594,6 +935,9 @@ def auto_cull_preview(source_folder: str | None = None):
         "blurry_frame": 0,
         "cluttered_background": 0,
         "low_score": 0,
+        # Frames rejected only because a near-identical burst sibling scored
+        # clearly better (multi-keep graded demotion).
+        "burst_duplicate": 0,
         # PR3: uncertain photos are routed to "maybe" (not rejected) so we
         # count them outside the reject-only bucket below.
         "uncertain": 0,
@@ -608,9 +952,20 @@ def auto_cull_preview(source_folder: str | None = None):
         decisions[row["id"]] = decision
         preview_reasons[row["id"]] = reason
 
+    bursts_preview = _group_undecided_into_bursts(rows_dicts, threshold=threshold)
+
+    # Same multi-keep pass as run_auto_cull, ahead of the keep-guarantee pass
+    # below, so the preview counts match what the real run would produce.
+    demotions_count = 0
+    reject_demotions_count = 0
+    if thresholds.get("auto_cull_cap_burst_keeps"):
+        burst_demotions = _cap_burst_keeps(
+            bursts_preview, decisions, preview_reasons, thresholds)
+        demotions_count = len(burst_demotions)
+        reject_demotions_count = sum(1 for d in burst_demotions if d["to"] == "reject")
+
     from backend.group_scoring import top_n_candidates
     promotions_count = 0
-    bursts_preview = _group_undecided_into_bursts(rows_dicts)
     for burst in bursts_preview:
         if len(burst) < 2:
             continue
@@ -662,6 +1017,11 @@ def auto_cull_preview(source_folder: str | None = None):
         # maybe by the keep-guarantee post-pass. Surfaces "your burst would
         # otherwise have lost the moment" so the AutoCullModal can flag it.
         "promotions": promotions_count,
+        # Count of extra burst keeps demoted by the multi-keep pass (to Maybe
+        # or Reject). `reject_demotions` is the subset sent all the way to
+        # Reject (clearly-weak near-duplicates); the rest went to Maybe.
+        "demotions": demotions_count,
+        "reject_demotions": reject_demotions_count,
     }
 
 
@@ -670,14 +1030,345 @@ def auto_cull_preview(source_folder: str | None = None):
 # would just put a guaranteed-bad photo in front of the user. Subjective
 # reasons (closed_eyes, soft_face, cluttered_background) DO get rescued
 # because they can be salvageable in context (one photo of the group might
-# be the only frame the moment happened in).
-_PHYSICAL_REJECT_REASONS = frozenset({"iso_ceiling", "reciprocal_rule", "blurry_frame"})
+# be the only frame the moment happened in). low_iqa joins this set: a frame
+# TOPIQ-NR scores below the floor is out-of-focus / heavily degraded, and
+# rescuing the "best" of an all-low-IQA burst just surfaces the least-bad blur.
+_PHYSICAL_REJECT_REASONS = frozenset({"iso_ceiling", "reciprocal_rule", "blurry_frame", "low_iqa"})
 
 
-def _group_undecided_into_bursts(rows: list[dict], time_gap_seconds: float = 60.0,
+# Auto-decision reasons that mean "the personal model made this call" — for
+# those members the multi-keep gates read personal_score against the personal
+# cutoffs; every other keep reason came from the threshold-fallback path and
+# reads overall_score against the fallback cutoffs. Mirrors the two branches of
+# _compute_auto_decision so the gates use the same number the Keep verdict did.
+_PERSONAL_KEEP_REASONS = frozenset({"personal_keep"})
+
+
+def _burst_member_score(row: dict, reason: str | None) -> float | None:
+    """The score the auto-decision was actually made on for this member:
+    personal_score for personal-mode keeps, overall_score otherwise. None when
+    the relevant field is missing (older rows / analysis gaps) — the caller
+    treats a None-scored extra keep as non-qualifying (never double-kept)."""
+    if reason in _PERSONAL_KEEP_REASONS:
+        return row.get("personal_score")
+    return row.get("overall_score")
+
+
+# Cosine threshold that separates distinct visual sub-scenes WITHIN one burst.
+# Deliberately STRICTER than the 0.90 the grouping algorithm uses to FORM a
+# burst: a burst is already a single 0.90-connected component (transitively —
+# a chain A~B~C at 0.92 each is one burst even if A~C is only 0.85), so
+# sub-clustering at 0.90 would just re-merge it and never fire. We need a higher
+# bar to isolate a genuinely-different framing that got chained into the burst.
+# 0.94 sits between burst formation (0.90) and near-dup collapse (0.97): shoot
+# angle A, pan, shoot angle B seconds apart → two sub-scenes, each with its own
+# Keep/Maybe budget, so a real second POV earns its own keeps instead of being
+# budget-rejected as a redundant copy of angle A. A slight recompose of the same
+# shot stays ≥ 0.94 and remains one scene. Tunable later if real bursts show
+# 0.94 splits too eagerly or too rarely; kept a constant for now (no new knob).
+_SCENE_SPLIT_COSINE = 0.94
+
+
+def _scene_subclusters(ordered_members: list[dict]) -> list[list[dict]]:
+    """Split a burst's members into distinct visual sub-scenes by cosine
+    union-find at _SCENE_SPLIT_COSINE, preserving each member's priority order
+    within its sub-cluster. Members without an embedding can't be clustered —
+    each becomes its own singleton sub-cluster (conservative: a frame we can't
+    place visually gets its own keep budget rather than being lumped in and
+    possibly budget-rejected against an unrelated scene).
+
+    Returns a list of sub-clusters; concatenated they contain every input member
+    exactly once. When every member shares one scene this returns a single
+    sub-cluster == the input, so the budget behaves exactly as the pre-sub-
+    cluster code did for single-scene bursts.
+    """
+    import numpy as _np
+    from phase2_quality.similarity_scorer import json_to_embedding as _emb
+
+    vecs: dict[int, "_np.ndarray"] = {}
+    for m in ordered_members:
+        vec = _emb(m.get("embedding"))
+        if vec is not None:
+            vecs[m["id"]] = _np.asarray(vec, dtype=_np.float32)
+
+    # Union-find over members that have embeddings.
+    parent: dict[int, int] = {m["id"]: m["id"] for m in ordered_members}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    ids_with_vec = [m["id"] for m in ordered_members if m["id"] in vecs]
+    for i, a in enumerate(ids_with_vec):
+        for b in ids_with_vec[i + 1:]:
+            if float(_np.dot(vecs[a], vecs[b])) >= _SCENE_SPLIT_COSINE:
+                union(a, b)
+
+    # Bucket members by root, preserving input (priority) order both across and
+    # within sub-clusters: first-seen root ordering keeps the best sub-cluster
+    # (the one containing the burst winner) first.
+    order: list[int] = []
+    buckets: dict[int, list[dict]] = {}
+    for m in ordered_members:
+        root = find(m["id"])
+        if root not in buckets:
+            buckets[root] = []
+            order.append(root)
+        buckets[root].append(m)
+    return [buckets[r] for r in order]
+
+
+def _near_duplicate_losers(ordered_members: list[dict]) -> set[int]:
+    """Greedy near-duplicate collapse over an already-priority-ordered burst.
+
+    Walks members best→worst; the higher-priority frame of each cosine-near-
+    identical pair (cosine ≥ _NEAR_DUP_COSINE) is the surviving representative,
+    and every lower-priority frame within that radius is a redundant duplicate.
+    Returns the set of image_ids that are duplicates of some better frame — the
+    caller rejects those as `burst_near_duplicate`.
+
+    Same 0.97 threshold and greedy-rep logic as burst_ranker._collapse_near_
+    duplicates, but operates purely on the embeddings already on the in-memory
+    rows (no DB round-trip). Embeddings are L2-normalised, so dot product IS
+    cosine. A frame with no embedding can never be collapsed (can't prove it's
+    a dup) and never absorbs others — it falls through to the score gates.
+    """
+    import numpy as _np
+    from phase2_quality.similarity_scorer import json_to_embedding as _emb
+    from phase2_quality.burst_ranker import _NEAR_DUP_COSINE
+
+    vecs: dict[int, "_np.ndarray"] = {}
+    for m in ordered_members:
+        vec = _emb(m.get("embedding"))
+        if vec is not None:
+            vecs[m["id"]] = _np.asarray(vec, dtype=_np.float32)
+    if len(vecs) < 2:
+        return set()
+
+    losers: set[int] = set()
+    ordered_ids = [m["id"] for m in ordered_members]
+    for i, rep_id in enumerate(ordered_ids):
+        if rep_id in losers or rep_id not in vecs:
+            continue
+        rep_vec = vecs[rep_id]
+        # Only lower-priority frames can be absorbed by this rep.
+        for other_id in ordered_ids[i + 1:]:
+            if other_id in losers or other_id not in vecs:
+                continue
+            if float(_np.dot(rep_vec, vecs[other_id])) >= _NEAR_DUP_COSINE:
+                losers.add(other_id)
+    return losers
+
+
+def _cap_burst_keeps(
+    bursts: list[list[dict]],
+    decisions: dict[int, str],
+    reasons: dict[int, str],
+    thresholds: dict | None = None,
+) -> list[dict]:
+    """Burst multi-keep post-pass: mutates `decisions`/`reasons` in place so a
+    similarity burst auto-keeps its best-by-priority member plus any additional
+    frames that are genuinely strong — the rest demote, graded to Maybe or
+    Reject. Each burst member is scored independently by _compute_auto_decision,
+    so a run of near-identical frames (same pose, seconds apart) can each clear
+    the Keep cutoff; the grouping/dedup users expect never fires for auto-cull
+    without this pass.
+
+    For every burst with ≥2 members and ≥2 "keep" decisions:
+
+      Stage A — near-duplicate collapse (burst-wide). The lower-priority frame
+      of any pair that is cosine-near-identical (≥ 0.97, same threshold as the
+      LLM burst ranker's dedup) is redundant regardless of score → "reject" with
+      reason "burst_near_duplicate". The higher-priority frame survives as rep.
+
+      Scene split. The burst is split into distinct visual sub-scenes by cosine
+      union-find at _SCENE_SPLIT_COSINE (0.90, the same threshold the grouping
+      algorithm uses to form bursts within a time segment). A 30s time-gap burst
+      can contain several genuinely-different framings — shoot angle A, pan,
+      shoot angle B seconds apart — and the time-gap glue makes them one burst.
+      Each sub-scene gets its OWN Keep/Maybe budget below, so a real second POV
+      earns its own keeps instead of being rejected as a redundant copy of the
+      first. A single-scene burst yields one sub-cluster → identical to the
+      per-burst budget.
+
+      Stage B — score gates + review budget, applied PER SUB-SCENE (see
+      _apply_burst_budget). The best member of each sub-scene always keeps; the
+      rest stay "keep" only if BOTH gates hold and we're under max_burst_keeps
+      (margin above the mode's Keep cutoff + closeness to the sub-scene winner),
+      else demote: "burst_keep_reject" when clearly weak (far below the sub-scene
+      winner or under the Maybe cutoff), "burst_keep_cap"→Maybe while that sub-
+      scene's Maybe budget has room, "burst_redundant"→reject once it's spent. A
+      scoreless frame never counts as clearly weak (no auto-trash on missing
+      data) — Maybe slot if free, else redundant-reject.
+
+    max_burst_keeps=1 + max_burst_maybes large reproduces the original cap-at-one
+    behaviour PER SUB-SCENE; max_burst_maybes=0 rejects every non-surviving frame
+    in each sub-scene. Non-keep decisions in the burst are left untouched. Runs
+    BEFORE the burst_keep_guarantee floor pass so a burst always retains ≥1 keep
+    here (each sub-scene keeps its winner) — it can never trigger the zero-keeps
+    rescue the floor pass checks.
+
+    Returns the list of demotions applied:
+    [{"image_id", "burst_size", "to"}, ...] where "to" is "maybe" | "reject".
+    """
+    from backend.group_scoring import top_n_candidates
+    from phase1_technical.quality_analyzer import get_decision_thresholds
+
+    t = thresholds or get_decision_thresholds()
+    max_keeps = int(t.get("max_burst_keeps", 2))
+    max_maybes = int(t.get("max_burst_maybes", 2))
+    margin = t.get("burst_keep_margin", 8.0)
+    winner_delta = t.get("burst_keep_winner_delta", 6.0)
+    reject_delta = t.get("burst_keep_reject_delta", 20.0)
+
+    budget = {
+        "max_keeps": max_keeps, "max_maybes": max_maybes,
+        "margin": margin, "winner_delta": winner_delta, "reject_delta": reject_delta,
+    }
+
+    demotions: list[dict] = []
+    for burst in bursts:
+        if len(burst) < 2:
+            continue
+        burst_ids = [m["id"] for m in burst]
+        keep_ids = [i for i in burst_ids if decisions.get(i) == "keep"]
+        if len(keep_ids) < 2:
+            continue
+
+        by_id = {m["id"]: m for m in burst}
+        keep_members = [by_id[i] for i in keep_ids]
+        # Priority order (best→worst) drives every stage: the winner, the
+        # near-dup reps, and which frames fill the Keep/Maybe budgets.
+        ordered = top_n_candidates(keep_members, len(keep_members))
+
+        # Stage A — near-duplicate collapse, applied ACROSS the whole burst: a
+        # near-pixel-dup is redundant no matter which sub-scene it lands in
+        # (and two ≥0.97 frames are always in the same ≥0.90 sub-cluster anyway,
+        # so scoping this burst-wide changes nothing but is clearer).
+        near_dup_losers = _near_duplicate_losers(ordered)
+
+        # Split the burst into distinct visual sub-scenes. A 30s time-gap burst
+        # can contain several genuinely-different framings (pan to a new POV
+        # mid-window); each sub-scene gets its OWN Keep/Maybe budget so a real
+        # second scene isn't budget-rejected as a redundant copy of the first.
+        subclusters = _scene_subclusters(ordered)
+
+        # Stage B — score gates + review budget, applied per sub-scene.
+        for sub in subclusters:
+            demotions.extend(
+                _apply_burst_budget(
+                    sub, near_dup_losers, decisions, reasons, t, budget,
+                    burst_size=len(burst),
+                )
+            )
+    return demotions
+
+
+def _apply_burst_budget(
+    ordered_sub: list[dict],
+    near_dup_losers: set[int],
+    decisions: dict[int, str],
+    reasons: dict[int, str],
+    t: dict,
+    budget: dict,
+    burst_size: int,
+) -> list[dict]:
+    """Apply the Keep/Maybe review budget to ONE visual sub-scene of a burst.
+
+    `ordered_sub` is priority-ordered (best first). Its best member is the
+    sub-scene winner and always keeps; the rest run the near-dup / score-gate /
+    graded-demotion logic with a fresh Keep+Maybe budget scoped to this sub-
+    scene. Mutates `decisions`/`reasons` in place; returns the demotions list.
+
+    A single-scene burst produces one sub-cluster, so this reproduces the prior
+    burst-wide budget exactly. `burst_size` is passed through unchanged for the
+    demotion records (callers/telemetry still think in whole-burst sizes).
+    """
+    demotions: list[dict] = []
+    winner_id = ordered_sub[0]["id"]
+    winner_score = _burst_member_score(ordered_sub[0], reasons.get(winner_id))
+
+    kept_count = 1   # the sub-scene winner always keeps
+    maybe_count = 0
+    for member in ordered_sub:
+        image_id = member["id"]
+        if image_id == winner_id:
+            continue
+
+        if image_id in near_dup_losers:
+            decisions[image_id] = "reject"
+            reasons[image_id] = "burst_near_duplicate"
+            demotions.append(
+                {"image_id": image_id, "burst_size": burst_size, "to": "reject"}
+            )
+            continue
+
+        reason = reasons.get(image_id)
+        score = _burst_member_score(member, reason)
+
+        personal_mode = reason in _PERSONAL_KEEP_REASONS
+        keep_cutoff = t["keep_threshold"] if personal_mode else t["fallback_keep"]
+        maybe_cutoff = t["maybe_threshold"] if personal_mode else t["fallback_maybe"]
+
+        qualifies = (
+            kept_count < budget["max_keeps"]
+            and score is not None
+            and winner_score is not None
+            and score >= keep_cutoff + budget["margin"]
+            and (winner_score - score) <= budget["winner_delta"]
+        )
+        if qualifies:
+            kept_count += 1
+            continue  # survives as keep; decision/reason untouched
+
+        # Graded demotion. Reject when clearly-weak (far below the sub-scene
+        # winner, or under the mode's Maybe cutoff) OR when this sub-scene's
+        # review budget is spent. A missing score can't be judged weak, so it
+        # only rejects via the budget path, never the clearly-weak path.
+        clearly_weak = score is not None and (
+            (winner_score is not None and (winner_score - score) > budget["reject_delta"])
+            or score < maybe_cutoff
+        )
+        if clearly_weak:
+            target, reason_out = "reject", "burst_keep_reject"
+        elif maybe_count < budget["max_maybes"]:
+            target, reason_out = "maybe", "burst_keep_cap"
+            maybe_count += 1
+        else:
+            target, reason_out = "reject", "burst_redundant"
+
+        decisions[image_id] = target
+        reasons[image_id] = reason_out
+        demotions.append(
+            {"image_id": image_id, "burst_size": burst_size, "to": target}
+        )
+    return demotions
+
+
+def _group_undecided_into_bursts(rows: list[dict],
+                                 time_gap_seconds: float | None = None,
                                  threshold: float = 0.90) -> list[list[dict]]:
-    """Cluster the rows the same way /similarity-groups does so the burst
-    keep-guarantee operates on the same groupings the user sees in the UI.
+    """Cluster the rows for the auto-cull burst post-passes.
+
+    Auto-cull groups by VISUAL SIMILARITY only — `time_gap_seconds` defaults to
+    None (time split disabled). Rationale: the grouping time-gap can only split
+    bursts *coarser* than the camera's inter-frame spacing, and continuous
+    bursts fire several frames within one EXIF second (second-resolution
+    timestamps), so no gap can separate them — the slider was inert for
+    auto-cull dedup on fast bursts. Cosine similarity *can* discriminate those
+    frames. The risk of pure-similarity grouping (distinct moments minutes apart
+    collapsing into one giant burst) is handled downstream by _cap_burst_keeps'
+    per-scene split at _SCENE_SPLIT_COSINE, which re-separates them and gives
+    each moment its own keep budget. So the real auto-cull dedup levers are the
+    Similarity `threshold` + the keep/maybe budgets, NOT the time gap. Callers
+    may still pass an explicit time_gap_seconds (tests do) to force a time split.
 
     Photos without an embedding (Phase 2 hasn't completed for them yet) are
     returned as singleton groups so the caller can still iterate uniformly.
@@ -713,39 +1404,40 @@ def _group_undecided_into_bursts(rows: list[dict], time_gap_seconds: float = 60.
     return grouped + singletons
 
 
-def _shot_at_to_unix(shot_at) -> float | None:
-    """Tiny copy of the helper in routers/model.py so this module isn't
-    forced into a circular import. Returns a unix timestamp or None when the
-    field is missing / unparseable."""
-    if shot_at is None:
-        return None
-    try:
-        from datetime import datetime
-        # Accept ISO 8601 with or without microseconds. SQLite stores
-        # "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS"; both parse via
-        # fromisoformat after a tiny tolerance fix.
-        s = str(shot_at).strip()
-        if " " in s and "T" not in s:
-            s = s.replace(" ", "T", 1)
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return None
-
-
 @router.post("/auto-cull")
-def run_auto_cull(source_folder: str | None = None):
+def run_auto_cull(
+    source_folder: str | None = None,
+    threshold: float = 0.90,
+):
     """
     Assign K/M/X to every undecided analyzed photo and move their files.
 
-    Uses the same scoring logic as GET /auto-cull/preview, with one
-    burst-aware post-pass: when an entire similarity group ends up with
-    zero Keeps AND none of the rejects were physical-unrecoverable
-    (ISO ceiling / reciprocal-rule / blurry-frame), the best photo in
-    the burst is promoted to Maybe so the user always has a chance to
-    rescue a moment. Promotion uses the same priority as the group hero
-    selector (face_sharpness → eyes_open → sharpness → IQA → aesthetic
-    → overall_score). See backend.group_scoring.top_n_candidates.
+    Uses the same scoring logic as GET /auto-cull/preview, with two
+    burst-aware post-passes over the similarity groups:
+
+      1. Multi-keep cap (_cap_burst_keeps, opt-out): the best-by-priority
+         member of a burst always keeps; additional in-burst Keeps survive
+         only if genuinely strong (up to max_burst_keeps), and the rest demote
+         graded to Maybe (near-alternates) or Reject (clearly-weak duplicates).
+      2. Keep-guarantee floor: when an entire group ends up with zero Keeps AND
+         none of the rejects were physical-unrecoverable (ISO ceiling /
+         reciprocal-rule / blurry-frame / low-IQA), the best photo is promoted
+         to Maybe so the user always has a chance to rescue a moment.
+
+    Both passes rank with the same priority as the group hero selector
+    (face_sharpness → eyes_open → sharpness → IQA → aesthetic → overall_score);
+    see backend.group_scoring.top_n_candidates.
+
+    `threshold` is the cosine-similarity cutoff the burst grouping uses. Auto-cull
+    dedup groups by visual similarity ONLY, not the grouping time-gap (see
+    _group_undecided_into_bursts for why the time-gap was inert on fast bursts).
     """
+    if is_photos_source_folder(source_folder):
+        raise HTTPException(
+            status_code=400,
+            detail="Auto-cull is not available for Photos albums — it runs on "
+                   "the personal model, which is trained on camera photos only",
+        )
     with get_db() as conn:
         if source_folder is not None:
             rows = conn.execute(
@@ -753,6 +1445,10 @@ def run_auto_cull(source_folder: str | None = None):
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                   AND i.source_folder = ?
                 """,
                 (source_folder,),
@@ -763,6 +1459,10 @@ def run_auto_cull(source_folder: str | None = None):
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                 """
             ).fetchall()
 
@@ -786,6 +1486,17 @@ def run_auto_cull(source_folder: str | None = None):
         decisions[row["id"]] = decision
         reasons[row["id"]] = reason
 
+    bursts = _group_undecided_into_bursts(rows_dicts, threshold=threshold)
+
+    # Phase 1.5: burst keep-cap post-pass. Runs BEFORE the keep-guarantee
+    # floor pass below — see _cap_burst_keeps docstring for why the ordering
+    # is safe (a burst can never end up with zero keeps as a result of this
+    # pass, since it always leaves exactly one). Opt-out via the
+    # auto_cull_cap_burst_keeps setting.
+    demotions: list[dict] = []
+    if thresholds.get("auto_cull_cap_burst_keeps"):
+        demotions = _cap_burst_keeps(bursts, decisions, reasons, thresholds)
+
     # Phase 2: burst keep-guarantee post-pass. Walks each similarity group;
     # if it has ≥2 members, zero Keeps, and at least one member has a
     # subjective reject reason (not iso_ceiling / reciprocal_rule /
@@ -793,7 +1504,6 @@ def run_auto_cull(source_folder: str | None = None):
     # the promotions so the response surfaces them for any future UI nudge.
     from backend.group_scoring import top_n_candidates
     promotions: list[dict] = []
-    bursts = _group_undecided_into_bursts(rows_dicts)
     for burst in bursts:
         if len(burst) < 2:
             continue
@@ -816,6 +1526,11 @@ def run_auto_cull(source_folder: str | None = None):
             # report "this burst was almost lost" in the response.
             continue
         decisions[winner_id] = "maybe"
+        # Overwrite the winner's pre-promotion reject reason so Phase 3 (and
+        # the auto_decision_log audit trail) record the TRUE cause of the
+        # final decision, not the reject rule that would have fired without
+        # this post-pass.
+        reasons[winner_id] = "burst_keep_guarantee"
         promotions.append({
             "image_id": winner_id,
             "from": current,
@@ -825,12 +1540,38 @@ def run_auto_cull(source_folder: str | None = None):
         })
 
     # Phase 3: apply the decisions (now post-promotion).
+    #
+    # Mirroring is OFF by default here: every row (RAW and processed alike)
+    # already went through _compute_auto_decision independently above, using
+    # its own scores. Letting _apply_decision mirror one side's decision onto
+    # its companion would silently overwrite that independent verdict with
+    # whichever sibling happened to be applied second in this loop — e.g. a
+    # camera JPEG scoring personal_score=100 ("keep") getting dragged down to
+    # match its un-demosaiced RAW twin scoring ~35 ("maybe"), even though both
+    # were correctly scored on their own. Manual K/M/X from the UI still
+    # mirrors (see POST /decision) because there the user only ever judges
+    # one visible tile and both files should follow that single verdict.
+    #
+    # Exception: analysis_mode=jpeg_priority gives a RAW-with-processed-sibling
+    # an unscored analysis_status='skipped' stub row (see analyze_folder in
+    # backend/routers/analysis.py) that never reaches this query's `WHERE
+    # analysis_status = 'done'` filter and never gets its own entry in
+    # `decisions`/`reasons`. That stub has no independent verdict to protect —
+    # mirroring is the ONLY way it ever gets decided and moved. Skipping this
+    # would leave every such RAW behind in the source folder while its JPEG
+    # twin moves on its own (see _companion_is_hidden, which encodes this same
+    # skipped-stub case for the manual K/M/X path).
     counts: dict[str, int] = {"keep": 0, "maybe": 0, "reject": 0}
     errors: list[dict] = []
     for row in rows_dicts:
         decision = decisions[row["id"]]
+        companion_id = _find_companion_image_id(row)
+        mirror_to_skipped_stub = companion_id is not None and _companion_is_skipped_stub(companion_id)
         try:
-            _apply_decision(row["id"], decision, is_auto=True)
+            _apply_decision(
+                row["id"], decision, is_auto=True, reason=reasons.get(row["id"]),
+                _mirror=mirror_to_skipped_stub,
+            )
             counts[decision] += 1
         except HTTPException as exc:
             errors.append({"id": row["id"], "error": exc.detail})
@@ -845,4 +1586,8 @@ def run_auto_cull(source_folder: str | None = None):
         # New: surfaces how many bursts had their best photo rescued from
         # all-reject to maybe. Frontend can use this for a one-line toast.
         "promotions": promotions,
+        # Surfaces how many extra burst keeps were demoted by the multi-keep
+        # pass. Each entry carries "to": "maybe" | "reject" so the frontend can
+        # split near-alternates (Maybe) from clearly-weak duplicates (Reject).
+        "demotions": demotions,
     }

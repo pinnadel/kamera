@@ -271,8 +271,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     target = Path(sys.argv[1])
-    extensions = {".jpg", ".jpeg", ".png", ".raf", ".nef"}
-    image_paths = sorted(f for f in target.iterdir() if f.suffix.lower() in extensions)
+    from backend.constants import SUPPORTED_EXTENSIONS
+    image_paths = sorted(f for f in target.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS)
 
     if not image_paths:
         print("No images found.")

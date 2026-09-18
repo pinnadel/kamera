@@ -19,23 +19,181 @@ the constant with a "keep in sync" comment that drifted. Moving the
 constants here is the cheapest fix.
 """
 
-# Photo file extensions the analyzer + watcher recognise. Lowercase with
-# the leading dot so callers can match against `path.suffix.lower()`
-# directly. Update both this list AND
-# phase2_quality/burst_ranker.py::_DIRECT_PASS_FORMATS /
-# _RAW_FALLBACK_FORMATS when adding a new format.
-SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".raf", ".nef", ".png", ".tiff", ".tif",
-})
-
 # Uppercase canonical format names used in `images.format` column for
 # RAW files. Kept aligned with rawpy's supported set; do not add formats
 # rawpy can't decode (the analyzer would crash). Used to gate RAW-only
 # code paths (preview demosaic, sidecar-pref invalidation, the burst
 # ranker's on-demand preview fallback).
+#
+# This is the single source of truth for "which RAW formats KaMeRa handles".
+# Everything RAW-shaped below derives from it — see RAW_DECODE_SUFFIXES.
 RAW_FORMATS: frozenset[str] = frozenset({
-    "RAF", "NEF", "ARW", "CR2", "CR3", "DNG",
+    "RAF", "NEF", "3FR", "ARW", "CR2", "CR3", "DNG",
 })
+
+# Lowercase, dot-prefixed mirror of RAW_FORMATS, so callers can match against
+# `path.suffix.lower()` directly. Derived, never hand-written.
+#
+# Why derived: until 2026-08-28 four scorers each carried their own literal
+# tuple of RAW suffixes, and three of them still read ('.RAF', '.NEF', '.3FR')
+# long after DNG/ARW/CR2/CR3 joined RAW_FORMATS. A .dng therefore fell through
+# to the cv2/Pillow branch, which cannot decode it. Import this constant
+# instead of retyping the list.
+RAW_DECODE_SUFFIXES: tuple[str, ...] = tuple(
+    sorted("." + fmt.lower() for fmt in RAW_FORMATS)
+)
+
+# Non-RAW photo extensions the analyzer + watcher recognise.
+#
+# .hif is here as a directly-analyzable format (Fuji X100VI/X Half can shoot
+# HIF-only, no RAW at all — those files were previously invisible to KaMeRa).
+# But .hif is ALSO written as a sidecar next to a .RAF in RAW+HIF mode, where
+# it must stay move-only (see file_mover.py) and never get its own DB row /
+# independent analysis — that would double-count the shot and double-move on
+# decision. is_standalone_hif() below is the gate: callers that walk a folder
+# for analysis candidates must skip a .hif file that has a same-stem RAW
+# sibling.
+# .heic/.heif decode through the same pillow-heif opener as .hif (registered
+# once at backend/main.py import) and burst_ranker._DIRECT_PASS_FORMATS already
+# lists them. Added 2026-09-18 for the Apple Photos source, where they are ~75%
+# of the library — note this also makes HEIC analysable in ordinary folder tabs,
+# which it previously was not.
+#
+# Unlike .hif they are never a RAW sidecar: no camera writes a RAW+HEIC pair,
+# so they need no is_standalone_hif-style gate.
+_PROCESSED_EXTS: frozenset[str] = frozenset({
+    ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".hif", ".heic", ".heif",
+})
+
+# Photo file extensions the analyzer + watcher recognise. The RAW half is
+# derived from RAW_FORMATS so the two can never drift — before 2026-08-28 they
+# did, and DNG/ARW/CR2/CR3 counted as decodable RAW formats while staying
+# invisible to every folder walk (so the files were simply never discovered).
+#
+# Adding a new NON-RAW format still means updating
+# phase2_quality/burst_ranker.py::_DIRECT_PASS_FORMATS by hand; the RAW side
+# of that module already reads RAW_FORMATS.
+SUPPORTED_EXTENSIONS: frozenset[str] = _PROCESSED_EXTS | frozenset(RAW_DECODE_SUFFIXES)
+
+# Extensions that, when found as a same-stem sibling of a .hif file, mean
+# the .hif is a camera-baked sidecar preview (not a standalone photo). Any
+# RAW format qualifies — only Fuji ships RAW+HIF today, but gating on the
+# full set costs nothing and removes another hand-maintained copy.
+_HIF_PAIRED_RAW_EXTS: frozenset[str] = frozenset(RAW_DECODE_SUFFIXES)
+
+
+def is_standalone_hif(path) -> bool:
+    """
+    True if `path` is a .hif/.HIF file with no same-stem RAW sibling in its
+    folder — i.e. a real photo (X100VI/X Half HIF-only shooting mode), not a
+    RAW+HIF sidecar preview. Non-.hif paths always return False.
+
+    Folder is scanned once per call; callers filtering many candidates
+    should cache siblings per-directory rather than calling this in a
+    tight loop over a large folder.
+    """
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if p.suffix.lower() != ".hif":
+        return False
+    stem_lower = p.stem.lower()
+    try:
+        siblings = list(p.parent.iterdir())
+    except OSError:
+        return True
+    for sibling in siblings:
+        if sibling.suffix.lower() in _HIF_PAIRED_RAW_EXTS and sibling.stem.lower() == stem_lower:
+            return False
+    return True
+
+def is_raw_format(fmt: str | None) -> bool:
+    """True if `fmt` (an images.format value, e.g. 'RAF', 'JPG') is RAW."""
+    return bool(fmt) and fmt.upper() in RAW_FORMATS
+
+
+# Extensions that count as a "processed" sibling for the jpeg_priority
+# analysis-mode skip (backend/routers/settings.py::analysis_mode). Exactly the
+# non-RAW half of SUPPORTED_EXTENSIONS, .hif-as-sidecar nuance included — .hif
+# itself counts, since an X100VI/X Half RAW+HIF pair should skip the RAW the
+# same way a RAW+JPEG pair does.
+_PROCESSED_SIBLING_EXTS: frozenset[str] = _PROCESSED_EXTS
+
+
+def has_processed_sibling(path) -> bool:
+    """
+    True if `path` (a RAW file) has a same-stem JPEG/HIF/etc. sibling in its
+    folder — i.e. it's safe to skip scoring it under analysis_mode=jpeg_priority
+    because a processed rendition exists to cull from instead. Non-RAW paths
+    and RAW files with no such sibling return False (the latter must still be
+    analyzed in full — nothing else to judge the shot by).
+
+    Folder is scanned once per call; callers filtering many candidates should
+    cache siblings per-directory rather than calling this in a tight loop.
+    """
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if p.suffix.upper().lstrip(".") not in RAW_FORMATS:
+        return False
+    stem_lower = p.stem.lower()
+    try:
+        siblings = list(p.parent.iterdir())
+    except OSError:
+        return False
+    for sibling in siblings:
+        if (sibling.suffix.lower() in _PROCESSED_SIBLING_EXTS
+                and sibling.stem.lower() == stem_lower
+                and sibling != p):
+            return True
+    return False
+
+
+def companion_stem_matches(filename_a: str, filename_b: str) -> bool:
+    """
+    True if two filenames are the same shot in different formats — same stem,
+    case-insensitive (APFS default), different file. Used to pair a RAW+JPEG
+    (or RAW+standalone-HIF) capture across two independent `images` rows.
+
+    Does NOT check source_folder — callers must already have scoped the
+    comparison to the same folder (two files with the same stem in different
+    folders are unrelated shots, not a pair).
+    """
+    from pathlib import Path as _Path
+    if filename_a == filename_b:
+        return False
+    return _Path(filename_a).stem.lower() == _Path(filename_b).stem.lower()
+
+
+def shot_at_to_unix(value) -> float | None:
+    """
+    Normalise a SQLite shot_at column to Unix seconds for burst clustering.
+
+    Accepts either an integer/float epoch or an ISO-8601 string. Handles the
+    two string shapes SQLite actually stores — 'YYYY-MM-DDTHH:MM:SS' and
+    'YYYY-MM-DD HH:MM:SS' (space separator) — and a trailing 'Z' UTC marker.
+    Returns None if the value is missing or unparseable.
+
+    Canonical home for what used to be two subtly-divergent copies: one in
+    routers/model.py (handled int epochs + 'Z' but not the space separator)
+    and a "tiny copy" in routers/decisions.py (handled the space separator but
+    silently returned None for 'Z'-suffixed and epoch values). Consolidated
+    here — stdlib-only, importable from either router without a circular
+    import — so the two clustering call sites can never drift apart again.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    from datetime import datetime
+    s = str(value).strip().replace("Z", "+00:00")
+    # SQLite may store a space between date and time; fromisoformat wants 'T'
+    # on older Pythons. Normalise only the first separator.
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
 
 # Subfolder names a photo is moved INTO once a keep/maybe/reject decision is
 # made (see file_mover.resolve_dest_folder). Files here are post-decision and
@@ -43,4 +201,29 @@ RAW_FORMATS: frozenset[str] = frozenset({
 # (Provenance) moving a keeper out of _Keeps can't race the watcher into a
 # "Could not load image" error. Canonical home — previously duplicated as
 # inline literals in routers/images.py, routers/analysis.py, file_mover.py.
-DECISION_SUBFOLDERS: frozenset[str] = frozenset({"_Keeps", "_Maybes", "_Trash"})
+DECISION_SUBFOLDERS: frozenset[str] = frozenset({"_Keeps", "_Maybes", "_Rejects"})
+
+
+# ---------------------------------------------------------------------------
+# Non-filesystem sources
+# ---------------------------------------------------------------------------
+
+# `images.source_folder` doubles as the tab key. For an Apple Photos album
+# there is no folder, so the key is an opaque URI instead:
+#
+#     photos://<library_id>/<album_uuid>
+#
+# Deliberately not a path: Path("photos://…").exists() is False and is_dir()
+# is False, so any code that mistakes it for a directory fails loudly rather
+# than silently walking "/" or creating a "_Keeps" folder somewhere strange.
+#
+# Dispatch of write-back behaviour is by `images.source_type`, never by this
+# prefix — the prefix only exists to make the key unique and debuggable. Use
+# the helper below only for endpoints that receive a bare source_folder string
+# and have no row to look source_type up on.
+PHOTOS_SOURCE_PREFIX: str = "photos://"
+
+
+def is_photos_source_folder(source_folder: str | None) -> bool:
+    """True if this tab key names an Apple Photos album rather than a folder."""
+    return bool(source_folder) and source_folder.startswith(PHOTOS_SOURCE_PREFIX)

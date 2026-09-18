@@ -194,7 +194,7 @@ export function GroupView(props) {
               Icon={Trash2}
               tone="reject"
               title="Keep best · Reject rest"
-              body={`Keep the AI pick. Send the other ${group.size - 1} to _Trash.`}
+              body={`Keep the AI pick. Send the other ${group.size - 1} to _Rejects.`}
               onClick={() => batchKeepBestRest('reject')}
             />
             <BatchAction

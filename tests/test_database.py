@@ -138,11 +138,11 @@ def test_folder_overrides_roundtrip(tmp_path: Path, tmp_db: Path) -> None:
 
     overrides = get_folder_overrides(source, db_path=tmp_db)
 
-    # get_folder_overrides translates decision names to the legacy key names
+    # get_folder_overrides translates decision names to the override key names
     # that resolve_dest_folder expects.
-    assert overrides.get("keeps_folder")  == keeps
-    assert overrides.get("maybes_folder") == maybes
-    assert overrides.get("trash_folder")  == trash
+    assert overrides.get("keeps_folder")   == keeps
+    assert overrides.get("maybes_folder")  == maybes
+    assert overrides.get("rejects_folder") == trash
 
 
 def test_folder_override_delete(tmp_path: Path, tmp_db: Path) -> None:
@@ -554,3 +554,59 @@ def test_v25_backfill_idempotent(tmp_db: Path) -> None:
 
     assert first == 2
     assert second == 2, f"Backfill duplicated rows: {first} → {second}"
+
+
+# ---------------------------------------------------------------------------
+# v52 — Apple Photos as a source type
+# ---------------------------------------------------------------------------
+
+def test_v52_images_source_columns(tmp_db: Path) -> None:
+    """source_type drives write-back dispatch; photos_uuid addresses the asset."""
+    columns = _column_names(tmp_db, "images")
+    assert {"source_type", "photos_uuid"} <= columns
+
+
+def test_v52_source_type_defaults_to_folder(tmp_db: Path) -> None:
+    """
+    Every pre-v52 row is folder-sourced, and the NOT NULL DEFAULT backfills
+    them in one statement — so an INSERT that omits the column must still
+    land on 'folder' rather than NULL.
+    """
+    with get_db(tmp_db) as conn:
+        conn.execute(
+            "INSERT INTO images (file_path, filename) VALUES (?, ?)",
+            ("/tmp/legacy.RAF", "legacy.RAF"),
+        )
+        row = conn.execute(
+            "SELECT source_type, photos_uuid FROM images WHERE file_path = ?",
+            ("/tmp/legacy.RAF",),
+        ).fetchone()
+    assert row["source_type"] == "folder"
+    assert row["photos_uuid"] is None
+
+
+def test_v52_training_samples_corpus_defaults_to_folder(tmp_db: Path) -> None:
+    """Existing training rows all came from folder tabs — they must stay there."""
+    assert "corpus" in _column_names(tmp_db, "training_samples")
+    with get_db(tmp_db) as conn:
+        conn.execute(
+            "INSERT INTO training_samples "
+            "(sample_uuid, decision, features_json, schema_version) "
+            "VALUES (?, ?, ?, ?)",
+            ("uuid-legacy", "keep", "{}", 6),
+        )
+        row = conn.execute(
+            "SELECT corpus FROM training_samples WHERE sample_uuid = ?",
+            ("uuid-legacy",),
+        ).fetchone()
+    assert row["corpus"] == "folder"
+
+
+def test_v52_photos_albums_table(tmp_db: Path) -> None:
+    """source_folder is an opaque photos:// key, so the album name needs a home."""
+    assert "photos_albums" in _table_names(tmp_db)
+    columns = _column_names(tmp_db, "photos_albums")
+    assert {
+        "source_folder", "library_path", "album_uuid",
+        "album_name", "album_path", "last_synced_at",
+    } <= columns

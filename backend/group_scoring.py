@@ -91,7 +91,15 @@ def score_candidate(img: dict) -> tuple:
 
 def top_n_candidates(images: list[dict], n: int) -> list[dict]:
     """Return the top-n photos by `score_candidate`, descending. Stable on
-    ties (preserves input order)."""
-    if n >= len(images):
-        return list(images)
+    ties (preserves input order).
+
+    Always sorts, even when `n >= len(images)`: callers rely on the full
+    result being in priority order, not just truncated to n. A prior
+    `if n >= len(images): return list(images)` short-circuit skipped the
+    sort in that case and returned the photos in INPUT order — which silently
+    made _collapse_near_duplicates keep whichever near-dup frame happened to
+    be listed first as the burst representative, instead of the best-scoring
+    one (it passes n == len(images)). Sorting a handful of burst members is
+    cheap; the correctness of "index 0 is the best photo" is the contract.
+    """
     return sorted(images, key=score_candidate, reverse=True)[:n]

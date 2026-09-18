@@ -334,9 +334,11 @@ if __name__ == "__main__":
         print("Usage: python camera_shake.py <image_path_or_folder>")
         sys.exit(1)
 
+    from backend.constants import SUPPORTED_EXTENSIONS
+
     target = Path(sys.argv[1])
     images = (
-        sorted(f for f in target.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".raf", ".nef"})
+        sorted(f for f in target.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS)
         if target.is_dir() else [target]
     )
 

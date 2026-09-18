@@ -66,9 +66,30 @@ openai>=1.0.0
 # Trash utility — send files to macOS Trash (recoverable), used by POST /trash-rejects
 send2trash>=1.8.0
 
-# Launcher — menu bar / tray icon
-pystray>=0.19.0   # Windows / Linux tray icon
-rumps>=0.4.0      # macOS-native menu bar app (ignored on other platforms)
+# Launcher — Windows / Linux tray icon (macOS launcher is headless, no tray dep)
+pystray>=0.19.0
 
 # Environment
 python-dotenv==1.2.2
+
+# Apple Photos source type (macOS only)
+#
+# osxphotos reads the Photos library catalogue (Photos.sqlite) and resolves
+# album membership to real originals/ file paths; photoscript writes decisions
+# back as `KaMeRa:Keep|Maybe|Reject` keywords via AppleScript. Decoding is
+# still done by rawpy / pillow-heif on the real original — osxphotos never
+# touches pixels, and nothing here ever moves a file.
+#
+# COMPATIBILITY RULE 4 EXCEPTION (macOS + Windows): Photos.app has no Windows
+# equivalent, so there is no cross-platform fallback to write. Contained
+# instead: both imports are lazy and confined to backend/photos_library.py and
+# backend/sources/photos.py, photos_library.is_available() gates every entry
+# point, the endpoints return 501 off macOS, and the UI hides the menu item.
+# A Windows install loses exactly one source type and nothing else.
+#
+# Verified 2026-09-18 on Python 3.14.5: installs clean, `pip check` shows no
+# new conflicts (only the pre-existing facenet-pytorch --no-deps warnings), and
+# numpy / torch / Pillow / OpenCV / rawpy / scikit-learn are all untouched.
+# Bumps pyobjc-core 12.1 → 12.2.2.
+osxphotos==0.76.1 ; sys_platform == "darwin"
+photoscript>=0.5.3 ; sys_platform == "darwin"

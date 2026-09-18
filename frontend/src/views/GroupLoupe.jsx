@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
-import { ArrowLeft, Check, ChevronLeft, ChevronRight, MousePointerSquareDashed, ZoomIn } from 'lucide-react'
+import { ArrowLeft, Check, ChevronLeft, ChevronRight, Filter, MousePointerSquareDashed, ZoomIn } from 'lucide-react'
 import { API } from '../api'
 import { DecisionBadge, DecisionWord, ScoreBadge } from '../ui/primitives'
 import { PullVisionModelButton } from '../ui/PullVisionModelButton'
@@ -11,6 +11,7 @@ import { ViewPill } from '../ui/ViewPill'
 import { THUMB_ASPECT, FILMSTRIP_CHROME_BARE, stripHeight } from '../ui/filmstripMetrics'
 import { Filmstrip } from '../ui/Filmstrip'
 import { useMultiSelect } from '../hooks/useMultiSelect'
+import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // GroupLoupe — full-screen workspace for triaging one similarity group.
 //
@@ -47,34 +48,6 @@ const ZOOM_SCALE  = 2.4
 // burst opened this session). Entries are never evicted — refreshing
 // the page is the natural reset.
 const _burstResultCache = new Map()
-
-// fileFormat — uppercased filename suffix, used to badge tiles so users can
-// tell at a glance which version of a shot they're looking at. The same shot
-// captured as RAF + JPG (or RAF + HIF on Fuji) will score differently because
-// in-camera JPEG/HIF processing applies sharpening and tone-mapping the raw
-// decode skips — surfacing the format makes that intentional, not confusing.
-function fileFormat(filename) {
-  if (!filename) return null
-  const dot = filename.lastIndexOf('.')
-  if (dot < 0) return null
-  return filename.slice(dot + 1).toUpperCase()
-}
-
-// formatBadgeTone — distinguish raw formats (warmer) from rendered formats
-// (cooler) so users can tell families apart at a glance.
-function formatBadgeTone(fmt) {
-  if (!fmt) return null
-  if (fmt === 'RAF' || fmt === 'NEF' || fmt === 'CR2' || fmt === 'CR3' || fmt === 'ARW' || fmt === 'DNG') {
-    return 'bg-[rgba(232,184,74,0.15)] text-[#E8B84A] border border-[rgba(232,184,74,0.30)]'
-  }
-  if (fmt === 'HIF' || fmt === 'HEIC') {
-    return 'bg-[rgba(91,184,212,0.15)] text-[#5BB8D4] border border-[rgba(91,184,212,0.30)]'
-  }
-  if (fmt === 'JPG' || fmt === 'JPEG') {
-    return 'bg-[rgba(125,184,154,0.15)] text-[#7DB89A] border border-[rgba(125,184,154,0.30)]'
-  }
-  return 'bg-[rgba(255,255,255,0.10)] text-[#cecece] border border-[rgba(255,255,255,0.15)]'
-}
 
 export function GroupLoupe({
   group,
@@ -289,10 +262,15 @@ export function GroupLoupe({
   // best_image_id) so opening a new burst always starts clean.
   const loupeSelect = useMultiSelect()
   const [pickTargetMode, setPickTargetMode] = useState(false)
+  // "Finish group" no-keeps guard: when the user triggers Finish with zero
+  // Keeps marked, we don't sweep — instead we surface a confirm affordance.
+  // True = the "Reject whole group?" confirmation is showing.
+  const [finishWarnOpen, setFinishWarnOpen] = useState(false)
   const groupIdForResetKey = group?.best_image_id ?? null
   useEffect(() => {
     loupeSelect.exit()
     setPickTargetMode(false)
+    setFinishWarnOpen(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupIdForResetKey])
 
@@ -430,21 +408,82 @@ export function GroupLoupe({
     burstResult.filtered_from > (burstResult.evaluated_ids?.length || 0)
   )
 
+  // Clicking the "AI ranked top N of M" chip narrows Survey/Filmstrip to just
+  // the evaluated photos, in place of the old filename-list popover. Reset
+  // whenever the group's membership changes or the burst stops being
+  // filterable, so a stale narrowed view doesn't survive into an unrelated
+  // group.
+  const [showOnlyEvaluated, setShowOnlyEvaluated] = useState(false)
+  useEffect(() => { setShowOnlyEvaluated(false) }, [memberKey])
+  useEffect(() => { if (!wasFiltered) setShowOnlyEvaluated(false) }, [wasFiltered])
+
+  // What actually renders in SurveyGrid/LoupePane. Kept separate from
+  // sortedImages, which stays the full-group source of truth for navigation,
+  // hotkeys, and batch decide (Keep best/Maybe rest, Finish group, etc.) —
+  // those must always see every photo, not just the narrowed subset.
+  const displayImages = useMemo(() => {
+    if (!showOnlyEvaluated || !evaluatedSet) return sortedImages
+    return sortedImages.filter(img => evaluatedSet.has(img.id))
+  }, [sortedImages, showOnlyEvaluated, evaluatedSet])
+
+  // Map image_id → { rank, isDuplicate } so tiles can show the AI's full
+  // order, not just who's rank-1. Lets a user skim a burst as "AI already
+  // triaged this, ranks 1–3 are the real contenders" instead of eyeballing
+  // every near-dupe frame. Empty/absent outside a successful 'ranked'
+  // response — no ordinal renders for near_duplicates/error/loading/
+  // score-based-only.
+  //
+  // isDuplicate flags photos that never went to the LLM themselves — they
+  // were collapsed into a representative by burst_ranker's near-duplicate
+  // pass (cosine ≥ 0.97) and inherited that rep's rank wholesale (backend
+  // tags these with reason "near-duplicate of #<rep_id>"). Several tiles
+  // can legitimately share one rank number this way; the badge renders
+  // that as a tie ("≈3") instead of looking like a broken ordinal.
+  const rankById = useMemo(() => {
+    if (burstStatus !== 'ranked' || !Array.isArray(burstResult?.rankings)) return null
+    const m = new Map()
+    for (const r of burstResult.rankings) {
+      m.set(r.image_id, {
+        rank: r.rank,
+        isDuplicate: typeof r.reason === 'string' && r.reason.startsWith('near-duplicate of #'),
+      })
+    }
+    return m
+  }, [burstStatus, burstResult])
+
   // Pick a sensible default focus (the AI hero) on open or when the group
   // changes. Falls back to the first photo if hero somehow isn't in the list.
   // Deliberately keyed on the score-based hero only — we don't auto-shift
   // focus when the LLM rank arrives later, that would feel like the cursor
   // is jumping under the user. The amber ring/badge does shift to the LLM
   // pick; only the focused tile stays where the user put it.
+  //
+  // Guard: `best_image_id` also changes when a background analysis drops a
+  // new (higher-scoring) photo into the group the user already has open —
+  // that's not a "group changed" event from the user's POV, and shouldn't
+  // rip focus away from whatever they're looking at. So only jump to the
+  // hero when the currently-focused photo isn't (or is no longer) a member
+  // of this group; otherwise leave focusedId exactly where the user left it.
   useEffect(() => {
     if (!group) return
-    const heroId = group.best_image_id ?? sortedImages[0]?.id ?? null
-    setFocusedId(heroId)
+    let focusPreserved = false
+    setFocusedId(prev => {
+      if (prev != null && sortedImages.some(img => img.id === prev)) {
+        focusPreserved = true
+        return prev
+      }
+      return group.best_image_id ?? sortedImages[0]?.id ?? null
+    })
     // Mode is NOT reset on group change — the user's preferred view
-    // (Survey / Filmstrip) persists across loupes via localStorage.
-    setZoomOn(false)
-    setZoomOrigin({ x: 0.5, y: 0.5 })
-  }, [group?.best_image_id])
+    // (Survey / Filmstrip) persists across loupes via localStorage. Zoom
+    // likewise only resets on a real group switch, not when focus was
+    // preserved through a background photo arrival.
+    if (!focusPreserved) {
+      setZoomOn(false)
+      setZoomOrigin({ x: 0.5, y: 0.5 })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [group?.best_image_id, sortedImages])
 
   // Close View dropdown on outside click
   useEffect(() => {
@@ -555,17 +594,35 @@ export function GroupLoupe({
   }, [group, focusedImage, onSetGroupHero])
   useHotkeys('b', promoteFocusedToBest, { enabled: !!group }, [promoteFocusedToBest, group])
 
-  // U / Cmd+Z — per-photo undo for the currently-focused loupe photo. Silent
-  // no-op when the photo has no decision (matches grid behaviour). Doesn't
-  // auto-advance: undo is reflective, the user is correcting THIS photo.
+  // U / Cmd+Z — undo, selection-aware like decideSelectedOrFocused. Silent
+  // no-op when there's nothing decided to reverse (matches grid behaviour).
+  // Doesn't auto-advance: undo is reflective, the user is correcting these.
+  //
+  // The app-global stack (onUndo) is tried first: a just-applied bulk K/M/R
+  // is a single stack entry that already reverses every photo at once. The
+  // selection-aware branch below is the fallback for when the stack is empty
+  // or exhausted but a multi-selection is still active (e.g. photos decided
+  // in an earlier session) — without it, U would undo only the focused tile
+  // even though the user has several selected.
   const undoFocused = useCallback(async () => {
     if (onUndo) {
       const handled = await onUndo()
       if (handled) return
     }
+    if (loupeSelect.isSelectMode && loupeSelect.size > 0) {
+      // Undo every selected photo that actually has a decision. Selection
+      // persists so the user can act on the same set again (mirrors how bulk
+      // K/M/R leaves the selection in place).
+      const ids = Array.from(loupeSelect.selected).filter(id => {
+        const img = sortedImages.find(i => i.id === id)
+        return img && img.decision
+      })
+      await Promise.all(ids.map(id => onUndoImage?.(id)))
+      return
+    }
     if (!focusedImage || !focusedImage.decision) return
     onUndoImage?.(focusedImage.id)
-  }, [focusedImage, onUndo, onUndoImage])
+  }, [focusedImage, onUndo, onUndoImage, loupeSelect, sortedImages])
   useHotkeys('u',      undoFocused, { enabled: !!group }, [undoFocused, group])
   useHotkeys('meta+z', undoFocused, { enabled: !!group }, [undoFocused, group])
 
@@ -617,6 +674,52 @@ export function GroupLoupe({
 
     onAllDecided?.()
   }, [group, nonHero, onBulk, sortedImages, effectiveHeroId, onAllDecided])
+
+  // A — one-keystroke "accept the AI pick": keep effectiveHeroId, reject
+  // everyone else in the burst, close the loupe. Same underlying call as the
+  // "Keep best · Reject rest" toolbar button; the hotkey just gives K/R-only
+  // cullers a way to clear a whole near-dupe burst without reaching for the
+  // mouse. No-op when there's no hero or nothing left to reject.
+  useHotkeys('a', () => runBatch('reject'), { enabled: !!group && nonHero.length > 0 }, [runBatch, group, nonHero])
+
+  // ── Finish group ─────────────────────────────────────────────────────────
+  // "Respect my Keeps, reject everything else." Unlike runBatch (which forces
+  // a single AI hero), this honours every photo the user manually marked Keep
+  // and rejects the rest — undecided AND Maybe alike. Closes + advances via
+  // onAllDecided once the sweep lands.
+  const keptImages = useMemo(
+    () => sortedImages.filter(img => img.decision === 'keep'),
+    [sortedImages],
+  )
+  const nonKeptIds = useMemo(
+    () => sortedImages.filter(img => img.decision !== 'keep').map(img => img.id),
+    [sortedImages],
+  )
+
+  // Sweep all non-Keep photos to reject. When there are zero Keeps (the
+  // no-keeps confirm path), nonKeptIds is the whole group, so this rejects
+  // everything — which is exactly what "Reject whole group" means.
+  const sweepRejectRest = useCallback(async () => {
+    if (!group) return
+    if (nonKeptIds.length > 0) {
+      await onBulk(nonKeptIds, 'reject')
+    }
+    setFinishWarnOpen(false)
+    onAllDecided?.()
+  }, [group, nonKeptIds, onBulk, onAllDecided])
+
+  const finishGroup = useCallback(() => {
+    if (!group) return
+    // Zero Keeps → don't silently reject the whole group. Surface a confirm.
+    if (keptImages.length === 0) {
+      setFinishWarnOpen(true)
+      return
+    }
+    setFinishWarnOpen(false)
+    sweepRejectRest()
+  }, [group, keptImages, sweepRejectRest])
+
+  useHotkeys('c', finishGroup, { enabled: !!group }, [finishGroup, group])
 
   // ── Pan helpers ──────────────────────────────────────────────────────────
   // Drag: mousedown records start; mousemove translates delta into origin
@@ -1001,7 +1104,8 @@ export function GroupLoupe({
         <BurstRankStatus
           status={burstStatus}
           result={burstResult}
-          images={sortedImages}
+          showOnlyEvaluated={showOnlyEvaluated}
+          onToggleShowOnlyEvaluated={() => setShowOnlyEvaluated(v => !v)}
         />
         {nonHero.length > 0 && (
           <>
@@ -1022,15 +1126,49 @@ export function GroupLoupe({
             </button>
           </>
         )}
+
+        {/* Finish group — honour the user's manual Keeps, reject the rest (C) */}
+        <div className="w-px h-4 bg-[#2a2b2d]" />
+        {finishWarnOpen ? (
+          <span className="inline-flex items-center gap-2 text-xs whitespace-nowrap">
+            <span className="text-[#6a6b6c]">Nothing kept —</span>
+            <button
+              onClick={sweepRejectRest}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[rgba(201,123,123,0.12)] text-[#C97B7B] border border-[rgba(201,123,123,0.30)] hover:opacity-70 transition-opacity"
+              title={`Reject all ${group.size} photos in this group`}
+            >
+              <DecisionWord kind="reject">Reject</DecisionWord> whole group
+            </button>
+            <button
+              onClick={() => setFinishWarnOpen(false)}
+              className="px-2 py-1 rounded-lg text-[#cecece] hover:opacity-70 transition-opacity"
+            >
+              Cancel
+            </button>
+          </span>
+        ) : (
+          <button
+            onClick={finishGroup}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs bg-[rgba(91,184,212,0.12)] text-[#5BB8D4] border border-[rgba(91,184,212,0.30)] hover:opacity-70 transition-opacity whitespace-nowrap"
+            title={
+              keptImages.length > 0
+                ? `Finish group — reject the other ${nonKeptIds.length} photo${nonKeptIds.length === 1 ? '' : 's'} (C)`
+                : 'Finish group (C)'
+            }
+          >
+            <Check size={13} /> Finish group
+          </button>
+        )}
       </div>
 
       {/* ── Body ──────────────────────────────────────────────────────── */}
       <div className="flex-1 min-h-0 overflow-hidden">
         {mode === MODE_SURVEY ? (
           <SurveyGrid
-            images={sortedImages}
+            images={displayImages}
             heroId={effectiveHeroId}
             heroReason={effectiveHeroReason}
+            rankById={rankById}
             focusedId={focusedId}
             evaluatedSet={evaluatedSet}
             wasFiltered={wasFiltered}
@@ -1063,8 +1201,10 @@ export function GroupLoupe({
           />
         ) : (
           <LoupePane
-            images={sortedImages}
+            images={displayImages}
             heroId={effectiveHeroId}
+            heroReason={effectiveHeroReason}
+            rankById={rankById}
             focusedImage={focusedImage}
             evaluatedSet={evaluatedSet}
             wasFiltered={wasFiltered}
@@ -1182,7 +1322,7 @@ export function GroupLoupe({
 const TILE_SIZE_MAP = { S: 130, M: 280, L: 540 }
 const ROW_HEIGHT_MAP = { S: 120, M: 240, L: 460 }
 
-function SurveyGrid({ images, heroId, heroReason, focusedId, evaluatedSet, wasFiltered, onTileClick, onTileDoubleClick, onTileMouseDown, onWheel, transformStyle, zoomOn, tileSize, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile }) {
+function SurveyGrid({ images, heroId, heroReason, rankById, focusedId, evaluatedSet, wasFiltered, onTileClick, onTileDoubleClick, onTileMouseDown, onWheel, transformStyle, zoomOn, tileSize, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile }) {
   const minTile  = TILE_SIZE_MAP[tileSize] ?? (images.length <= 3 ? 480 : images.length <= 6 ? 340 : 260)
   const rowHeight = ROW_HEIGHT_MAP[tileSize] ?? (images.length <= 3 ? 420 : images.length <= 6 ? 290 : 220)
 
@@ -1198,6 +1338,8 @@ function SurveyGrid({ images, heroId, heroReason, focusedId, evaluatedSet, wasFi
             img={img}
             isHero={img.id === heroId}
             heroReason={img.id === heroId ? heroReason : null}
+            rank={rankById?.get(img.id)?.rank ?? null}
+            isDuplicateRank={!!rankById?.get(img.id)?.isDuplicate}
             isFocused={img.id === focusedId}
             // notLlmEvaluated: only meaningful when the burst was pre-filtered.
             // For un-filtered bursts (≤12), every tile was evaluated, so we
@@ -1222,7 +1364,7 @@ function SurveyGrid({ images, heroId, heroReason, focusedId, evaluatedSet, wasFi
   )
 }
 
-function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onClick, onDoubleClick, onMouseDown, onWheel, transformStyle, zoomOn, modelInfo, isMultiSelected = false, isSelectMode = false, draggable = false, onDragStart, onDragEnd }) {
+function SurveyTile({ img, isHero, heroReason, rank, isDuplicateRank = false, isFocused, notLlmEvaluated, onClick, onDoubleClick, onMouseDown, onWheel, transformStyle, zoomOn, modelInfo, isMultiSelected = false, isSelectMode = false, draggable = false, onDragStart, onDragEnd }) {
   // Ring priority (most specific wins):
   //   1. multi-select / focused → cyan (active user gesture)
   //   2. decision K/M/R → green/amber/coral; ring-2 if this is also the
@@ -1230,7 +1372,7 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
   //   3. hero (no decision yet) → ring-2 amber
   //   4. default → faint white hover
   const ring = (() => {
-    if (isMultiSelected || isFocused) return 'ring-1 ring-[#5BB8D4]'
+    if (isMultiSelected || isFocused) return SELECTION_RING
     const dec = img.decision
     if (dec === 'keep')   return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(125,184,154,0.55)] hover:ring-[rgba(125,184,154,0.75)]`
     if (dec === 'maybe')  return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(232,184,74,0.55)] hover:ring-[rgba(232,184,74,0.75)]`
@@ -1291,6 +1433,27 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
             aria-label="Not LLM-evaluated"
           />
         )}
+        {!isHero && typeof rank === 'number' && (
+          // AI rank ordinal for non-hero photos the LLM ranked. Mutually
+          // exclusive with notLlmEvaluated (a ranked photo was, by
+          // definition, evaluated), so both can safely share the top-right
+          // corner. Lets a user skim "AI already triaged this burst" —
+          // ranks 2/3 are real contenders, higher numbers are the LLM's
+          // rejects — without opening the top-bar inspect popover.
+          //
+          // isDuplicateRank: this photo wasn't itself judged by the LLM —
+          // it's a near-duplicate frame collapsed onto a ranked rep before
+          // the vision call, and inherited the rep's number. Several tiles
+          // can share one rank this way, so it renders as a tie ("≈3") to
+          // read as "same as" rather than a broken ordinal.
+          <span
+            className="absolute top-2 right-2 min-w-[20px] h-5 px-1.5 rounded-full bg-[rgba(0,0,0,0.65)] text-[#9c9c9d] text-[10px] font-semibold shadow flex items-center justify-center tabular-nums"
+            title={isDuplicateRank ? `Near-duplicate of the AI rank ${rank} pick — visually indistinguishable` : `AI rank ${rank}`}
+            aria-label={isDuplicateRank ? `Near-duplicate of AI rank ${rank}` : `AI rank ${rank}`}
+          >
+            {isDuplicateRank ? `≈${rank}` : rank}
+          </span>
+        )}
         {/* Multi-select check overlay — bottom-left so it never collides
             with the Best/hero badge in the top-left. */}
         {isSelectMode && (
@@ -1308,17 +1471,6 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
       <div className="px-2 py-1.5 flex items-center gap-1.5 bg-[#101111] border-t border-[rgba(255,255,255,0.04)]">
         <ScoreBadge score={pickHeadlineScore(img, modelInfo)} />
         {img.decision && <DecisionBadge decision={img.decision} />}
-        {(() => {
-          const fmt = fileFormat(img.filename)
-          return fmt && (
-            <span
-              className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold uppercase leading-none ${formatBadgeTone(fmt)}`}
-              title="File format — RAW vs JPEG/HIF can score differently due to in-camera processing"
-            >
-              {fmt}
-            </span>
-          )
-        })()}
         <span className="ml-auto text-[10px] font-mono text-[#9c9c9d] truncate" title={img.filename}>
           {img.filename}
         </span>
@@ -1328,15 +1480,16 @@ function SurveyTile({ img, isHero, heroReason, isFocused, notLlmEvaluated, onCli
 }
 
 // ── Loupe + filmstrip ───────────────────────────────────────────────────────
-function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, onPickFilmstrip, onMouseDown, onWheel, transformStyle, zoomOn, thumbSize = 112, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, onStartFilmstripResize = null }) {
+function LoupePane({ images, heroId, heroReason, rankById, focusedImage, evaluatedSet, wasFiltered, onPickFilmstrip, onMouseDown, onWheel, transformStyle, zoomOn, thumbSize = 112, modelInfo, selectedSet, isSelectMode, onDragStartTile, onDragEndTile, filmstripCollapsed = false, onToggleFilmstripCollapsed = null, onStartFilmstripResize = null }) {
   if (!focusedImage) return null
   const thumbW = thumbSize
   const thumbH = Math.round(thumbSize * THUMB_ASPECT)
+  const showHeroReason = focusedImage.id === heroId && !!heroReason
   return (
     <div className="h-full flex flex-col">
       {/* Big preview */}
       <div
-        className={`flex-1 min-h-0 bg-[#07080a] flex items-center justify-center overflow-hidden p-4 ${zoomOn ? 'cursor-grab' : ''}`}
+        className={`relative flex-1 min-h-0 bg-[#07080a] flex items-center justify-center overflow-hidden p-4 ${zoomOn ? 'cursor-grab' : ''}`}
         onMouseDown={(e) => onMouseDown(focusedImage, e)}
         onWheel={onWheel}
         onClick={() => onPickFilmstrip(focusedImage)}
@@ -1348,6 +1501,19 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
           style={transformStyle}
           draggable={false}
         />
+        {/* AI pick reason — same information as the Survey-mode badge, surfaced
+            here so Filmstrip-mode users (the default for most cullers) get the
+            "why" without switching views. Only shown while the hero itself is
+            focused; stepping to another photo hides it rather than showing a
+            stale reason that belongs to a different frame. */}
+        {showHeroReason && (
+          <span
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 max-w-[85%] px-2.5 py-1 rounded-md text-xs bg-[rgba(7,8,10,0.75)] border border-[rgba(232,184,74,0.30)] text-[#E8B84A] text-center truncate select-none pointer-events-none"
+            title={heroReason}
+          >
+            AI pick — {heroReason}
+          </span>
+        )}
       </div>
       {/* Filmstrip — shared primitive owns toolbar + collapse + resize +
           thumb row layout. Per-thumb chrome (hero ring, multi-select,
@@ -1367,7 +1533,7 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
           const notLlmEvaluated = wasFiltered && evaluatedSet ? !evaluatedSet.has(img.id) : false
           // Same ring priority as SurveyTile — keep these in sync.
           const ring = (() => {
-            if (isMultiSelected || isFocused) return 'ring-1 ring-[#5BB8D4]'
+            if (isMultiSelected || isFocused) return SELECTION_RING
             const dec = img.decision
             if (dec === 'keep')   return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(125,184,154,0.55)] hover:ring-[rgba(125,184,154,0.75)]`
             if (dec === 'maybe')  return `${isHero ? 'ring-2' : 'ring-1'} ring-[rgba(232,184,74,0.55)] hover:ring-[rgba(232,184,74,0.75)]`
@@ -1377,6 +1543,14 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
           })()
           const dimmed = isSelectMode && !isMultiSelected ? 'opacity-70' : ''
           const isDraggable = isMultiSelected
+          // Rank ordinal — only for non-hero photos the LLM actually ranked
+          // (rank 1 already has the star badge below; showing "1" too would
+          // be redundant). Lets a user skim "AI already triaged this burst"
+          // without re-reading the top-bar chip for every thumb.
+          const rankEntry = rankById?.get(img.id)
+          const rank = rankEntry?.rank
+          const isDuplicateRank = !!rankEntry?.isDuplicate
+          const showRankBadge = !isHero && typeof rank === 'number'
           return (
             <button
               key={img.id}
@@ -1388,7 +1562,7 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
               onDragStart={isDraggable ? (e) => onDragStartTile?.(img, e) : undefined}
               onDragEnd={isDraggable ? onDragEndTile : undefined}
               className={`relative flex-shrink-0 rounded-md overflow-hidden bg-[#161718] transition-all ${isDraggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'} ${ring} ${dimmed || (img.decision === 'reject' && !isFocused ? 'opacity-[0.45]' : '')}`}
-              title={isHero ? `${img.filename} — Best in group` : img.filename}
+              title={isHero ? `${img.filename} — Best in group` : showRankBadge ? `${img.filename} — ${isDuplicateRank ? `near-duplicate of AI rank ${rank}` : `AI rank ${rank}`}` : img.filename}
             >
               <div
                 style={{ height: `${thumbH}px` }}
@@ -1407,6 +1581,18 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
                     <svg width="8" height="8" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
                       <path d="M8 1.5 L9.9 5.85 L14.5 6.4 L11.05 9.55 L11.95 14.1 L8 11.85 L4.05 14.1 L4.95 9.55 L1.5 6.4 L6.1 5.85 Z" />
                     </svg>
+                  </span>
+                )}
+                {showRankBadge && (
+                  // isDuplicateRank: a near-duplicate frame collapsed onto a
+                  // ranked rep before the vision call — it inherited that rep's
+                  // number, so it renders as a tie ("≈3") to read as "same as"
+                  // rather than a broken ordinal, matching SurveyTile.
+                  <span
+                    className="absolute top-1 left-1 min-w-[16px] h-4 px-1 rounded-full bg-[rgba(0,0,0,0.65)] text-[#9c9c9d] text-[9px] font-semibold shadow flex items-center justify-center tabular-nums"
+                    aria-label={isDuplicateRank ? `Near-duplicate of AI rank ${rank}` : `AI rank ${rank}`}
+                  >
+                    {isDuplicateRank ? `≈${rank}` : rank}
                   </span>
                 )}
                 {notLlmEvaluated && (
@@ -1431,17 +1617,6 @@ function LoupePane({ images, heroId, focusedImage, evaluatedSet, wasFiltered, on
               <div className="px-1.5 py-1 flex items-center gap-1">
                 <ScoreBadge score={pickHeadlineScore(img, modelInfo)} />
                 {img.decision && <DecisionBadge decision={img.decision} />}
-                {(() => {
-                  const fmt = fileFormat(img.filename)
-                  return fmt && (
-                    <span
-                      className={`px-1 py-0.5 rounded text-[8px] font-mono font-semibold uppercase leading-none ml-auto ${formatBadgeTone(fmt)}`}
-                      title="File format"
-                    >
-                      {fmt}
-                    </span>
-                  )
-                })()}
               </div>
             </button>
           )
@@ -1473,8 +1648,8 @@ function RailGroupTile({ group, isOpen, isPickTarget, isDropHover, onClick, onDr
   }, [isOpen])
   if (!hero) return null
   let ring
-  if (isDropHover)    ring = 'ring-[3px] ring-[#5BB8D4]'
-  else if (isOpen)    ring = 'ring-1 ring-[#5BB8D4]'
+  if (isDropHover)    ring = SELECTION_RING_STRONG
+  else if (isOpen)    ring = SELECTION_RING
   else if (isPickTarget) ring = 'ring-1 ring-[rgba(91,184,212,0.55)] hover:ring-[#5BB8D4]'
   else                ring = 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.18)]'
   return (
@@ -1505,7 +1680,8 @@ function RailGroupTile({ group, isOpen, isPickTarget, isDropHover, onClick, onDr
 
 
 //   ranked (top-N filtered)     → amber chip "AI ranked top N of M" with InfoTooltip
-//                                  + click-to-inspect popover listing evaluated filenames
+//                                  + click-to-toggle a filter narrowing Survey/
+//                                  Filmstrip down to just the evaluated photos
 //   no_vision_model             → one-line nudge with `ollama pull qwen2.5vl:7b` hint
 //   too_few                     → silent (group is out of bounds; nothing went wrong)
 //   near_duplicates             → neutral "Near-duplicate frames" chip explaining
@@ -1514,25 +1690,12 @@ function RailGroupTile({ group, isOpen, isPickTarget, isDropHover, onClick, onDr
 //                                  in tone (this is a deliberate outcome, not a
 //                                  failure) and from "too_few" (which is silent).
 //   error                       → small coral hint, no retry button (user can reopen)
-function BurstRankStatus({ status, result, images }) {
+function BurstRankStatus({ status, result, showOnlyEvaluated, onToggleShowOnlyEvaluated }) {
 
-  const [inspectOpen, setInspectOpen] = useState(false)
   // Cache the latest /lm-status so we can show the right CTA in the
   // no_vision_model branch (Ollama-missing → install link, Ollama-running
   // → pull qwen). Only fetched when actually needed.
   const [lmStatus, setLmStatus] = useState(null)
-
-  // Close inspect popover on outside click (same data-dropdown pattern used
-  // by the View dropdown earlier — fixed-positioned backdrops fail when an
-  // ancestor creates a stacking context; see memory `feedback_dropdown_outside_click`).
-  useEffect(() => {
-    if (!inspectOpen) return
-    const handler = (e) => {
-      if (!e.target.closest('[data-dropdown="true"]')) setInspectOpen(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [inspectOpen])
 
   // Lazy /lm-status fetch when we hit a no_vision_model state, so we can
   // distinguish "Ollama isn't installed" from "Ollama is installed but no
@@ -1546,6 +1709,13 @@ function BurstRankStatus({ status, result, images }) {
       .catch(() => { /* harmless — chip falls back to generic pull CTA */ })
     return () => { cancelled = true }
   }, [status, lmStatus])
+
+  const recheckLmStatus = useCallback(() => {
+    fetch(`${API}/lm-status`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (data) setLmStatus(data) })
+      .catch(() => { /* harmless — user can just retry again */ })
+  }, [])
 
   if (status === 'loading') {
     // Rainbow-bordered pill while qwen is processing. The conic-gradient
@@ -1577,6 +1747,29 @@ function BurstRankStatus({ status, result, images }) {
     // proper explanatory label.
     if (lmStatus?.status === 'not_installed') {
       return <InstallOllamaCTA compact />
+    }
+    if (lmStatus?.status === 'not_running') {
+      // Ollama is installed and the model is already pulled — the daemon
+      // just isn't listening (e.g. killed since last session, or the app
+      // launched without going through ensure_daemon_running()). Pulling
+      // again would be a no-op wait; the real fix is starting the daemon.
+      return (
+        <span
+          className="inline-flex items-center gap-2 px-2 py-1 rounded-md bg-[rgba(232,184,74,0.10)] border border-[rgba(232,184,74,0.30)] select-none"
+          title="Ollama is installed but not running. Restart KaMeRa, or run `ollama serve` in Terminal, then retry."
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-[#E8B84A] shrink-0" />
+          <span className="text-xs text-[#E8B84A] whitespace-nowrap">
+            Ollama isn't running
+          </span>
+          <button
+            onClick={recheckLmStatus}
+            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-[rgba(91,184,212,0.12)] text-[#5BB8D4] border border-[rgba(91,184,212,0.30)] hover:opacity-70 transition-opacity"
+          >
+            Retry
+          </button>
+        </span>
+      )
     }
     return (
       <span
@@ -1613,56 +1806,35 @@ function BurstRankStatus({ status, result, images }) {
     )
   }
 
-  // Ranked + pre-filtered → show the "top N of M" chip with a click-to-inspect
-  // popover and an InfoTooltip explaining how the filter works. For ranked
-  // bursts that fit in one call (≤ _MAX_MEMBERS), filtered_from === evaluated
-  // length, so we stay silent — the amber ring on the hero tells the story.
+  // Ranked + pre-filtered → show the "top N of M" chip as a toggle. Clicking
+  // it narrows Survey/Filmstrip down to just the N photos the AI evaluated
+  // (a Filter icon signals this is a view filter, not just a status readout);
+  // clicking again restores all M. For ranked bursts that fit in one call
+  // (≤ _MAX_MEMBERS), filtered_from === evaluated length, so we stay silent —
+  // the amber ring on the hero tells the story.
   if (status === 'ranked' && result) {
     const evalIds = Array.isArray(result.evaluated_ids) ? result.evaluated_ids : []
     const total   = result.filtered_from || evalIds.length
     if (evalIds.length > 0 && total > evalIds.length) {
-      const byId = images ? Object.fromEntries(images.map(im => [im.id, im])) : {}
-      const evaluatedItems = evalIds
-        .map(id => byId[id])
-        .filter(Boolean)
       return (
-        <span
-          data-dropdown="true"
-          className="relative inline-flex items-center gap-1 text-xs text-[#E8B84A] select-none"
-        >
+        <span className="relative inline-flex items-center gap-1 text-xs text-[#E8B84A] select-none">
           <button
             type="button"
-            onClick={(e) => { e.stopPropagation(); setInspectOpen(v => !v) }}
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-[rgba(232,184,74,0.30)] bg-[rgba(232,184,74,0.10)] hover:opacity-80 transition-opacity"
-            title="Click to see which photos the AI evaluated"
+            onClick={onToggleShowOnlyEvaluated}
+            aria-pressed={showOnlyEvaluated}
+            className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border transition-opacity whitespace-nowrap ${
+              showOnlyEvaluated
+                ? 'bg-[#E8B84A] text-[#07080a] border-[#E8B84A] hover:opacity-90'
+                : 'bg-[rgba(232,184,74,0.10)] border-[rgba(232,184,74,0.30)] hover:opacity-80'
+            }`}
+            title={showOnlyEvaluated ? 'Showing only AI-evaluated photos — click to show all' : 'Click to show only the photos the AI evaluated'}
           >
+            <Filter size={12} />
             AI ranked top {evalIds.length} of {total}
           </button>
           <InfoTooltip>
-            The vision model evaluates a maximum of {evalIds.length} photos at once. For larger bursts the app pre-selects the most promising candidates by face sharpness, eyes-open, frame sharpness, IQA, aesthetic, and overall score — then the model ranks those. The other {total - evalIds.length} photos keep their score-based standing.
+            The vision model evaluates a maximum of {evalIds.length} photos at once. For larger bursts the app pre-selects the most promising candidates by face sharpness, eyes-open, frame sharpness, IQA, aesthetic, and overall score — then the model ranks those. The other {total - evalIds.length} photos keep their score-based standing. Click the chip to filter the view down to just the evaluated photos.
           </InfoTooltip>
-
-          {inspectOpen && (
-            <div
-              data-dropdown="true"
-              className="absolute top-full left-0 mt-1.5 z-50 min-w-[240px] max-w-[360px] rounded-lg bg-[#101111] border border-[rgba(255,255,255,0.10)] shadow-xl overflow-hidden"
-            >
-              <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#9c9c9d] border-b border-[rgba(255,255,255,0.06)]">
-                Photos the AI evaluated ({evaluatedItems.length})
-              </div>
-              <div className="max-h-[260px] overflow-y-auto py-1">
-                {evaluatedItems.map(im => (
-                  <div
-                    key={im.id}
-                    className="px-3 py-1 text-xs text-[#cecece] font-mono truncate"
-                    title={im.filename}
-                  >
-                    {im.filename}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
         </span>
       )
     }

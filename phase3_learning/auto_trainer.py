@@ -63,9 +63,26 @@ def status_snapshot() -> dict:
     }
 
 
+# The only corpus this trainer consumes. Photos-album decisions are stored
+# with corpus='photos' and are deliberately excluded: iPhone HEIC and camera
+# RAW score on different sharpness/aperture/iso distributions, so one GBR over
+# both would learn contradictory labels. A second model over the 'photos'
+# corpus is deferred until that corpus is large enough to be worth training
+# (MIN_DECISIONS=30) — see docs/PLAN-photos-source.md.
+_CORPUS = "folder"
+
+
 def _count_samples() -> int:
+    """Size of the corpus this model trains on — folder decisions only.
+
+    Must use the same WHERE clause as _load_corpus(): if it counted every
+    corpus, a run of Photos decisions would move the freshness gate and
+    trigger retrains on a folder corpus that had not changed at all.
+    """
     with get_db() as conn:
-        return conn.execute("SELECT COUNT(*) FROM training_samples").fetchone()[0]
+        return conn.execute(
+            f"SELECT COUNT(*) FROM training_samples WHERE corpus = '{_CORPUS}'"
+        ).fetchone()[0]
 
 
 def _pairwise_synthetic_samples() -> tuple[np.ndarray, list[str], list[float | None], list[str | None]]:
@@ -160,7 +177,8 @@ def _load_corpus() -> tuple[np.ndarray, list[str], list[float | None], list[str 
     """
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT decision, features_json, overall_score, decided_at FROM training_samples"
+            "SELECT decision, features_json, overall_score, decided_at "
+            f"FROM training_samples WHERE corpus = '{_CORPUS}'"
         ).fetchall()
     if len(rows) < MIN_DECISIONS:
         return None
@@ -197,7 +215,18 @@ def _train_worker(model: "PersonalModel") -> None:
             logger.info("Auto-train skipped — corpus below MIN_DECISIONS")
             return
         X, decisions, overall_scores, decided_at, base_weights = corpus
-        logger.info("Auto-train starting on %d samples", X.shape[0])
+        prior_size = model.training_size if model.ready else 0
+        logger.info(
+            "Auto-train starting on %d samples (prior fit: %d)",
+            X.shape[0], prior_size,
+        )
+        if X.shape[0] < prior_size:
+            logger.warning(
+                "Auto-train corpus (%d) is SMALLER than the prior fit (%d) — "
+                "the training_samples table appears to have shrunk. save() will "
+                "refuse the overwrite; investigate the corpus before forcing.",
+                X.shape[0], prior_size,
+            )
         model.train_from_samples(X, decisions, overall_scores, decided_at=decided_at,
                                  base_weights=base_weights)
         model.save()

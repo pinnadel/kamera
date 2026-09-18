@@ -40,6 +40,7 @@ import json
 import logging
 
 from phase2_quality.model_status import begin as _begin, end as _end
+from phase2_quality.model_loading import MODEL_LOAD_LOCK
 from phase2_quality.device import get_device as _get_device
 
 logger = logging.getLogger(__name__)
@@ -70,28 +71,37 @@ def _is_facenet_cached() -> bool:
 
 
 def _get_model():
-    """Load InceptionResnetV1 on first call; cache for the rest of the process."""
-    global _model, _load_failed
-    if _load_failed:
-        return None
-    if _model is None:
-        try:
-            from facenet_pytorch import InceptionResnetV1
+    """Load InceptionResnetV1 on first call; cache for the rest of the process.
 
-            downloading = not _is_facenet_cached()
-            _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
-            try:
-                logger.info("Loading FaceNet (first use — may download ~107 MB)…")
-                model = InceptionResnetV1(pretrained="vggface2").eval()
-                model = model.to(_get_device())
-                _model = model
-                logger.info("FaceNet ready on %s.", _get_device())
-            finally:
-                _end(_MODEL_ID)
-        except Exception:
-            logger.exception("FaceNet model load failed — disabling for this session")
-            _load_failed = True
+    Holds the shared MODEL_LOAD_LOCK across construction and `.to(device)`.
+    This loader previously had no lock at all, so it could construct its net
+    while SigLIP or pyiqa was mid-load and pick up accelerate's meta-device
+    patch — see phase2_quality/model_loading.py.
+    """
+    global _model, _load_failed
+    if _model is not None:   # fast path — no lock once loaded
+        return _model
+    with MODEL_LOAD_LOCK:
+        if _load_failed:
             return None
+        if _model is None:
+            try:
+                from facenet_pytorch import InceptionResnetV1
+
+                downloading = not _is_facenet_cached()
+                _begin(_MODEL_ID, _MODEL_NAME, _MODEL_SIZE_MB, downloading)
+                try:
+                    logger.info("Loading FaceNet (first use — may download ~107 MB)…")
+                    model = InceptionResnetV1(pretrained="vggface2").eval()
+                    model = model.to(_get_device())
+                    _model = model
+                    logger.info("FaceNet ready on %s.", _get_device())
+                finally:
+                    _end(_MODEL_ID)
+            except Exception:
+                logger.exception("FaceNet model load failed — disabling for this session")
+                _load_failed = True
+                return None
 
     return _model
 

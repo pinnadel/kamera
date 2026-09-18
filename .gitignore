@@ -19,6 +19,10 @@ Photo culling playground pics/
 # Claude assistant project notes — may contain PII / personal workflow detail
 CLAUDE.md
 **/CLAUDE.md
+# Symlink to CLAUDE.md (the AGENTS.md convention other tools look for). Ignored
+# for the same reason, and because a committed symlink would dangle on a fresh
+# clone where its target is absent.
+AGENTS.md
 
 # Personal / portfolio docs — not for public consumption
 docs/PROJECT_WIKI.md
@@ -41,3 +45,7 @@ scripts/auto-cull-experiment/
 !kamera_app_icons_complete/**
 !frontend/public/**
 !docs/images/**
+
+# ...but never the macOS folder-metadata cruft, even inside whitelisted dirs.
+.DS_Store
+**/.DS_Store

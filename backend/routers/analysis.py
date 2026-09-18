@@ -49,10 +49,19 @@ router = APIRouter()
 # /folders/unfinished endpoint, burst_ranker's RAW fallback) should import
 # directly from backend.constants to avoid pulling in this module's heavy
 # transitive deps (rawpy, pyiqa, torch).
-from backend.constants import SUPPORTED_EXTENSIONS, RAW_FORMATS, DECISION_SUBFOLDERS
-# .hif is intentionally excluded from SUPPORTED_EXTENSIONS — Fuji writes it
-# next to every .RAF in RAW+HIF mode. We treat HIF as a sidecar of the RAF
-# (move-only, never analyzed on its own).
+from backend.constants import (
+    SUPPORTED_EXTENSIONS,
+    RAW_FORMATS,
+    DECISION_SUBFOLDERS,
+    is_standalone_hif,
+    is_raw_format,
+    has_processed_sibling,
+)
+from backend.routers.settings import get_analysis_mode
+# .hif is in SUPPORTED_EXTENSIONS but only analyzed standalone (X100VI/X Half
+# HIF-only shooting). When a same-stem .RAF exists, the .hif is a RAW+HIF
+# sidecar preview — move-only, never analyzed on its own. See
+# is_standalone_hif() and backend/file_mover.py.
 
 # Sidecar preview extensions — companions written next to a RAW that hold the
 # camera's baked rendition of the same shot. Order matters: HIF is checked
@@ -239,10 +248,13 @@ def _load_preview_pil(image_id: int) -> PilImage.Image:
     """
     Resolve image_id → an RGB PIL image of the displayed preview.
 
-    Reaches for the on-disk cached preview first (instant), falls back to
-    generating one for RAW formats, or thumbnailing the source for JPEG/PNG.
-    Used by both the histogram endpoint and the clipping-mask endpoint so the
-    pixels they analyze are exactly the pixels DetailView shows.
+    Reaches for the on-disk cached preview first (instant); on a miss,
+    generates one via _generate_preview (RAW demosaic or plain decode
+    depending on format) AND persists it to data/previews/, same as
+    GET /previews/{id} — every format is cached unconditionally now (see
+    that endpoint's docstring for why HIF needed this too). Used by both
+    the histogram endpoint and the clipping-mask endpoint so the pixels
+    they analyze are exactly the pixels DetailView shows.
 
     Raises HTTPException(404) if the image_id is unknown or the source file
     is missing from disk.
@@ -265,15 +277,18 @@ def _load_preview_pil(image_id: int) -> PilImage.Image:
         return PilImage.open(str(cached_path)).convert("RGB")
 
     fmt = (row["format"] or "").upper()
-    if fmt in RAW_FORMATS:
-        jpeg_bytes = _generate_preview(file_path, fmt)
-        return PilImage.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+    jpeg_bytes = _generate_preview(file_path, fmt)
 
-    from PIL import ImageOps
-    img = PilImage.open(str(file_path))
-    img = ImageOps.exif_transpose(img)
-    img.thumbnail(PREVIEW_SIZE, PilImage.LANCZOS)
-    return img.convert("RGB")
+    PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = PREVIEW_CACHE_DIR / f"{image_id}.jpg"
+    cache_file.write_bytes(jpeg_bytes)
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE images SET preview_path = ? WHERE id = ?",
+            (str(cache_file), image_id),
+        )
+
+    return PilImage.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
 
 def _warm_models() -> None:
@@ -291,6 +306,15 @@ def _warm_models() -> None:
     evidence: previous parallel implementation made aesthetic_scorer fail
     every session and TOPIQ retry-fail 200+ times per batch (logged 2026-05-05).
     Sequential load adds ~5s startup overhead but loads ALL three reliably.
+
+    Since 2026-08-28 the actual correctness guarantee is the process-wide
+    MODEL_LOAD_LOCK held by each loader (phase2_quality/model_loading.py) —
+    warming sequentially here could never be one, because it only orders the
+    loads *this* thread performs. If a user clicked Analyze before warm-up
+    finished, the six-worker scorer pool called the same loaders from other
+    threads and raced anyway, silently blanking IQA + Aesthetic for the whole
+    batch. This function stays sequential regardless: it avoids pointless lock
+    contention and keeps the startup toasts in a predictable order.
     """
     from phase2_quality.aesthetic_scorer import _get_metric as _get_aes
     from phase2_quality.iqa_scorer import _get_metric
@@ -357,7 +381,7 @@ def _backfill_histograms() -> None:
 # pass the uuid to write_shooting_log without an extra SELECT.
 _INSERT_SQL = """
     INSERT INTO images (
-        file_path, filename, format, source_folder, uuid,
+        file_path, filename, format, source_folder, source_type, photos_uuid, uuid,
         camera, shot_at, focal_length_mm, aperture, shutter_speed, iso,
         sharpness_score, exposure_score, overall_score,
         highlight_clip_pct, shadow_clip_pct,
@@ -371,7 +395,7 @@ _INSERT_SQL = """
         subject_prominence_score, background_distraction_score,
         eye_contact_score, decisive_moment_score,
         analysis_status, imported_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', DATETIME('now'))
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', DATETIME('now'))
     ON CONFLICT(file_path) DO UPDATE SET
         uuid                 = COALESCE(images.uuid, excluded.uuid),
         camera               = excluded.camera,
@@ -412,8 +436,67 @@ _INSERT_SQL = """
 """
 
 
-def _build_insert_params(path: Path, result: dict, exif: dict) -> tuple:
-    """Pack analysis + EXIF into the positional tuple for _INSERT_SQL."""
+# Lightweight insert for a RAW file skipped under analysis_mode=jpeg_priority
+# (see backend/routers/settings.py::analysis_mode). "jpeg_priority" is the
+# setting's stored value, but the skip fires for ANY processed sibling —
+# .jpg/.jpeg/.hif/.png/.tif/.tiff, see has_processed_sibling. No scorers run
+# — every score column stays NULL and analysis_status is 'skipped', not
+# 'done', so the row is excluded from every "done"-gated query (auto-cull,
+# pairwise, undecided counters, /folders/unfinished) and from the grid (see
+# _filter_raw_jpeg_pairs in routers/images.py). It still gets a uuid and
+# file_path so _find_companion_image_id can mirror K/M/R decisions onto it
+# and move it alongside its sibling. EXIF is cheap and kept for camera/shot_at
+# metadata (burst grouping, shooting log) even though nothing is scored.
+_INSERT_SKIPPED_SQL = """
+    INSERT INTO images (
+        file_path, filename, format, source_folder, uuid,
+        camera, shot_at, focal_length_mm, aperture, shutter_speed, iso,
+        analysis_status, imported_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', DATETIME('now'))
+    ON CONFLICT(file_path) DO UPDATE SET
+        uuid            = COALESCE(images.uuid, excluded.uuid),
+        camera          = excluded.camera,
+        shot_at         = excluded.shot_at,
+        focal_length_mm = excluded.focal_length_mm,
+        aperture        = excluded.aperture,
+        shutter_speed   = excluded.shutter_speed,
+        iso             = excluded.iso,
+        analysis_status = CASE images.analysis_status WHEN 'done' THEN 'done' ELSE 'skipped' END
+    RETURNING id, uuid
+"""
+
+
+def _build_skipped_insert_params(path: Path, exif: dict) -> tuple:
+    """Pack EXIF into the positional tuple for _INSERT_SKIPPED_SQL."""
+    return (
+        str(path), path.name,
+        path.suffix.lstrip(".").upper(),
+        str(path.parent),
+        str(_uuid.uuid4()),
+        exif["camera"], exif["shot_at"],
+        exif["focal_length_mm"], exif["aperture"],
+        exif["shutter_speed"], exif["iso"],
+    )
+
+
+def _build_insert_params(
+    path: Path,
+    result: dict,
+    exif: dict,
+    *,
+    source_folder: str | None = None,
+    filename: str | None = None,
+    source_type: str = "folder",
+    photos_uuid: str | None = None,
+) -> tuple:
+    """Pack analysis + EXIF into the positional tuple for _INSERT_SQL.
+
+    The keyword overrides exist for non-filesystem sources. An Apple Photos
+    asset lives at `originals/<hex>/<UUID>.heic`, so its real parent directory
+    is useless as a tab key and its real filename is a UUID — the album URI and
+    the asset's `original_filename` are passed in instead. The defaults
+    reproduce today's folder behaviour exactly, so that path is unaffected.
+    """
     sharpness  = result["sharpness"]
     exposure   = result["exposure"]
     face       = result["face"]
@@ -422,9 +505,14 @@ def _build_insert_params(path: Path, result: dict, exif: dict) -> tuple:
     similarity = result["similarity"]
     histogram  = result.get("histogram")
     return (
-        str(path), path.name,
+        str(path), filename or path.name,
         path.suffix.lstrip(".").upper(),
-        str(path.parent),
+        source_folder if source_folder is not None else str(path.parent),
+        source_type,
+        photos_uuid,
+        # KaMeRa's own durable id, never the Photos asset UUID: this column is
+        # UNIQUE and joins training_samples / auto_decision_log, and one asset
+        # can legitimately appear in two album tabs.
         str(_uuid.uuid4()),
         exif["camera"], exif["shot_at"],
         exif["focal_length_mm"], exif["aperture"],
@@ -563,12 +651,52 @@ def analyze(request: AnalyzeRequest):
     )
 
 
+def _is_analyzable(f: Path) -> bool:
+    if f.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        return False
+    if f.suffix.lower() == ".hif" and not is_standalone_hif(f):
+        return False  # RAW+HIF sidecar — moves with its RAF, never analyzed alone
+    return True
+
+
+def _scan_candidates(folder: Path, include_subfolders: bool) -> list[Path]:
+    """Walk `folder` for analyzable files. Shared by the initial scan and the
+    mid-batch rescans that pick up files a live import (e.g. Provenance) drops
+    in while a batch is already running."""
+    if include_subfolders:
+        # Recursive walk. Skip the conventional decision subfolders so a
+        # re-analysis doesn't suck in already-decided photos as fresh inputs.
+        skip_dirs = DECISION_SUBFOLDERS
+        return sorted(
+            f for f in folder.rglob("*")
+            if f.is_file()
+            and _is_analyzable(f)
+            and not any(part in skip_dirs for part in f.relative_to(folder).parts)
+        )
+    return sorted(
+        f for f in folder.iterdir()
+        if f.is_file() and _is_analyzable(f)
+    )
+
+
+# How often _run_batch rescans the source folder for new arrivals. A live
+# Provenance import can drop hundreds of files after the batch's initial
+# snapshot; without a rescan they'd sit undiscovered until the batch ends
+# and the (paused-for-the-duration) watcher resumes. Time-based rather than
+# every N files so it stays cheap on fast (JPG-heavy) batches too.
+RESCAN_INTERVAL_SECONDS = 10.0
+
+
 def _run_batch(
-    folder: Path,
+    folder: Path | None,
     to_analyze: list[Path],
     skipped: list[str],
     total_candidates: int,
     paused_watch_path: Any,
+    include_subfolders: bool = False,
+    source_folder_override: str | None = None,
+    filename_overrides: dict[str, str] | None = None,
+    photos_uuid_overrides: dict[str, str] | None = None,
 ) -> None:
     """
     Run the batch analysis loop in a daemon thread.
@@ -580,21 +708,113 @@ def _run_batch(
     _progress is pre-initialised by analyze_folder before this thread starts.
     On completion (normal, stop, or error) _progress["running"] is set to False
     and the final counts are written so the last poll sees the totals.
+
+    to_analyze is a live list (not copied) — mid-batch rescans append to it
+    in place and bump _progress["total"] so a batch started against a partial
+    import (Provenance still copying files off a card) keeps absorbing new
+    arrivals instead of finishing early and leaving them undiscovered until
+    the watcher resumes.
     """
     analyzed, errors = 0, []
+    queued = {str(f) for f in to_analyze} | {str(folder / name) for name in skipped}
+    last_rescan = time.monotonic()
 
     # Read settings ONCE before the loop. Settings can't change mid-batch,
     # so the previous "fresh DB connection per photo per setting" pattern
     # was pure overhead (~10ms × 741 = ~7s on a typical batch).
     from phase1_technical.quality_analyzer import get_sharpness_weight as _get_sharpness_weight
+    from phase1_technical.quality_analyzer import decode_raw as _decode_raw, RAW_DECODE_SUFFIXES
+    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
     sharpness_weight = _get_sharpness_weight()
+    jpeg_priority = get_analysis_mode() == "jpeg_priority"
+
+    def _needs_full_raw_decode(p: Path) -> bool:
+        # Mirrors the skip_scoring gate below: only a RAW file that will
+        # actually reach analyze_photo_quality's expensive decode qualifies
+        # for prefetch. Paired RAWs under jpeg_priority take the lightweight
+        # EXIF-only path and never decode at all.
+        if p.suffix.lower() not in RAW_DECODE_SUFFIXES:
+            return False
+        if jpeg_priority and is_raw_format(p.suffix.lstrip(".").upper()) and has_processed_sibling(p):
+            return False
+        return True
+
+    # One-ahead RAW decode prefetch: while photo N's scorers are running,
+    # decode photo N+1's RAW data on this single background worker so the
+    # ~17s rawpy.postprocess() cost (GIL-releasing, CPU-bound) overlaps with
+    # scoring instead of stalling the loop. Bounded to exactly one photo
+    # ahead — each decoded RAF is tens of MB, and decode already outlasts
+    # scoring per photo, so a deeper queue would only add memory pressure
+    # without shortening the batch further. Scoped to orphan RAWs only
+    # (jpeg_priority already skips paired ones before they'd ever decode).
+    _prefetch_pool = _ThreadPoolExecutor(max_workers=1)
+    _prefetch: dict[str, Any] = {"path": None, "future": None}
+
+    def _submit_prefetch(p: Path) -> None:
+        if _needs_full_raw_decode(p):
+            _prefetch["path"] = str(p)
+            _prefetch["future"] = _prefetch_pool.submit(_decode_raw, str(p))
+        else:
+            _prefetch["path"] = None
+            _prefetch["future"] = None
+
+    def _take_predecoded(path_str: str):
+        if _prefetch["path"] == path_str and _prefetch["future"] is not None:
+            fut = _prefetch["future"]
+            _prefetch["path"] = None
+            _prefetch["future"] = None
+            return fut.result()
+        return None
+
+    if to_analyze:
+        _submit_prefetch(to_analyze[0])
 
     try:
         with get_db() as conn:
-            for file_path in to_analyze:
+            i = 0
+            while i < len(to_analyze):
+                file_path = to_analyze[i]
+                i += 1
                 # Top-of-loop stop check — catches a Stop pressed between files.
                 if _progress.get("stop_requested") or _stop_event.is_set():
                     break
+
+                # Claim this photo's predecoded RAW data (if any) BEFORE
+                # submitting the next photo's prefetch — _submit_prefetch
+                # overwrites the single prefetch slot, so reading it first
+                # avoids losing the current photo's already-finished decode.
+                predecoded = _take_predecoded(str(file_path))
+
+                # Kick off next photo's RAW decode now, before this photo's
+                # scoring starts, so the two overlap on separate threads.
+                if i < len(to_analyze):
+                    _submit_prefetch(to_analyze[i])
+
+                # Periodically rescan the folder for files that arrived after
+                # the batch started (or after the last rescan) — e.g. a card
+                # import still in progress. New files are appended to the live
+                # to_analyze list and total ticks up so the progress bar keeps
+                # reflecting reality instead of freezing at the original count.
+                # `folder is None` for a Photos album: membership is fixed
+                # when the batch starts and there is no directory to re-walk.
+                now = time.monotonic()
+                if folder is not None and now - last_rescan >= RESCAN_INTERVAL_SECONDS:
+                    last_rescan = now
+                    try:
+                        found = _scan_candidates(folder, include_subfolders)
+                        new_files = [f for f in found if str(f) not in queued]
+                    except Exception:
+                        logger.exception("Batch rescan failed for %s", folder)
+                        new_files = []
+                    if new_files:
+                        queued.update(str(f) for f in new_files)
+                        to_analyze.extend(new_files)
+                        _progress["total"] = len(to_analyze)
+                        logger.info(
+                            "analyze — rescan picked up %d new file(s) in %s (total now %d)",
+                            len(new_files), folder, len(to_analyze),
+                        )
+
                 path_str = str(file_path)
                 _progress["current_file"] = file_path.name
                 _photo_t0 = time.monotonic()
@@ -608,27 +828,61 @@ def _run_batch(
                     if _progress.get("stop_requested") or _stop_event.is_set():
                         break
 
-                    _progress["_current_step"] = "analysis"
-                    result = analyze_photo_quality(
-                        path_str,
-                        stop_event=_stop_event,
-                        sharpness_weight=sharpness_weight,
+                    # jpeg_priority: a RAW with a same-stem processed sibling
+                    # (.jpg/.jpeg/.hif/.png/.tif/.tiff) gets a lightweight row
+                    # (EXIF only, no scorers) instead of full analysis — the
+                    # sibling is what gets scored and culled; this row exists
+                    # only so K/M/R on the sibling can mirror onto it and move
+                    # it. Orphan RAWs (no sibling) always get full analysis
+                    # regardless of the setting.
+                    skip_scoring = (
+                        jpeg_priority
+                        and is_raw_format(file_path.suffix.lstrip(".").upper())
+                        and has_processed_sibling(file_path)
                     )
-                    _progress["_current_step"] = "exif"
-                    exif   = extract_exif(path_str)
-                    _progress["_current_step"] = "database"
 
-                    # RETURNING id, uuid avoids a separate SELECT round-trip after
-                    # the upsert. Saves ~0.5–1ms × 741 photos = ~0.5–1s/batch.
-                    inserted = conn.execute(
-                        _INSERT_SQL, _build_insert_params(file_path, result, exif)
-                    ).fetchone()
-                    if inserted is not None:
-                        _personal_model.invalidate(inserted["id"])
-                        write_shooting_log(
-                            conn,
-                            **_shooting_log_kwargs(file_path, result, exif, inserted["uuid"]),
+                    if skip_scoring:
+                        _progress["_current_step"] = "exif"
+                        exif = extract_exif(path_str)
+                        _progress["_current_step"] = "database"
+                        conn.execute(
+                            _INSERT_SKIPPED_SQL, _build_skipped_insert_params(file_path, exif)
                         )
+                    else:
+                        _progress["_current_step"] = "analysis"
+                        result = analyze_photo_quality(
+                            path_str,
+                            stop_event=_stop_event,
+                            sharpness_weight=sharpness_weight,
+                            predecoded=predecoded,
+                        )
+                        _progress["_current_step"] = "exif"
+                        exif   = extract_exif(path_str)
+                        _progress["_current_step"] = "database"
+
+                        # RETURNING id, uuid avoids a separate SELECT round-trip after
+                        # the upsert. Saves ~0.5–1ms × 741 photos = ~0.5–1s/batch.
+                        inserted = conn.execute(
+                            _INSERT_SQL,
+                            _build_insert_params(
+                                file_path, result, exif,
+                                source_folder=source_folder_override,
+                                filename=(filename_overrides or {}).get(str(file_path)),
+                                source_type="photos" if source_folder_override else "folder",
+                                photos_uuid=(photos_uuid_overrides or {}).get(str(file_path)),
+                            ),
+                        ).fetchone()
+                        if inserted is not None:
+                            _personal_model.invalidate(inserted["id"])
+                            # The shooting log answers "what are my camera
+                            # habits" — focal lengths, apertures, bodies. iPhone
+                            # shots out of a Photos album would skew every
+                            # Dashboard statistic it feeds, so they stay out.
+                            if source_folder_override is None:
+                                write_shooting_log(
+                                    conn,
+                                    **_shooting_log_kwargs(file_path, result, exif, inserted["uuid"]),
+                                )
 
                     # Commit per-photo so the frontend's /images poll can see
                     # rows as they finish. Without this, SQLite holds the whole
@@ -678,6 +932,10 @@ def _run_batch(
                 _progress["done"] += 1
 
     finally:
+        # Drop any in-flight prefetch immediately on Stop/error rather than
+        # blocking batch teardown on a decode whose result nothing will use.
+        _prefetch_pool.shutdown(wait=False, cancel_futures=True)
+
         # Write final counts so the last /analyze-progress poll can report totals.
         # elapsed is computed from the monotonic started_at stamp so it is
         # immune to wall-clock drift / NTP corrections during long batches.
@@ -725,9 +983,12 @@ def has_subfolders(folder_path: str):
             continue
         # Cheap check: does this subdir (or any descendant) contain a photo?
         for path in sub.rglob("*"):
-            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                count += 1
-                break
+            if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            if path.suffix.lower() == ".hif" and not is_standalone_hif(path):
+                continue  # RAW+HIF sidecar, not an independently analyzable photo
+            count += 1
+            break
     return {"has_subfolders": count > 0, "count": count}
 
 
@@ -752,21 +1013,7 @@ def analyze_folder(request: AnalyzeFolderRequest):
     if _progress.get("running"):
         raise HTTPException(status_code=409, detail="Analysis already running")
 
-    if request.include_subfolders:
-        # Recursive walk. Skip the conventional decision subfolders so a
-        # re-analysis doesn't suck in already-decided photos as fresh inputs.
-        skip_dirs = DECISION_SUBFOLDERS
-        candidates = sorted(
-            f for f in folder.rglob("*")
-            if f.is_file()
-            and f.suffix.lower() in SUPPORTED_EXTENSIONS
-            and not any(part in skip_dirs for part in f.relative_to(folder).parts)
-        )
-    else:
-        candidates = sorted(
-            f for f in folder.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-        )
+    candidates = _scan_candidates(folder, request.include_subfolders)
     if not candidates:
         # Nothing to analyze — return immediately without touching _progress.
         _progress.update({
@@ -781,9 +1028,24 @@ def analyze_folder(request: AnalyzeFolderRequest):
                 "SELECT file_path FROM images WHERE analysis_status = 'done'"
             ).fetchall()
         }
+        skipped_raw_paths = {
+            row[0] for row in conn.execute(
+                "SELECT file_path FROM images WHERE analysis_status = 'skipped'"
+            ).fetchall()
+        }
 
-    to_analyze = [f for f in candidates if str(f) not in done_paths]
-    skipped = [f.name for f in candidates if str(f) in done_paths]
+    # A 'skipped' RAW is only left out of the re-queue while it still has a
+    # processed sibling — if that sibling was since deleted (orphaned RAW),
+    # fall through to a full re-analysis instead of leaving it unscored
+    # forever. Cheap: has_processed_sibling only runs for the small set of
+    # rows already marked 'skipped', not every candidate.
+    still_skippable = {
+        p for p in skipped_raw_paths if has_processed_sibling(Path(p))
+    }
+    resolved_paths = done_paths | still_skippable
+
+    to_analyze = [f for f in candidates if str(f) not in resolved_paths]
+    skipped = [f.name for f in candidates if str(f) in resolved_paths]
 
     # Initialise progress before starting the thread so the very first poll
     # already sees the correct total.  Reset the stop flag so a previous stop
@@ -811,7 +1073,8 @@ def analyze_folder(request: AnalyzeFolderRequest):
 
     t = threading.Thread(
         target=_run_batch,
-        args=(folder, to_analyze, skipped, len(candidates), paused_watch_path),
+        args=(folder, to_analyze, skipped, len(candidates), paused_watch_path,
+              request.include_subfolders),
         daemon=True,
         name="batch-analysis",
     )
@@ -887,9 +1150,20 @@ def get_preview(image_id: int):
     """
     Serve a high-quality preview for the UI.
 
-    RAW files are demosaiced at half-resolution on first request and cached
-    to data/previews/ so every subsequent load is instant. JPEG/PNG files
-    are served directly without caching (they're already compressed).
+    Every format is demosaiced/decoded on first request and cached to
+    data/previews/ so every subsequent load — including after an app
+    reload — is instant. This used to be RAW-only (JPEG/PNG were re-decoded
+    on every request on the assumption that "already compressed" meant
+    "cheap to decode"), but .HIF (HEIF) breaks that assumption: pillow-heif
+    decode is comparably expensive to a RAW demosaic, so a folder full of
+    HIF-only shots (X100VI/X Half) re-paid that cost on every single reload.
+    Caching is unconditional now — cheap formats just get a near-instant
+    first write, expensive ones get the same speedup RAW already had.
+
+    Cache lifecycle: cleared alongside the DB row by clear-folder (tab
+    close), clear-analysis, and sync-folder (file moved/deleted outside the
+    app) — see _delete_image_rows(). A same-content move (K/M/R decision)
+    leaves preview_path untouched since the cached bytes are still valid.
 
     Raises 404 if the image_id doesn't exist or the file has been moved.
     """
@@ -906,24 +1180,12 @@ def get_preview(image_id: int):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File missing from disk: {file_path}")
 
-    fmt = (row["format"] or "").upper()
-
-    # Serve non-RAW files directly — no cache needed.
-    if fmt not in RAW_FORMATS:
-        from PIL import ImageOps
-        img = PilImage.open(str(file_path))
-        img = ImageOps.exif_transpose(img)
-        img.thumbnail(PREVIEW_SIZE, PilImage.LANCZOS)
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=PREVIEW_QUALITY)
-        return Response(content=buf.getvalue(), media_type="image/jpeg")
-
-    # RAW: check the disk cache first.
     cached_path = Path(row["preview_path"]) if row["preview_path"] else None
     if cached_path and cached_path.exists():
         return Response(content=cached_path.read_bytes(), media_type="image/jpeg")
 
     # Cache miss — generate and persist.
+    fmt = (row["format"] or "").upper()
     jpeg_bytes = _generate_preview(file_path, fmt)
 
     PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)

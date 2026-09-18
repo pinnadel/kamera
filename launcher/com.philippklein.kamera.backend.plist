@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  KaMeRa backend as a user LaunchAgent.
+
+  Why an agent rather than a process the applet spawns: an AppleScript applet
+  quits as soon as its script ends, and macOS 26+ then terminates what that
+  applet spawned. Measured 2026-09-18 — applet exits at T, launcher.py takes a
+  SIGTERM at T+0.6s, uvicorn is gone at T+1.2s. Neither `perl POSIX::setsid()`
+  nor `launchctl submit` escapes it: both still run in the applet's bootstrap
+  context. A job in the gui/<uid> domain belongs to launchd, so the applet's
+  exit cannot reap it.
+
+  RunAtLoad/KeepAlive are false on purpose: the backend starts when the user
+  opens KaMeRa (the applet kickstarts this job), and stops when they quit the
+  window (launcher.py's supervisor terminates it). KeepAlive would fight that
+  and respawn a backend the user just closed.
+
+  Install / update:  launcher/install_agent.sh
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.philippklein.kamera.backend</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/philippklein/dev/kamera/start.sh</string>
+        <string>--no-browser</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/philippklein/dev/kamera</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/kamera_launch.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kamera_launch.log</string>
+</dict>
+</plist>

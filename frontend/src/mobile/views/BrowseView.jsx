@@ -147,7 +147,7 @@ export function BrowseView(props) {
           <EmptyState
             icon={Folder}
             title="Pick a folder to begin"
-            body="KaMeRa reads RAW + JPEG files in place. Decisions move them to _Keeps / _Maybes / _Trash subfolders."
+            body="KaMeRa reads RAW + JPEG files in place. Decisions move them to _Keeps / _Maybes / _Rejects subfolders."
             action={
               <button type="button" className="m-btn m-btn-primary" onClick={onPickFolder}>
                 <FolderOpen size={18} aria-hidden="true" />

@@ -87,6 +87,7 @@ export function SortPill({
     <div className="relative" data-dropdown="true">
       <div className={`inline-flex items-center rounded-lg border whitespace-nowrap ${containerActive}`}>
         <button
+          onMouseDown={(e) => e.preventDefault()}
           onClick={(e) => { e.stopPropagation(); onToggleDir() }}
           title={getDirectionTooltip(sortField, sortDir)}
           className={`ml-1 my-0.5 px-1.5 py-0.5 rounded-md text-xs inline-flex items-center border border-transparent hover:border-[rgba(255,255,255,0.20)] transition-colors ${open ? 'text-[#f0f0f0]' : 'text-[#cecece]'}`}
@@ -94,6 +95,7 @@ export function SortPill({
           <DirIcon size={15} />
         </button>
         <button
+          onMouseDown={(e) => e.preventDefault()}
           onClick={() => (open ? closeAll() : onOpen())}
           title="Sort"
           className={`pr-2 pl-1 py-1 text-xs inline-flex items-center gap-1.5 transition-opacity ${open ? 'text-[#f0f0f0]' : 'text-[#cecece]'}`}

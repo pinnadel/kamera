@@ -355,8 +355,8 @@ if __name__ == "__main__":
     target = Path(sys.argv[1])
 
     if target.is_dir():
-        extensions = {'.jpg', '.jpeg', '.png', '.raf', '.nef'}
-        images = [f for f in target.iterdir() if f.suffix.lower() in extensions]
+        from backend.constants import SUPPORTED_EXTENSIONS
+        images = [f for f in target.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
         images.sort()
     else:
         images = [target]

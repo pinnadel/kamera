@@ -1,0 +1,298 @@
+"""
+Apple Photos album endpoints.
+
+Reading is backend/photos_library.py, writing is backend/sources/photos.py;
+this module is only the HTTP surface over them. Everything 501s off macOS
+rather than 500ing, so a non-Darwin install degrades to "this source type does
+not exist here" instead of looking broken.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from backend import photos_library
+from backend.photos_library import PhotosAccessError
+from backend.database import get_db
+from backend.routers.analysis import _run_batch
+from backend.state import _progress, _stop_event, watcher
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+class AnalyzePhotosAlbumRequest(BaseModel):
+    library_path: str
+    album_uuid: str
+
+
+def _require_photos() -> None:
+    if not photos_library.is_available():
+        raise HTTPException(
+            status_code=501,
+            detail="Apple Photos albums are only available on macOS with "
+                   "osxphotos installed",
+        )
+
+
+def _require_open_library(library_path: str) -> None:
+    """Refuse to work against a library Photos.app does not currently have open.
+
+    Reads would actually succeed (osxphotos parses the catalogue directly), but
+    every subsequent WRITE goes through AppleScript, which only ever addresses
+    the open library. Indexing an album KaMeRa could never write back to is a
+    trap, so it is refused at the door.
+    """
+    current = photos_library.current_library_path()
+    if current and Path(current) != Path(library_path):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Photos has a different library open ({Path(current).stem}). "
+                   f"Open {Path(library_path).stem} first.",
+        )
+
+
+_PREF_ACCESS_HELP = (
+    "KaMeRa may not read which Photos library is open. The backend runs "
+    "detached from the app, so macOS treats it as its own identity: turn on "
+    "System Settings \u2192 Privacy & Security \u2192 Files & Folders \u2192 "
+    "python3.14 \u2192 Photos, then restart KaMeRa."
+)
+
+_ACCESS_HELP = (
+    "KaMeRa cannot read your Photos library. Grant Full Disk Access to the app "
+    "in System Settings \u2192 Privacy & Security, then restart it. Note macOS "
+    "attributes this to the process that actually reads \u2014 a separate "
+    "\u201cpython\u201d entry may need it too."
+)
+
+
+class SelectLibraryRequest(BaseModel):
+    library_path: str | None = None
+
+
+@router.get("/photos-libraries")
+def photos_libraries():
+    """Photos libraries on this Mac, for the picker's library step.
+
+    Found via Spotlight, which needs no special permission — unlike Photos'
+    own "which library is open" preference, whose Files & Folders grant cannot
+    always be given to a detached backend process. This is why choosing a
+    library explicitly is the reliable path and auto-detection is only a hint.
+    """
+    _require_photos()
+    return {
+        "libraries": photos_library.list_libraries(),
+        "selected": photos_library.selected_library_path(),
+        "detected": photos_library.detected_library_path(),
+    }
+
+
+@router.post("/photos-library")
+def select_photos_library(request: SelectLibraryRequest):
+    """Remember which library to use. Pass null to fall back to auto-detection."""
+    _require_photos()
+    # The picker lets the user type a path, and people type "~".
+    path = str(Path((request.library_path or "").strip()).expanduser()).rstrip("/") \
+        if (request.library_path or "").strip() else ""
+    if path:
+        if not Path(path).is_dir() or not path.endswith(".photoslibrary"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not a Photos library: {path}",
+            )
+        if not os.access(path, os.R_OK):
+            raise HTTPException(status_code=403, detail=_ACCESS_HELP)
+    photos_library.set_selected_library(path or None)
+    return {"status": "ok", "selected": photos_library.selected_library_path()}
+
+
+@router.get("/photos-albums")
+def photos_albums(refresh: bool = False, library_path: str | None = None):
+    """Every album in the currently open Photos library.
+
+    First call parses the library catalogue, which is slow on a large library —
+    this is a sync `def`, so FastAPI runs it on a worker thread and the event
+    loop stays responsive. The UI should show an indeterminate spinner rather
+    than assume it is instant.
+    """
+    _require_photos()
+    if library_path:
+        library_path = str(Path(library_path).expanduser()).rstrip("/")
+    library = library_path or photos_library.current_library_path()
+    if not library:
+        # A TCC denial makes the preference read as absent, so "no library" and
+        # "not allowed to look" are the same symptom. Naming the right one is
+        # the difference between a two-second fix and a dead end.
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Could not tell which Photos library is open"
+                if not photos_library.photos_pref_readable()
+                else "No Photos library found"
+            ),
+        )
+    try:
+        albums = photos_library.list_albums(library, refresh=refresh)
+    except PhotosAccessError as exc:
+        logger.warning("Photos library not readable: %s", exc)
+        raise HTTPException(status_code=403, detail=_ACCESS_HELP)
+    return {
+        "library_path": library,
+        "library_name": Path(library).stem,
+        "albums": albums,
+    }
+
+
+@router.get("/photos-library-status")
+def photos_library_status(source_folder: str):
+    """Is the library this tab belongs to the one Photos currently has open?
+
+    Drives the warning strip on a Photos tab. Decisions stay enabled when this
+    reports not-ok: the 409 the user then gets names the library they need to
+    open, which is more useful than a silently dead keyboard.
+    """
+    if not photos_library.is_available():
+        return {"ok": False, "reason": "unavailable",
+                "expected_library": None, "current_library": None}
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT library_path, album_name FROM photos_albums WHERE source_folder = ?",
+            (source_folder,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not a known Photos album tab")
+
+    expected = row["library_path"]
+    current = photos_library.current_library_path()
+    ok = bool(current) and Path(current) == Path(expected)
+    return {
+        "ok": ok,
+        "reason": None if ok else "wrong_library",
+        "album_name": row["album_name"],
+        "expected_library": expected,
+        "expected_library_name": Path(expected).stem,
+        "current_library": current,
+        "current_library_name": Path(current).stem if current else None,
+    }
+
+
+@router.post("/analyze-photos-album")
+def analyze_photos_album(request: AnalyzePhotosAlbumRequest):
+    """Analyze every supported asset in one Photos album, in place.
+
+    Mirrors POST /analyze-folder: same dedup on file_path, same _progress slot,
+    same daemon thread, same per-photo commit — so the existing progress poll
+    and grid need no special case. The differences are that candidates come
+    from album membership rather than a directory walk, and that the rows are
+    stamped source_type='photos' so their decisions become keywords instead of
+    file moves.
+    """
+    _require_photos()
+    _require_open_library(request.library_path)
+
+    if _progress.get("running"):
+        raise HTTPException(status_code=409, detail="Analysis already running")
+
+    try:
+        assets, skipped_counts = photos_library.album_assets(
+            request.library_path, request.album_uuid
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PhotosAccessError as exc:
+        logger.warning("Photos library not readable: %s", exc)
+        raise HTTPException(status_code=403, detail=_ACCESS_HELP)
+
+    source_folder = photos_library.photos_source_folder(
+        request.library_path, request.album_uuid
+    )
+    album_name = photos_library.album_name(
+        request.library_path, request.album_uuid
+    ) or "Photos album"
+
+    # Remember the album's identity before anything else: sink preflight and
+    # the library-mismatch banner both read this row, and a tab must never
+    # exist without one.
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO photos_albums
+                (source_folder, library_path, album_uuid, album_name, album_path, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, DATETIME('now'))
+            ON CONFLICT(source_folder) DO UPDATE SET
+                library_path   = excluded.library_path,
+                album_name     = excluded.album_name,
+                album_path     = excluded.album_path,
+                last_synced_at = excluded.last_synced_at
+            """,
+            (source_folder, request.library_path, request.album_uuid,
+             album_name, album_name),
+        )
+
+    common = {
+        "status": "done",
+        "source_folder": source_folder,
+        "album_name": album_name,
+        "missing_originals": skipped_counts["missing_originals"],
+        "skipped_videos": skipped_counts["movies"],
+        "skipped_unsupported": skipped_counts["unsupported"],
+    }
+
+    if not assets:
+        _progress.update({"analyzed_count": 0, "error_count": 0})
+        return {**common, "analyzed": 0, "skipped": [], "errors": [], "total_found": 0}
+
+    with get_db() as conn:
+        done_paths = {
+            r[0] for r in conn.execute(
+                "SELECT file_path FROM images WHERE analysis_status = 'done'"
+            ).fetchall()
+        }
+
+    to_analyze = [Path(a.path) for a in assets if a.path not in done_paths]
+    skipped = [a.original_filename for a in assets if a.path in done_paths]
+    filename_overrides = {a.path: a.original_filename for a in assets}
+    photos_uuid_overrides = {a.path: a.uuid for a in assets}
+
+    _stop_event.clear()
+    _progress.update({
+        "running": True,
+        "total": len(to_analyze),
+        "done": 0,
+        "current_file": None,
+        "started_at": time.monotonic(),
+        "stop_requested": False,
+        "source_folder": source_folder,
+        "analyzed_count": 0,
+        "error_count": 0,
+        "elapsed_seconds": None,
+    })
+
+    paused_watch_path = watcher.watching
+    if paused_watch_path:
+        watcher.stop()
+
+    threading.Thread(
+        target=_run_batch,
+        args=(None, to_analyze, skipped, len(assets), paused_watch_path, False,
+              source_folder, filename_overrides, photos_uuid_overrides),
+        daemon=True,
+        name="batch-analysis",
+    ).start()
+
+    return {
+        **common,
+        "status": "started",
+        "total": len(to_analyze),
+        "skipped": skipped,
+        "total_found": len(assets),
+    }

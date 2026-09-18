@@ -2,19 +2,25 @@
 Personal model and similarity-group endpoints.
 """
 
+import json
 import logging
+from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
+from backend.constants import shot_at_to_unix as _shot_at_to_unix
 from backend.database import get_db, set_setting
 from backend.group_scoring import compute_best_reason
+from backend.routers.settings import tunable_setting_keys
 from backend.state import _personal_model
 from phase2_quality.model_status import snapshot as _model_status_snapshot
 from phase3_learning.auto_trainer import (
     force_train_sync,
     status_snapshot as _auto_train_snapshot,
 )
+from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION
+from phase3_learning.personal_model import MIN_DECISIONS
 from phase2_quality.similarity_scorer import (
     embedding_to_json as _embedding_to_json,
     group_by_similarity as _group_by_similarity,
@@ -176,7 +182,12 @@ def personal_model_info():
       min_decisions      — minimum samples required to train (30)
       decided_count      — how many durable training samples exist right now
                            (read from training_samples, not decisions — these
-                           persist across Clear Analysis / folder moves)
+                           persist across Clear Analysis / folder moves).
+                           Scoped to corpus='folder': this model never sees
+                           Photos-album decisions.
+      photos_sample_count— Photos-album decisions recorded so far. Kept in a
+                           separate corpus and not trained on yet; surfaced so
+                           Settings can show the corpus growing.
       trained_at         — ISO-8601 timestamp of last training run (or null)
       top_features       — all feature importances, descending [{name, importance}]
       auto_running       — bool, true if a background train is in flight
@@ -186,9 +197,15 @@ def personal_model_info():
                            the next auto-train will pick up
     """
     with get_db() as conn:
-        decided_count = conn.execute("SELECT COUNT(*) FROM training_samples").fetchone()[0]
+        decided_count = conn.execute(
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = 'folder'"
+        ).fetchone()[0]
+        photos_sample_count = conn.execute(
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = 'photos'"
+        ).fetchone()[0]
     info = _personal_model.info()
     info["decided_count"] = decided_count
+    info["photos_sample_count"] = photos_sample_count
     info.update(_auto_train_snapshot())
     info["pending_samples"] = max(0, decided_count - (info.get("training_size") or 0))
     return info
@@ -221,7 +238,8 @@ def reset_personal_model():
     """
     Destructive: clear all personal-model training progress.
 
-    Deletes every row in training_samples and pairwise_comparisons, removes
+    Deletes every folder-corpus row in training_samples (Photos-album samples
+    are kept — they belong to a separate corpus) and all pairwise_comparisons, removes
     the persisted personal_model.pkl, and resets the in-memory model so the
     banner falls back to 0/50. Decisions on photos (K/M/R) and analysis
     results are preserved — only the learned model and its inputs are wiped.
@@ -230,7 +248,10 @@ def reset_personal_model():
     """
     try:
         with get_db() as conn:
-            cur = conn.execute("DELETE FROM training_samples")
+            # Scoped to the corpus this model actually trains on. Resetting the
+            # camera model must not discard the Photos corpus being collected
+            # for a future second model.
+            cur = conn.execute("DELETE FROM training_samples WHERE corpus = 'folder'")
             samples_removed = cur.rowcount
             cur = conn.execute("DELETE FROM pairwise_comparisons")
             pairwise_removed = cur.rowcount
@@ -250,25 +271,287 @@ def reset_personal_model():
         raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
 
 
-def _shot_at_to_unix(value) -> float | None:
-    """
-    Normalise a SQLite shot_at column to Unix seconds for clustering.
+# ---------------------------------------------------------------------------
+# Backup / export / import of the personal taste model
+#
+# The durable source of truth is the training_samples corpus (one row per
+# MANUAL decision, with a name-keyed frozen feature vector) plus
+# pairwise_comparisons and the tunable settings. The trained pickle is a
+# derived artifact — import rebuilds it by retraining. Exporting the corpus as
+# JSON (not the pickle) keeps backups portable across feature-schema versions:
+# features_from_json re-aligns rows by feature name and NaN-pads missing cols.
+# ---------------------------------------------------------------------------
 
-    Stored either as ISO-8601 string ('2026-04-12T14:33:21') or as an integer
-    epoch — handle both. Returns None if the value is missing or unparseable.
+_BACKUP_FORMAT = "kamera-taste-model"
+# v2 (2026-09-18): training_samples rows carry `corpus`. A v1 backup has no
+# such field and its rows are read as corpus="folder", which is correct —
+# v1 predates the Photos source entirely. The version is bumped so an older
+# app REFUSES a v2 backup rather than silently folding Photos samples into
+# the camera corpus.
+_BACKUP_FORMAT_VERSION = 2
+_MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB — a 100k-sample corpus is well under this
+
+
+@router.get("/export-taste-model")
+def export_taste_model():
     """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        from datetime import datetime
-        s = value.replace("Z", "+00:00")
+    Export the personal taste model's durable state as a portable JSON backup.
+
+    Contents: every training_samples row across ALL corpora (each tagged with
+    its `corpus`, so a restore puts folder and Photos samples back where they
+    belong) + pairwise_comparisons + the
+    user-tunable settings (decision thresholds/weights). The trained pickle is
+    intentionally excluded — import rebuilds it via retrain. Returns a
+    downloadable attachment; an empty corpus is a valid (never 404) export.
+    """
+    keys = tunable_setting_keys()
+    placeholders = ",".join("?" * len(keys))
+    with get_db() as conn:
+        samples = [
+            dict(r) for r in conn.execute(
+                "SELECT sample_uuid, decision, features_json, overall_score, "
+                "schema_version, corpus, decided_at FROM training_samples"
+            ).fetchall()
+        ]
+        pairwise = [
+            dict(r) for r in conn.execute(
+                "SELECT winner_id, loser_id, source_folder, decided_at "
+                "FROM pairwise_comparisons"
+            ).fetchall()
+        ]
+        setting_rows = conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall()
+
+    payload = {
+        "format":         _BACKUP_FORMAT,
+        "format_version": _BACKUP_FORMAT_VERSION,
+        "exported_at":    datetime.now().isoformat(timespec="seconds"),
+        "app": {
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "min_decisions":          MIN_DECISIONS,
+        },
+        "training_samples":     samples,
+        "pairwise_comparisons": pairwise,
+        "settings":             {r["key"]: r["value"] for r in setting_rows},
+    }
+
+    filename = f"kamera-taste-model-{len(samples)}-samples.json"
+    return Response(
+        content=json.dumps(payload),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/import-taste-model")
+async def import_taste_model(request: Request, mode: str = "merge"):
+    """
+    Restore a personal-taste-model backup produced by /export-taste-model.
+
+    The backup JSON is sent as the raw request body (application/json); `mode`
+    is a query parameter. This keeps the endpoint dependency-free — the browser
+    reads the picked file's text and POSTs it directly, no multipart needed.
+
+    mode="merge"   → upsert samples by sample_uuid (taste evolution wins),
+                     apply settings additively; never clears existing state.
+    mode="replace" → wipe the corpus AND tunable settings first, then restore
+                     the backup exactly (a true snapshot restore).
+
+    After the DB restore, the model is retrained so the on-disk pickle reflects
+    the imported corpus (skipped when the corpus is below MIN_DECISIONS).
+    """
+    if mode not in ("merge", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'merge' or 'replace'")
+
+    raw = await request.body()
+    if len(raw) > _MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="Backup file too large (limit 50 MB)")
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="File is not valid JSON")
+
+    if not isinstance(payload, dict) or payload.get("format") != _BACKUP_FORMAT:
+        raise HTTPException(status_code=400, detail="Not a KaMeRa taste-model backup")
+    fmt_version = payload.get("format_version")
+    if not isinstance(fmt_version, int) or fmt_version > _BACKUP_FORMAT_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported backup version — export was made by a newer app",
+        )
+
+    samples  = payload.get("training_samples", [])
+    pairwise = payload.get("pairwise_comparisons", [])
+    settings = payload.get("settings", {})
+    if not isinstance(samples, list) or not isinstance(pairwise, list) \
+            or not isinstance(settings, dict):
+        raise HTTPException(status_code=400, detail="Backup structure is malformed")
+
+    # Schema-mismatch is a warning, never a blocker: features_from_json re-aligns
+    # rows by name and the SimpleImputer fills any missing columns at retrain.
+    backup_fsv = (payload.get("app") or {}).get("feature_schema_version")
+    schema_warning = None
+    if backup_fsv != FEATURE_SCHEMA_VERSION:
+        schema_warning = (
+            f"Backup was made on feature schema {backup_fsv}; this app is on "
+            f"{FEATURE_SCHEMA_VERSION}. Samples will be re-aligned by name and "
+            f"any missing features filled in when the model retrains."
+        )
+
+    allowed_keys = set(tunable_setting_keys())
+
+    # Pre-filter samples: a row needs a non-empty uuid and a valid decision.
+    valid_samples, skipped = [], 0
+    for s in samples:
+        uuid = s.get("sample_uuid")
+        if not uuid or s.get("decision") not in ("keep", "maybe", "reject"):
+            skipped += 1
+            continue
+        valid_samples.append(s)
+
+    try:
+        with get_db() as conn:
+            if mode == "replace":
+                conn.execute("DELETE FROM training_samples")
+                conn.execute("DELETE FROM pairwise_comparisons")
+                if allowed_keys:
+                    ph = ",".join("?" * len(allowed_keys))
+                    conn.execute(
+                        f"DELETE FROM settings WHERE key IN ({ph})",
+                        tuple(allowed_keys),
+                    )
+
+            # Upsert samples — mirror the live decision path's ON CONFLICT, but
+            # preserve the backup's decided_at so recency weighting stays faithful.
+            conn.executemany(
+                """
+                INSERT INTO training_samples
+                    (sample_uuid, decision, features_json, overall_score,
+                     schema_version, corpus, decided_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sample_uuid) DO UPDATE SET
+                    decision       = excluded.decision,
+                    features_json  = excluded.features_json,
+                    overall_score  = excluded.overall_score,
+                    schema_version = excluded.schema_version,
+                    corpus         = excluded.corpus,
+                    decided_at     = excluded.decided_at
+                """,
+                [
+                    (
+                        s["sample_uuid"],
+                        s["decision"],
+                        s.get("features_json"),
+                        s.get("overall_score"),
+                        s.get("schema_version", FEATURE_SCHEMA_VERSION),
+                        # v1 backups predate the Photos source — folder is right.
+                        s.get("corpus") or "folder",
+                        s.get("decided_at"),
+                    )
+                    for s in valid_samples
+                ],
+            )
+
+            # Pairwise has no unique key; in merge mode dedup so repeat imports
+            # stay idempotent. Replace mode already wiped the table.
+            pairwise_imported = 0
+            for p in pairwise:
+                if p.get("winner_id") is None or p.get("loser_id") is None:
+                    continue
+                params = (
+                    p["winner_id"], p["loser_id"],
+                    p.get("source_folder"), p.get("decided_at"),
+                )
+                if mode == "merge":
+                    cur = conn.execute(
+                        """
+                        INSERT INTO pairwise_comparisons
+                            (winner_id, loser_id, source_folder, decided_at)
+                        SELECT ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM pairwise_comparisons
+                            WHERE winner_id = ? AND loser_id = ?
+                              AND IFNULL(decided_at,'') = IFNULL(?,'')
+                        )
+                        """,
+                        params + (p["winner_id"], p["loser_id"], p.get("decided_at")),
+                    )
+                    pairwise_imported += cur.rowcount
+                else:
+                    conn.execute(
+                        "INSERT INTO pairwise_comparisons "
+                        "(winner_id, loser_id, source_folder, decided_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        params,
+                    )
+                    pairwise_imported += 1
+
+            # Settings: only accept known tunable keys (drop unknown/hostile).
+            settings_applied = 0
+            for key, value in settings.items():
+                if key in allowed_keys:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (key, str(value)),
+                    )
+                    settings_applied += 1
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Taste-model import failed during DB restore")
+        raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
+
+    # ── Rebuild the derived pickle from the restored corpus ──────────────────
+    _personal_model.clear_cache()
+    # Replace can shrink the corpus below the on-disk fit; save()'s shrink guard
+    # would then silently refuse the overwrite and leave a stale pickle. reset()
+    # deletes the pickle first so the (possibly smaller) new fit persists cleanly.
+    if mode == "replace":
+        _personal_model.reset()
+
+    retrained = False
+    retrain_deferred = False
+    retrain_skipped_reason = None
+    with get_db() as conn:
+        corpus_size = conn.execute("SELECT COUNT(*) FROM training_samples").fetchone()[0]
+
+    if corpus_size < MIN_DECISIONS:
+        retrain_skipped_reason = "below_min_decisions"
+    else:
         try:
-            return datetime.fromisoformat(s).timestamp()
+            force_train_sync(_personal_model)
+            retrained = True
         except ValueError:
-            return None
-    return None
+            retrain_skipped_reason = "below_min_decisions"
+        except RuntimeError:
+            # An auto-train is mid-flight — don't fail the import; the running
+            # train (or the next one) will pick up the freshly imported corpus.
+            retrain_deferred = True
+        except Exception:
+            logger.exception("Retrain after import failed")
+            retrain_skipped_reason = "retrain_error"
+
+    logger.info(
+        "Taste-model import (%s): %d samples, %d skipped, %d pairwise, %d settings; "
+        "retrained=%s deferred=%s",
+        mode, len(valid_samples), skipped, pairwise_imported, settings_applied,
+        retrained, retrain_deferred,
+    )
+    return {
+        "status":                 "imported",
+        "mode":                   mode,
+        "samples_imported":       len(valid_samples),
+        "samples_skipped":        skipped,
+        "pairwise_imported":      pairwise_imported,
+        "settings_applied":       settings_applied,
+        "retrained":              retrained,
+        "retrain_deferred":       retrain_deferred,
+        "retrain_skipped_reason": retrain_skipped_reason,
+        "schema_warning":         schema_warning,
+    }
 
 
 @router.get("/similarity-groups")
@@ -530,6 +813,39 @@ def set_group_hero(request: GroupHeroRequest):
     return {"status": "ok", "hero_image_id": request.hero_image_id}
 
 
+def _reclaim_stale_singleton_anchors(conn, anchors: set[str]) -> None:
+    """Null out manual_group_id for any of `anchors` left with exactly one
+    member after a mutation.
+
+    A manual anchor bucket only means something as a *group* — the ≥2 rule
+    in group_by_similarity() already hides size-1 buckets from
+    /similarity-groups. Without this sweep, moving one photo out of a
+    2-member anchored group (e.g. GroupLoupe's "Remove from group") leaves
+    the other member pinned to the old anchor forever: it can't be seen
+    (size 1 never renders) and it can't rejoin auto-clustering either
+    (a non-NULL manual_group_id always short-circuits into the anchor
+    phase). Clearing it restores normal auto-cluster behaviour, matching
+    what already happens to an auto-cluster member that ends up alone.
+    """
+    anchors = {a for a in anchors if a}
+    if not anchors:
+        return
+    placeholders = ",".join("?" * len(anchors))
+    rows = conn.execute(
+        f"SELECT manual_group_id, COUNT(*) AS n FROM images "
+        f"WHERE manual_group_id IN ({placeholders}) GROUP BY manual_group_id",
+        list(anchors),
+    ).fetchall()
+    stale = [r["manual_group_id"] for r in rows if r["n"] == 1]
+    if stale:
+        placeholders2 = ",".join("?" * len(stale))
+        conn.execute(
+            f"UPDATE images SET manual_group_id = NULL "
+            f"WHERE manual_group_id IN ({placeholders2})",
+            stale,
+        )
+
+
 @router.post("/set-manual-group")
 def set_manual_group(request: SetManualGroupRequest):
     """Move photos in/out of manually-anchored groups. See
@@ -567,6 +883,17 @@ def set_manual_group(request: SetManualGroupRequest):
         )
 
     with get_db() as conn:
+        # Snapshot the anchors image_ids currently belong to BEFORE mutating.
+        # Every mode below can pull photos out of whatever bucket they were
+        # previously in, so these are the buckets that need a post-mutation
+        # stale-singleton sweep (see _reclaim_stale_singleton_anchors).
+        placeholders0 = ",".join("?" * len(image_ids))
+        prior_anchor_rows = conn.execute(
+            f"SELECT manual_group_id FROM images WHERE id IN ({placeholders0})",
+            image_ids,
+        ).fetchall()
+        prior_anchors = {r["manual_group_id"] for r in prior_anchor_rows}
+
         if mode == "new_group":
             anchor = _uuid.uuid4().hex
             placeholders = ",".join("?" * len(image_ids))
@@ -574,6 +901,7 @@ def set_manual_group(request: SetManualGroupRequest):
                 f"UPDATE images SET manual_group_id = ? WHERE id IN ({placeholders})",
                 [anchor, *image_ids],
             )
+            _reclaim_stale_singleton_anchors(conn, prior_anchors)
             conn.commit()
             return {"updated": len(image_ids), "manual_group_id": anchor}
 
@@ -585,6 +913,7 @@ def set_manual_group(request: SetManualGroupRequest):
                     "UPDATE images SET manual_group_id = ? WHERE id = ?",
                     (anchor, image_id),
                 )
+            _reclaim_stale_singleton_anchors(conn, prior_anchors)
             conn.commit()
             return {"updated": len(image_ids), "manual_group_id": None}
 
@@ -619,6 +948,7 @@ def set_manual_group(request: SetManualGroupRequest):
                 f"UPDATE images SET manual_group_id = ? WHERE id IN ({placeholders})",
                 [anchor, *all_ids],
             )
+            _reclaim_stale_singleton_anchors(conn, prior_anchors)
             conn.commit()
             return {"updated": len(all_ids), "manual_group_id": anchor}
 
@@ -628,6 +958,7 @@ def set_manual_group(request: SetManualGroupRequest):
             f"UPDATE images SET manual_group_id = NULL WHERE id IN ({placeholders})",
             image_ids,
         )
+        _reclaim_stale_singleton_anchors(conn, prior_anchors)
         conn.commit()
         return {"updated": len(image_ids), "manual_group_id": None}
 

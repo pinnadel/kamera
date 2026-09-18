@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArrowLeft,
   ArrowRight,
@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Download,
   Filter,
   GraduationCap,
   Monitor,
@@ -14,12 +15,13 @@ import {
   Scale,
   Shield,
   Trash2,
+  Upload,
   X,
   Zap,
 } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY } from '../ui/buttons'
-import { Toggle, InfoTooltip, DecisionWord } from '../ui/primitives'
+import { Toggle, InfoTooltip, HoverPopover, DecisionWord } from '../ui/primitives'
 import { ConfirmModal } from './ConfirmModal'
 import { PersonalModelBanner } from '../views/PersonalModelBanner'
 import { ALL_METRICS, SCORE_GROUPS } from '../sortMetrics'
@@ -44,6 +46,8 @@ const PRESETS = {
     face_sharpness_floor:     15,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                25,
     reject_closed_eyes:       true,
   },
   balanced: {
@@ -56,6 +60,8 @@ const PRESETS = {
     face_sharpness_floor:     20,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                30,
     reject_closed_eyes:       true,
   },
   review_heavy: {
@@ -68,6 +74,8 @@ const PRESETS = {
     face_sharpness_floor:     20,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                25,
     reject_closed_eyes:       true,
   },
   aggressive: {
@@ -80,6 +88,8 @@ const PRESETS = {
     face_sharpness_floor:     25,
     reject_soft_face:         true,
     reject_blurry_frame:      true,
+    reject_low_iqa:           true,
+    iqa_floor:                35,
     reject_closed_eyes:       true,
   },
 }
@@ -95,6 +105,8 @@ const DECISION_DEFAULTS = {
   face_sharpness_floor:       20,
   reject_soft_face:           true,
   reject_blurry_frame:        true,
+  reject_low_iqa:             true,
+  iqa_floor:                  30,
   reject_closed_eyes:         true,
   reject_closed_eyes_all_faces: false,
   reject_reciprocal_rule:     false,
@@ -103,9 +115,51 @@ const DECISION_DEFAULTS = {
   // PR3 boundary routing.
   auto_cull_uncertain_to_maybe: true,
   uncertainty_threshold:        8.0,
+  // Burst keep-cap / multi-keep post-pass.
+  auto_cull_cap_burst_keeps:    true,
+  max_burst_keeps:              2,
+  max_burst_maybes:             2,
+  burst_keep_margin:            8.0,
+  burst_keep_winner_delta:      6.0,
+  burst_keep_reject_delta:      20.0,
 }
 
-export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, advanceDir, onAdvanceDirChange,
+// Non-linear value ladder for the burst "Time gap" slider. A native range
+// input can only do a uniform step, so the slider runs over the ARRAY INDEX
+// (uniform step 1) and each index maps to a gap value with finer granularity
+// at the short end where it matters most:
+//   1–30s  in 1s steps · 30–60s in 10s steps · 60–300s (5min) in 15s steps.
+const TIME_GAP_STEPS = (() => {
+  const steps = []
+  for (let s = 1; s <= 30; s += 1) steps.push(s)      // 1..30 @ 1s
+  for (let s = 40; s <= 60; s += 10) steps.push(s)    // 40,50,60 @ 10s
+  for (let s = 75; s <= 300; s += 15) steps.push(s)   // 75..300 @ 15s
+  return steps
+})()
+
+// Snap an arbitrary gap (seconds) to the nearest ladder index — used to place
+// the slider handle for a value that may predate this ladder (e.g. a stored 45).
+function timeGapToIndex(seconds) {
+  const target = seconds ?? 60
+  let best = 0
+  let bestDist = Infinity
+  for (let i = 0; i < TIME_GAP_STEPS.length; i += 1) {
+    const d = Math.abs(TIME_GAP_STEPS[i] - target)
+    if (d < bestDist) { bestDist = d; best = i }
+  }
+  return best
+}
+
+// Format a gap in seconds as "N seconds" or "M:SS minutes".
+function formatTimeGap(seconds) {
+  const total = Math.round(seconds ?? 60)
+  if (total < 60) return `${total} ${total === 1 ? 'second' : 'seconds'}`
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  return `${m}:${String(s).padStart(2, '0')} minutes`
+}
+
+export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onExportModel, onImportModel, importingModel, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
   // Grouping sliders (Model tab). Live-updating — change triggers an
   // immediate /similarity-groups refetch via useGroups in the parent.
   // They aren't part of the Apply/draft flow because they aren't
@@ -128,6 +182,16 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   useEffect(() => {
     setRejectToTrash(settings?.reject_to_system_trash ?? false)
   }, [settings?.reject_to_system_trash])
+  const [rawJpegMode, setRawJpegMode] = useState(settings?.raw_jpeg_display_mode ?? 'both')
+  const [savingRawJpegMode, setSavingRawJpegMode] = useState(false)
+  useEffect(() => {
+    setRawJpegMode(settings?.raw_jpeg_display_mode ?? 'both')
+  }, [settings?.raw_jpeg_display_mode])
+  const [analysisMode, setAnalysisMode] = useState(settings?.analysis_mode ?? 'full')
+  const [savingAnalysisMode, setSavingAnalysisMode] = useState(false)
+  useEffect(() => {
+    setAnalysisMode(settings?.analysis_mode ?? 'full')
+  }, [settings?.analysis_mode])
   // Advanced sort-options visibility (localStorage). Lean defaults preselected;
   // user can opt into the rest. Section collapsed by default — these are
   // power-user toggles, not first-run choices.
@@ -149,8 +213,10 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     fallback_maybe:           settings?.fallback_maybe           ?? DECISION_DEFAULTS.fallback_maybe,
     fallback_sharpness_floor: settings?.fallback_sharpness_floor ?? DECISION_DEFAULTS.fallback_sharpness_floor,
     face_sharpness_floor:     settings?.face_sharpness_floor     ?? DECISION_DEFAULTS.face_sharpness_floor,
+    iqa_floor:                settings?.iqa_floor                ?? DECISION_DEFAULTS.iqa_floor,
     reject_soft_face:           settings?.reject_soft_face           ?? DECISION_DEFAULTS.reject_soft_face,
     reject_blurry_frame:        settings?.reject_blurry_frame        ?? DECISION_DEFAULTS.reject_blurry_frame,
+    reject_low_iqa:             settings?.reject_low_iqa             ?? DECISION_DEFAULTS.reject_low_iqa,
     reject_closed_eyes:         settings?.reject_closed_eyes         ?? DECISION_DEFAULTS.reject_closed_eyes,
     reject_closed_eyes_all_faces: settings?.reject_closed_eyes_all_faces ?? DECISION_DEFAULTS.reject_closed_eyes_all_faces,
     reject_reciprocal_rule:     settings?.reject_reciprocal_rule     ?? DECISION_DEFAULTS.reject_reciprocal_rule,
@@ -158,6 +224,12 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     iso_ceiling:                settings?.iso_ceiling                ?? DECISION_DEFAULTS.iso_ceiling,
     auto_cull_uncertain_to_maybe: settings?.auto_cull_uncertain_to_maybe ?? DECISION_DEFAULTS.auto_cull_uncertain_to_maybe,
     uncertainty_threshold:        settings?.uncertainty_threshold        ?? DECISION_DEFAULTS.uncertainty_threshold,
+    auto_cull_cap_burst_keeps:    settings?.auto_cull_cap_burst_keeps    ?? DECISION_DEFAULTS.auto_cull_cap_burst_keeps,
+    max_burst_keeps:              settings?.max_burst_keeps              ?? DECISION_DEFAULTS.max_burst_keeps,
+    max_burst_maybes:             settings?.max_burst_maybes             ?? DECISION_DEFAULTS.max_burst_maybes,
+    burst_keep_margin:            settings?.burst_keep_margin            ?? DECISION_DEFAULTS.burst_keep_margin,
+    burst_keep_winner_delta:      settings?.burst_keep_winner_delta      ?? DECISION_DEFAULTS.burst_keep_winner_delta,
+    burst_keep_reject_delta:      settings?.burst_keep_reject_delta      ?? DECISION_DEFAULTS.burst_keep_reject_delta,
   })
   const [decision, setDecision]               = useState(initDecision)
   const [savedDecision, setSavedDecision]     = useState(initDecision)
@@ -191,6 +263,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   const [resetDashboardConfirm, setResetDashboardConfirm] = useState(false)
   const [resetDashboardRunning, setResetDashboardRunning] = useState(false)
   const [discardConfirm, setDiscardConfirm] = useState(false)
+  // Backup & Restore: the picked file waits here until the user chooses
+  // Merge vs Replace; the ref lets us reset the input so re-picking the same
+  // file re-fires onChange.
+  const importFileRef = useRef(null)
+  const [pendingImportFile, setPendingImportFile] = useState(null)
 
   function openClearConfirm() {
     const a = Math.floor(Math.random() * 9) + 1
@@ -258,8 +335,74 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     }
   }
 
+  // RAW+JPEG pair visibility. Same optimistic-save pattern as the sidecar
+  // toggle above. Switching to 'raw' or 'processed' takes effect on the next
+  // GET /images refetch — the hidden half simply stops appearing in the grid,
+  // nothing is deleted or moved until a decision is actually made.
+  async function handleRawJpegModeChange(next) {
+    if (next === rawJpegMode) return
+    const prev = rawJpegMode
+    setRawJpegMode(next)
+    setSavingRawJpegMode(true)
+    try {
+      const res = await fetch(`${API}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_jpeg_display_mode: next }),
+      })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
+      await onSave()
+      onToast({
+        type: 'success',
+        message: next === 'both'
+          ? 'Showing both RAW and processed files'
+          : next === 'raw'
+            ? 'Showing RAW files only — decisions apply to the processed companion too'
+            : 'Showing processed files only — decisions apply to the RAW companion too',
+      })
+    } catch (err) {
+      console.error('RAW/JPEG display mode save failed:', err)
+      setRawJpegMode(prev)
+      onToast({ type: 'error', message: 'Could not save preference — server error' })
+    } finally {
+      setSavingRawJpegMode(false)
+    }
+  }
+
+  // Analysis scope. Same optimistic-save pattern as the two settings above.
+  // Switching to 'jpeg_priority' takes effect on the NEXT analysis run for
+  // files not yet in the library — it doesn't retroactively drop scores
+  // already stored for RAWs analyzed under 'full'.
+  async function handleAnalysisModeChange(next) {
+    if (next === analysisMode) return
+    const prev = analysisMode
+    setAnalysisMode(next)
+    setSavingAnalysisMode(true)
+    try {
+      const res = await fetch(`${API}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ analysis_mode: next }),
+      })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
+      await onSave()
+      onToast({
+        type: 'success',
+        message: next === 'jpeg_priority'
+          ? 'Processed-priority mode on — RAW files with a matching JPEG/HIF/etc. will be skipped on the next analysis'
+          : 'Full analysis mode on — every file will be scored',
+      })
+    } catch (err) {
+      console.error('Analysis mode save failed:', err)
+      setAnalysisMode(prev)
+      onToast({ type: 'error', message: 'Could not save preference — server error' })
+    } finally {
+      setSavingAnalysisMode(false)
+    }
+  }
+
   // Reject-to-Trash toggle. When ON, future R presses send the file to the
-  // system Trash via send2trash instead of moving it to _Trash/. Switching
+  // system Trash via send2trash instead of moving it to _Rejects/. Switching
   // this mid-session doesn't relocate already-rejected photos — applies to
   // future decisions only. Optimistic write with rollback on failure.
   async function handleRejectTrashToggle(next) {
@@ -278,7 +421,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
         type: 'success',
         message: next
           ? 'Rejected photos will be sent to system Trash'
-          : 'Rejected photos will be moved to the _Trash/ folder',
+          : 'Rejected photos will be moved to the _Rejects/ folder',
       })
     } catch (err) {
       console.error('Reject-to-trash preference save failed:', err)
@@ -326,11 +469,11 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-start justify-center pt-[5vh]" onClick={handleClose} onWheel={e => e.stopPropagation()}>
       <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
+        className="settings-modal bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
         onClick={e => e.stopPropagation()}
       >
         {/* Upper section — darker band, matches DetailView header */}
-        <div className="bg-[#161718] border-b border-[#2f3031] px-6 pt-5 pb-0 rounded-t-xl">
+        <div className="bg-[#161718] border-b border-[#2f3031] px-6 pt-5 pb-0 rounded-t-xl flex-shrink-0">
           {/* Header */}
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-semibold text-[#f9f9f9]">Settings</h2>
@@ -363,6 +506,46 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
         {activeTab === 'model' && (
           <div className="space-y-6">
 
+            {/* ── Analysis scope ───────────────────────────────────────── */}
+            <div>
+              <p className="label mb-1">Analysis scope</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
+                When a shot was taken RAW + a processed file (JPEG, HIF, PNG,
+                TIFF), choose whether the RAW also gets scored. Skipping it
+                can dramatically speed up analysis — the processed file's
+                score is used for culling, and any Keep / Maybe / Reject
+                decision on it automatically moves its RAW companion along
+                with it.
+              </p>
+
+              <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingAnalysisMode ? 'opacity-50 pointer-events-none' : ''}`}>
+                {[
+                  { key: 'full', label: 'Full', title: 'Analyze every file, including RAW + processed pairs' },
+                  { key: 'jpeg_priority', label: 'Processed (.jpg, .hif, …)', title: 'Skip a RAW file when a same-stem processed file (.jpg/.jpeg/.hif/.png/.tif/.tiff) exists' },
+                ].map(({ key, label, title }, i) => (
+                  <button
+                    key={key}
+                    onClick={() => handleAnalysisModeChange(key)}
+                    title={title}
+                    className={`px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${analysisMode === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
+                A RAW file with no processed sibling (RAW-only shooting) is
+                always analyzed in full, regardless of this setting — there's
+                nothing else to judge that shot by. Changing this setting
+                only affects files analyzed from now on — it never
+                retroactively scores an already-skipped RAW or clears scores
+                already stored for a fully-analyzed one. Use Clear Analysis
+                (or Clear folder) and re-analyze if you want to apply a new
+                mode to files already in your library.
+              </p>
+            </div>
+
             {/* ── Presets ───────────────────────────────────────────────── */}
             {(() => {
               // Detect which preset (if any) matches the current draft state.
@@ -378,42 +561,53 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               }) ?? null
 
               const pills = [
-                { key: 'conservative', label: 'Conservative', Icon: Shield },
-                { key: 'balanced',     label: 'Balanced',     Icon: Scale  },
-                { key: 'review_heavy', label: 'Review-heavy', Icon: Filter },
-                { key: 'aggressive',   label: 'Aggressive',   Icon: Zap    },
+                { key: 'conservative', label: 'Conservative', Icon: Shield, desc: 'Fewer keeps, stricter rules.' },
+                { key: 'balanced',     label: 'Balanced',     Icon: Scale,  desc: 'The defaults.' },
+                { key: 'review_heavy', label: 'Review-heavy', Icon: Filter, desc: 'Wider Maybe band so fewer borderline keeps slip through; pairs with manual Maybe review.' },
+                { key: 'aggressive',   label: 'Aggressive',   Icon: Zap,    desc: 'More keeps, looser rules.' },
               ]
 
               return (
                 <div>
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-2">
                     <span className="text-xs text-[#9c9c9d]">Presets</span>
-                    <div className="flex items-center gap-1.5">
-                      {pills.map(({ key, label, Icon }) => {
-                        const isActive = activePreset === key
-                        return (
+                    {activePreset === null && (
+                      <span className="text-[10px] text-[#9c9c9d]">· Custom settings</span>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {pills.map(({ key, label, Icon, desc }) => {
+                      const isActive = activePreset === key
+                      return (
+                        <HoverPopover key={key} content={desc}>
                           <button
-                            key={key}
                             onClick={() => {
                               setDecision({ ...PRESETS[key] })
                               setShowValidationHint(false)
                             }}
                             className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border text-xs transition-opacity ${
                               isActive
-                                ? 'border-[#5BB8D4] text-[#5BB8D4]'
+                                ? 'border-[#5BB8D4] text-[#5BB8D4] bg-[rgba(91,184,212,0.10)]'
                                 : 'border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70'
                             }`}
                           >
                             <Icon size={14} />
                             {label}
                           </button>
-                        )
-                      })}
-                    </div>
+                        </HoverPopover>
+                      )
+                    })}
                   </div>
-                  <p className="text-[11px] text-[#6a6b6c] mt-1 leading-relaxed">
-                    <span className="text-[#9c9c9d]">Conservative</span> — fewer keeps, stricter rules. <span className="text-[#9c9c9d]">Balanced</span> — defaults. <span className="text-[#9c9c9d]">Review-heavy</span> — wider Maybe band so fewer borderline keeps slip through; pairs with manual Maybe review. <span className="text-[#9c9c9d]">Aggressive</span> — more keeps, looser rules.
-                  </p>
+                  {activePreset === null ? (
+                    <p className="text-[11px] text-[#6a6b6c] mt-2 leading-relaxed">
+                      Your thresholds below don't match any preset — that's fine, they're yours.
+                      Presets are just starting points; pick one to reset everything to it.
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-[#6a6b6c] mt-2 leading-relaxed">
+                      A preset is selected. Adjusting any threshold below makes it custom.
+                    </p>
+                  )}
                 </div>
               )
             })()}
@@ -519,6 +713,57 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     indent
                   />
                 )}
+
+                <ToggleRow
+                  label="Deduplicate Keeps within a burst"
+                  tooltip="Auto-cull scores each photo independently, so several near-identical frames in the same burst (same pose, seconds apart) can each clear the Keep cutoff and all land in _Keeps/. When on, the single best photo per burst always keeps; a few extra frames may also keep if they're genuinely strong; near-pixel-identical duplicates are rejected; and once the burst has kept a few Maybe alternates, further redundant frames are rejected too — so a big burst doesn't flood your review pile. Tune all of it with the knobs below."
+                  enabled={decision.auto_cull_cap_burst_keeps}
+                  onChange={v => updField('auto_cull_cap_burst_keeps', v)}
+                />
+                {decision.auto_cull_cap_burst_keeps && (
+                  <>
+                    <NumberRow
+                      label="Max Keeps per burst"
+                      tooltip={`How many photos from one burst may auto-cull to Keep, counting the best one. Default ${DECISION_DEFAULTS.max_burst_keeps}. Set to 1 to keep only the single best photo per burst; raise it to let more strong alternates through automatically.`}
+                      value={decision.max_burst_keeps}
+                      min={1} max={10} step={1}
+                      onChange={v => updField('max_burst_keeps', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Max Maybe alternates per burst"
+                      tooltip={`After the Keeps, how many more frames from one burst may stay as Maybe for review. Beyond this, further redundant frames are auto-rejected instead of piling up as Maybe — this is what stops a big burst of near-identical shots from flooding your review pile. Default ${DECISION_DEFAULTS.max_burst_maybes}. Set to 0 to reject every non-kept frame; raise it to keep a wider safety net.`}
+                      value={decision.max_burst_maybes}
+                      min={0} max={10} step={1}
+                      onChange={v => updField('max_burst_maybes', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Extra-keep margin above cutoff"
+                      tooltip={`An extra frame keeps only if its score clears the Keep cutoff by at least this many points — not barely over the line. Default ${DECISION_DEFAULTS.burst_keep_margin}. Higher = pickier about which extras survive.`}
+                      value={decision.burst_keep_margin}
+                      min={0} max={50} step={1}
+                      onChange={v => updField('burst_keep_margin', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Extra-keep closeness to best"
+                      tooltip={`An extra frame keeps only if its score is within this many points of the burst's best photo — a genuine alternate, not a weaker straggler. Default ${DECISION_DEFAULTS.burst_keep_winner_delta}. Lower = only near-identical-quality frames double-keep.`}
+                      value={decision.burst_keep_winner_delta}
+                      min={0} max={50} step={1}
+                      onChange={v => updField('burst_keep_winner_delta', v)}
+                      indent
+                    />
+                    <NumberRow
+                      label="Reject when this far below best"
+                      tooltip={`A non-surviving burst frame more than this many points below the best photo (or below the Maybe cutoff) is sent straight to Reject instead of Maybe — the clearly-weaker duplicates. Default ${DECISION_DEFAULTS.burst_keep_reject_delta}. Raise it to make auto-reject rarer and route more to Maybe.`}
+                      value={decision.burst_keep_reject_delta}
+                      min={0} max={100} step={1}
+                      onChange={v => updField('burst_keep_reject_delta', v)}
+                      indent
+                    />
+                  </>
+                )}
               </div>
 
               {/* Fallback cutoffs — collapsed behind Advanced accordion */}
@@ -615,6 +860,22 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   />
                 )}
                 <ToggleRow
+                  label="Reject low perceptual quality"
+                  tooltip="Uses the TOPIQ-NR image-quality score (a whole-frame perceptual measure) to catch photos that the sharpness metric rates highly but are actually out-of-focus — e.g. a defocused frame full of fine texture that fools the edge detector. Photos scoring below the floor below are auto-rejected."
+                  enabled={decision.reject_low_iqa}
+                  onChange={v => updField('reject_low_iqa', v)}
+                />
+                {decision.reject_low_iqa && (
+                  <NumberRow
+                    label="Quality floor (IQA)"
+                    tooltip={`Photos with a TOPIQ-NR quality score below this number are rejected. Default ${DECISION_DEFAULTS.iqa_floor}. Keep it low — genuinely sharp photos score well above it (typically 70+); only clearly-degraded frames fall under 30. Raising it culls more aggressively.`}
+                    value={decision.iqa_floor}
+                    min={0} max={70} step={1}
+                    onChange={v => updField('iqa_floor', v)}
+                    indent
+                  />
+                )}
+                <ToggleRow
                   label="Reject above ISO ceiling"
                   tooltip="Photos shot at ISO higher than the ceiling below are auto-rejected. Useful if you know your camera becomes too noisy above a certain sensitivity."
                   enabled={decision.reject_above_iso_ceiling}
@@ -661,7 +922,8 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   className="w-full accent-[#5BB8D4]"
                 />
                 <p className="text-[10px] text-[#777] mt-1 leading-tight">
-                  Higher = stricter grouping. Lower = more photos per burst.
+                  Higher = stricter grouping. Lower = more photos per burst. Also
+                  controls how auto-cull decides which frames are redundant.
                 </p>
               </div>
 
@@ -669,26 +931,23 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-xs text-[#cecece]">Time gap</span>
                   <span className="text-xs text-[#9c9c9d] tabular-nums">
-                    {(() => {
-                      const total = Math.round(groupTimeGapSeconds ?? 60)
-                      if (total < 60) return `${total} seconds`
-                      const m = Math.floor(total / 60)
-                      const s = total % 60
-                      return `${m}:${String(s).padStart(2, '0')} minutes`
-                    })()}
+                    {formatTimeGap(groupTimeGapSeconds)}
                   </span>
                 </div>
                 <input
                   type="range"
-                  min="15"
-                  max="600"
-                  step="15"
-                  value={groupTimeGapSeconds ?? 60}
-                  onChange={e => setGroupTimeGapSeconds?.(parseFloat(e.target.value))}
+                  min="0"
+                  max={TIME_GAP_STEPS.length - 1}
+                  step="1"
+                  value={timeGapToIndex(groupTimeGapSeconds)}
+                  onChange={e => setGroupTimeGapSeconds?.(TIME_GAP_STEPS[parseInt(e.target.value, 10)])}
                   className="w-full accent-[#5BB8D4]"
                 />
                 <p className="text-[10px] text-[#777] mt-1 leading-tight">
-                  Max pause between shots in the same burst. Longer pauses start a new burst.
+                  Max pause between shots in the same burst. Longer pauses start a new burst. Ranges from 1 second to 5 minutes, with the finest steps at the short end.
+                </p>
+                <p className="text-[10px] text-[#6a6b6c] mt-1 leading-tight italic">
+                  Affects grouped review (Bursts / GroupLoupe) only — not auto-cull. Auto-cull groups by visual similarity, so it uses the Similarity slider above, not this one.
                 </p>
               </div>
             </div>
@@ -785,6 +1044,99 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               </div>
             )}
 
+            {/* Backup & Restore — export the durable taste corpus + settings as
+                a portable JSON file, or restore one. The model pickle itself is
+                not included; import rebuilds it by retraining. */}
+            {modelInfo && (
+              <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+                <p className="label mb-3">Backup &amp; Restore</p>
+                <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
+                  Save the progress from your manual culling — every keep, maybe and reject the
+                  model has learned from, plus your decision settings — as a portable file. Restore
+                  it on another computer or after reinstalling.
+                </p>
+
+                {pendingImportFile ? (
+                  <div className="rounded-lg border border-[rgba(255,255,255,0.10)] bg-[#0c0d0d] p-3 space-y-3">
+                    <p className="text-xs text-[#cecece] leading-relaxed">
+                      Restore <span className="text-[#f0f0f0]">{pendingImportFile.name}</span> — how should it be applied?
+                    </p>
+                    <div className="space-y-2">
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="text-[11px] text-[#9c9c9d] leading-relaxed flex-1">
+                          <span className="text-[#cecece]">Merge</span> — add these decisions to your current model. Photos in both update in place; your settings stay unless the backup overrides them.
+                        </p>
+                        <button
+                          onClick={async () => {
+                            const f = pendingImportFile
+                            setPendingImportFile(null)
+                            if (importFileRef.current) importFileRef.current.value = ''
+                            await onImportModel(f, 'merge')
+                          }}
+                          disabled={importingModel}
+                          className={`${BTN_SECONDARY} flex-shrink-0 text-xs disabled:opacity-40 disabled:cursor-not-allowed`}
+                        >
+                          {importingModel ? 'Importing…' : 'Merge'}
+                        </button>
+                      </div>
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="text-[11px] text-[#9c9c9d] leading-relaxed flex-1">
+                          <span className="text-red-400/90">Replace</span> — wipe the current taste model and decision settings, then restore this backup exactly.
+                        </p>
+                        <button
+                          onClick={async () => {
+                            const f = pendingImportFile
+                            setPendingImportFile(null)
+                            if (importFileRef.current) importFileRef.current.value = ''
+                            await onImportModel(f, 'replace')
+                          }}
+                          disabled={importingModel}
+                          className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          {importingModel ? 'Importing…' : 'Replace'}
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setPendingImportFile(null)
+                        if (importFileRef.current) importFileRef.current.value = ''
+                      }}
+                      disabled={importingModel}
+                      className={`${BTN_SECONDARY} text-xs disabled:opacity-40 disabled:cursor-not-allowed`}
+                    >
+                      <X size={14} /> Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={onExportModel}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity border border-[rgba(255,255,255,0.10)] text-[#cecece] hover:opacity-70"
+                    >
+                      <Download size={16} /> Export backup
+                    </button>
+                    <button
+                      onClick={() => importFileRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity border border-[rgba(255,255,255,0.10)] text-[#cecece] hover:opacity-70"
+                    >
+                      <Upload size={16} /> Import backup…
+                    </button>
+                    <input
+                      ref={importFileRef}
+                      type="file"
+                      accept="application/json,.json"
+                      style={{ display: 'none' }}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0]
+                        if (f) setPendingImportFile(f)
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="rounded-lg border border-red-900/50 bg-red-950/20 p-4 space-y-4">
               <p className="text-[11px] font-semibold uppercase tracking-widest text-red-500/70">Danger zone</p>
 
@@ -822,7 +1174,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   <div className="flex-1">
                     <p className="text-xs text-[#cecece] leading-relaxed mb-1">Reload AI scoring models</p>
                     <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                      The TOPIQ-NR, TOPIQ-IAA, and SigLIP models load once at startup and stay warm in RAM. You only need this if you've manually replaced a model file on disk (pulled a new version, swapped weights) and want the running app to pick it up without restarting the backend. Existing scores aren't recomputed — only future analyses use the new weights.
+                      The TOPIQ-NR, TOPIQ-IAA, and SigLIP models load once at startup and stay warm in RAM. Use this if you've manually replaced a model file on disk (pulled a new version, swapped weights) and want the running app to pick it up without restarting the backend. It also clears a stuck model: if one fails to load, it stays disabled for the rest of the session and its scores come back blank on every photo — this retries it. Existing scores aren't recomputed — only future analyses use the new weights.
                     </p>
                   </div>
                   <button
@@ -1052,13 +1404,37 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
             <div className="border-t border-[rgba(255,255,255,0.05)]" />
 
+            {/* ── Grid filenames ── */}
+            <div>
+              <p className="label mb-1">Grid filenames</p>
+              <div className="flex items-start justify-between gap-4 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs text-[#f0f0f0]">Show filenames under thumbnails</p>
+                  <p className="text-xs text-[#9c9c9d] leading-relaxed mt-1">
+                    Displays the filename row beneath every grid tile. Turn it
+                    off for a cleaner, image-first grid — the status chips and
+                    group summary stay. Toggle anytime with{' '}
+                    <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[10px] text-[#9c9c9d]">F</kbd>.
+                  </p>
+                </div>
+                <div className="pt-0.5">
+                  <Toggle
+                    enabled={showFilenames}
+                    onChange={() => onToggleFilenames?.()}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="border-t border-[rgba(255,255,255,0.05)]" />
+
             <div>
               <p className="label mb-1">Preview source</p>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
                 When a RAW shot has a camera-baked preview alongside it (Fuji
-                .HIF or any .JPG written next to the .RAF / .NEF), choose
-                whether to show the RAW or the camera’s rendition in the grid
-                and detail view.
+                .HIF or any .JPG written next to the RAW), choose whether to
+                show the RAW or the camera’s rendition in the grid and detail
+                view.
               </p>
 
               <div className="flex items-start justify-between gap-4 py-2">
@@ -1087,10 +1463,48 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
             </div>
 
             <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+              <p className="label mb-1">RAW+JPEG grid tiles</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
+                When a shot was taken RAW+JPEG (both files land in your
+                library as separate, independently-scored tiles), choose
+                which one shows up in grid and group view. This is separate
+                from “Preview source” above — that only swaps which image is
+                rendered for a single RAW tile, it doesn’t hide anything.
+              </p>
+
+              <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingRawJpegMode ? 'opacity-50 pointer-events-none' : ''}`}>
+                {[
+                  { key: 'raw', label: 'RAW only', title: 'Show only the RAW file (RAF, NEF, 3FR, DNG, ARW, CR2, CR3)' },
+                  { key: 'processed', label: 'Processed only', title: 'Show only the compressed JPEG/HIF file' },
+                  { key: 'both', label: 'Both', title: 'Show every analyzed file as its own tile (default)' },
+                ].map(({ key, label, title }, i) => (
+                  <button
+                    key={key}
+                    onClick={() => handleRawJpegModeChange(key)}
+                    title={title}
+                    className={`px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${rawJpegMode === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
+                A photo with no companion (RAW-only or JPEG-only import)
+                always shows regardless of this setting. When set to RAW
+                only or Processed only, a K/M/R decision on the visible file
+                automatically applies to its hidden companion too, so both
+                move together — the companion's own scores are never used to
+                train your taste model, since RAW and processed renditions
+                of the same shot score very differently on sharpness.
+              </p>
+            </div>
+
+            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
               <p className="label mb-1">Reject destination</p>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
                 Where rejected photos go. By default they live in a per-folder
-                <span className="font-mono text-[#cecece]"> _Trash/</span>
+                <span className="font-mono text-[#cecece]"> _Rejects/</span>
                 subfolder. Switch on the toggle to send them to the system
                 Trash instead — they can be recovered from the Trash
                 bin until you empty it.
