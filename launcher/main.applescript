@@ -7,24 +7,34 @@
 --     launcher/build_app.sh
 --
 -- ─────────────────────────────────────────────────────────────────────────────
--- Why the backend is launched through `perl … POSIX::setsid()` and NOT `… &`:
+-- Why the backend is handed to launchd and NOT forked by this applet:
 --
--- AppleScript's `do shell script` blocks until the shell it spawns AND every
--- process still holding that shell's stdout/stderr pipe have exited. `start.sh`
--- runs `launcher.py` in the FOREGROUND, and launcher.py never returns — it
--- blocks on a long-lived rumps menu-bar run loop (plus uvicorn). So a plain
--- `./start.sh … &` (even with nohup, redirects, or `disown`) leaves the pipe
--- open forever: `do shell script` never returns, the applet's main thread is
--- wedged, and macOS shows "KaMeRa — Application Not Responding" in the Dock.
--- (The backend itself is fine — only the launcher wrapper hangs.)
+-- An applet quits the moment its script ends — and on macOS 26+ the system then
+-- terminates the processes that applet spawned, even ones detached into their
+-- own session with POSIX::setsid(). Measured 2026-09-18, twice, to the tenth of
+-- a second: applet exits at T, launcher.py takes a SIGTERM at T+0.6s, uvicorn is
+-- gone at T+1.2s. The user saw a normal-looking window whose every request then
+-- failed with "failed to fetch", because the page itself still came from the
+-- service-worker cache.
 --
--- The reliable fix is to fully DETACH the child into its own session so it
--- shares no descriptor with the shell AppleScript is waiting on. macOS has no
--- `setsid` binary, but every Mac ships Perl with POSIX: fork, setsid(), then
--- exec start.sh with all three standard descriptors redirected. `do shell
--- script` then returns in ~0.1s while the backend keeps running detached.
--- Verified: plain/nohup/disown/subshell forms all hang; this one does not.
--- Do not replace this with a bare `… &`.
+-- Two escapes were tried and measured, and both still died with the applet:
+-- the older `perl -e 'fork and exit; POSIX::setsid(); exec @ARGV'` detach, and
+-- `launchctl submit`. Neither helps, because both still run in THIS applet's
+-- bootstrap context — a new session is not a new owner.
+--
+-- `launchctl kickstart` does, because the job it starts was bootstrapped into
+-- gui/<uid> ahead of time (launcher/install_agent.sh) and therefore belongs to
+-- launchd. Provenance's own autopilot agent has survived on this machine for
+-- months on exactly that footing.
+--
+-- kickstart also solves the OTHER hazard the perl form existed for: `do shell
+-- script` blocks until every process holding the spawned shell's stdout/stderr
+-- pipe has exited, so a plain `./start.sh &` (with or without nohup/disown)
+-- wedges the applet's main thread and macOS shows "KaMeRa — Application Not
+-- Responding". kickstart hands the work to launchd and returns at once.
+--
+-- If the agent was never installed, kickstart errors and the alert below fires.
+-- Fix with: launcher/install_agent.sh
 -- ─────────────────────────────────────────────────────────────────────────────
 
 set backendUp to false
@@ -34,7 +44,7 @@ try
 end try
 
 if not backendUp then
-	do shell script "cd '/Users/philippklein/dev/kamera' && /usr/bin/perl -e 'use POSIX; fork and exit; POSIX::setsid(); exec @ARGV' ./start.sh --no-browser </dev/null >/tmp/kamera_launch.log 2>&1 &"
+	do shell script "launchctl kickstart gui/$(id -u)/com.philippklein.kamera.backend"
 
 	set started to false
 	repeat 120 times
