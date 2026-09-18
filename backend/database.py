@@ -576,6 +576,42 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
          "UPDATE folder_settings SET dest_folder = "
          "substr(dest_folder, 1, length(dest_folder) - length('/_Trash')) || '/_Rejects' "
          "WHERE decision = 'reject' AND dest_folder LIKE '%/_Trash'"),
+    # v52: a photo can now come from somewhere that is not a folder on disk.
+    # `source_type` is the DB's source of truth for which write-back backend a
+    # decision uses (backend/sources/) — never parse source_folder for this.
+    # Existing rows are all folder-sourced, which the DEFAULT backfills in one
+    # statement.
+    (52, "Add source_type to images",
+         "ALTER TABLE images ADD COLUMN source_type TEXT NOT NULL DEFAULT 'folder'"),
+    # The Apple Photos asset UUID. Deliberately NOT unique: the same asset can
+    # sit in two albums, i.e. two images rows. images.uuid stays a fresh uuid4
+    # because it is UNIQUE and is the join key for training_samples /
+    # auto_decision_log — coupling that to a foreign namespace would collide.
+    (52, "Add photos_uuid to images",
+         "ALTER TABLE images ADD COLUMN photos_uuid TEXT"),
+    (52, "Index on images.source_type",
+         "CREATE INDEX IF NOT EXISTS idx_images_source_type ON images(source_type)"),
+    (52, "Index on images.photos_uuid",
+         "CREATE INDEX IF NOT EXISTS idx_images_photos_uuid ON images(photos_uuid)"),
+    # Keeps the taste model honest: an iPhone HEIC and a RAF score on entirely
+    # different sharpness/aperture/iso distributions, so Photos decisions train
+    # their own corpus rather than polluting the camera model. Same reasoning as
+    # the RAW+JPEG companion's _train=False in decisions.py.
+    (52, "Add corpus to training_samples",
+         "ALTER TABLE training_samples ADD COLUMN corpus TEXT NOT NULL DEFAULT 'folder'"),
+    # source_folder for a Photos tab is an opaque 'photos://<lib>/<album_uuid>'
+    # key, so the human-readable album name and the owning library need a home.
+    (52, "Create photos_albums table",
+         """
+         CREATE TABLE IF NOT EXISTS photos_albums (
+             source_folder  TEXT PRIMARY KEY,
+             library_path   TEXT NOT NULL,
+             album_uuid     TEXT NOT NULL,
+             album_name     TEXT NOT NULL,
+             album_path     TEXT,
+             last_synced_at DATETIME
+         )
+         """),
 ]
 
 

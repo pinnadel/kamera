@@ -381,7 +381,7 @@ def _backfill_histograms() -> None:
 # pass the uuid to write_shooting_log without an extra SELECT.
 _INSERT_SQL = """
     INSERT INTO images (
-        file_path, filename, format, source_folder, uuid,
+        file_path, filename, format, source_folder, source_type, photos_uuid, uuid,
         camera, shot_at, focal_length_mm, aperture, shutter_speed, iso,
         sharpness_score, exposure_score, overall_score,
         highlight_clip_pct, shadow_clip_pct,
@@ -395,7 +395,7 @@ _INSERT_SQL = """
         subject_prominence_score, background_distraction_score,
         eye_contact_score, decisive_moment_score,
         analysis_status, imported_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', DATETIME('now'))
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', DATETIME('now'))
     ON CONFLICT(file_path) DO UPDATE SET
         uuid                 = COALESCE(images.uuid, excluded.uuid),
         camera               = excluded.camera,
@@ -479,8 +479,24 @@ def _build_skipped_insert_params(path: Path, exif: dict) -> tuple:
     )
 
 
-def _build_insert_params(path: Path, result: dict, exif: dict) -> tuple:
-    """Pack analysis + EXIF into the positional tuple for _INSERT_SQL."""
+def _build_insert_params(
+    path: Path,
+    result: dict,
+    exif: dict,
+    *,
+    source_folder: str | None = None,
+    filename: str | None = None,
+    source_type: str = "folder",
+    photos_uuid: str | None = None,
+) -> tuple:
+    """Pack analysis + EXIF into the positional tuple for _INSERT_SQL.
+
+    The keyword overrides exist for non-filesystem sources. An Apple Photos
+    asset lives at `originals/<hex>/<UUID>.heic`, so its real parent directory
+    is useless as a tab key and its real filename is a UUID — the album URI and
+    the asset's `original_filename` are passed in instead. The defaults
+    reproduce today's folder behaviour exactly, so that path is unaffected.
+    """
     sharpness  = result["sharpness"]
     exposure   = result["exposure"]
     face       = result["face"]
@@ -489,9 +505,14 @@ def _build_insert_params(path: Path, result: dict, exif: dict) -> tuple:
     similarity = result["similarity"]
     histogram  = result.get("histogram")
     return (
-        str(path), path.name,
+        str(path), filename or path.name,
         path.suffix.lstrip(".").upper(),
-        str(path.parent),
+        source_folder if source_folder is not None else str(path.parent),
+        source_type,
+        photos_uuid,
+        # KaMeRa's own durable id, never the Photos asset UUID: this column is
+        # UNIQUE and joins training_samples / auto_decision_log, and one asset
+        # can legitimately appear in two album tabs.
         str(_uuid.uuid4()),
         exif["camera"], exif["shot_at"],
         exif["focal_length_mm"], exif["aperture"],
@@ -667,12 +688,15 @@ RESCAN_INTERVAL_SECONDS = 10.0
 
 
 def _run_batch(
-    folder: Path,
+    folder: Path | None,
     to_analyze: list[Path],
     skipped: list[str],
     total_candidates: int,
     paused_watch_path: Any,
     include_subfolders: bool = False,
+    source_folder_override: str | None = None,
+    filename_overrides: dict[str, str] | None = None,
+    photos_uuid_overrides: dict[str, str] | None = None,
 ) -> None:
     """
     Run the batch analysis loop in a daemon thread.
@@ -771,8 +795,10 @@ def _run_batch(
                 # import still in progress. New files are appended to the live
                 # to_analyze list and total ticks up so the progress bar keeps
                 # reflecting reality instead of freezing at the original count.
+                # `folder is None` for a Photos album: membership is fixed
+                # when the batch starts and there is no directory to re-walk.
                 now = time.monotonic()
-                if now - last_rescan >= RESCAN_INTERVAL_SECONDS:
+                if folder is not None and now - last_rescan >= RESCAN_INTERVAL_SECONDS:
                     last_rescan = now
                     try:
                         found = _scan_candidates(folder, include_subfolders)
@@ -837,14 +863,26 @@ def _run_batch(
                         # RETURNING id, uuid avoids a separate SELECT round-trip after
                         # the upsert. Saves ~0.5–1ms × 741 photos = ~0.5–1s/batch.
                         inserted = conn.execute(
-                            _INSERT_SQL, _build_insert_params(file_path, result, exif)
+                            _INSERT_SQL,
+                            _build_insert_params(
+                                file_path, result, exif,
+                                source_folder=source_folder_override,
+                                filename=(filename_overrides or {}).get(str(file_path)),
+                                source_type="photos" if source_folder_override else "folder",
+                                photos_uuid=(photos_uuid_overrides or {}).get(str(file_path)),
+                            ),
                         ).fetchone()
                         if inserted is not None:
                             _personal_model.invalidate(inserted["id"])
-                            write_shooting_log(
-                                conn,
-                                **_shooting_log_kwargs(file_path, result, exif, inserted["uuid"]),
-                            )
+                            # The shooting log answers "what are my camera
+                            # habits" — focal lengths, apertures, bodies. iPhone
+                            # shots out of a Photos album would skew every
+                            # Dashboard statistic it feeds, so they stay out.
+                            if source_folder_override is None:
+                                write_shooting_log(
+                                    conn,
+                                    **_shooting_log_kwargs(file_path, result, exif, inserted["uuid"]),
+                                )
 
                     # Commit per-photo so the frontend's /images poll can see
                     # rows as they finish. Without this, SQLite holds the whole

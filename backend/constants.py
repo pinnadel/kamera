@@ -53,8 +53,16 @@ RAW_DECODE_SUFFIXES: tuple[str, ...] = tuple(
 # decision. is_standalone_hif() below is the gate: callers that walk a folder
 # for analysis candidates must skip a .hif file that has a same-stem RAW
 # sibling.
+# .heic/.heif decode through the same pillow-heif opener as .hif (registered
+# once at backend/main.py import) and burst_ranker._DIRECT_PASS_FORMATS already
+# lists them. Added 2026-09-18 for the Apple Photos source, where they are ~75%
+# of the library — note this also makes HEIC analysable in ordinary folder tabs,
+# which it previously was not.
+#
+# Unlike .hif they are never a RAW sidecar: no camera writes a RAW+HEIC pair,
+# so they need no is_standalone_hif-style gate.
 _PROCESSED_EXTS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".hif",
+    ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".hif", ".heic", ".heif",
 })
 
 # Photo file extensions the analyzer + watcher recognise. The RAW half is
@@ -194,3 +202,28 @@ def shot_at_to_unix(value) -> float | None:
 # "Could not load image" error. Canonical home — previously duplicated as
 # inline literals in routers/images.py, routers/analysis.py, file_mover.py.
 DECISION_SUBFOLDERS: frozenset[str] = frozenset({"_Keeps", "_Maybes", "_Rejects"})
+
+
+# ---------------------------------------------------------------------------
+# Non-filesystem sources
+# ---------------------------------------------------------------------------
+
+# `images.source_folder` doubles as the tab key. For an Apple Photos album
+# there is no folder, so the key is an opaque URI instead:
+#
+#     photos://<library_id>/<album_uuid>
+#
+# Deliberately not a path: Path("photos://…").exists() is False and is_dir()
+# is False, so any code that mistakes it for a directory fails loudly rather
+# than silently walking "/" or creating a "_Keeps" folder somewhere strange.
+#
+# Dispatch of write-back behaviour is by `images.source_type`, never by this
+# prefix — the prefix only exists to make the key unique and debuggable. Use
+# the helper below only for endpoints that receive a bare source_folder string
+# and have no row to look source_type up on.
+PHOTOS_SOURCE_PREFIX: str = "photos://"
+
+
+def is_photos_source_folder(source_folder: str | None) -> bool:
+    """True if this tab key names an Apple Photos album rather than a folder."""
+    return bool(source_folder) and source_folder.startswith(PHOTOS_SOURCE_PREFIX)

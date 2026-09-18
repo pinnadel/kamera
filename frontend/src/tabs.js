@@ -10,6 +10,8 @@
 export function makeNewTab() {
   return {
     id: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `t-${Date.now()}-${Math.random()}`,
+    // 'batch' = a folder on disk, 'photos' = an Apple Photos album. A tab's
+    // SOURCE, not its mode — watch-live is a separate per-tab flag.
     kind: 'batch',
     folderPath: null,
     status: 'empty',
@@ -37,16 +39,29 @@ export function makeNewTab() {
   }
 }
 
-export function makeReadyTab(folderPath) {
+export function makeReadyTab(folderPath, { kind = 'batch', label = null, libraryPath = null } = {}) {
   return {
     ...makeNewTab(),
     folderPath,
+    kind,
+    label,
+    libraryPath,
     status: 'ready',
     loaded: false,
   }
 }
 
+// A Photos-album tab. Its folderPath is the opaque `photos://<lib>/<album>`
+// key the backend uses as source_folder — never a real path, so anything that
+// does path arithmetic on folderPath has to check this first.
+export function isPhotosTab(tab) {
+  return tab?.kind === 'photos'
+}
+
 export function tabLabel(tab) {
+  // A Photos album carries its own display name: splitting its photos:// key
+  // on '/' would render a raw album UUID.
+  if (tab?.label) return tab.label
   if (!tab.folderPath) return 'New analysis'
   const segments = tab.folderPath.split('/').filter(Boolean)
   return segments[segments.length - 1] || tab.folderPath

@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 import backend.routers.decisions as decisions_mod
+import backend.sources.folder as folder_sink_mod
 import backend.routers.images as images_mod
 import backend.routers.settings as settings_mod
 from backend.database import get_db
@@ -73,7 +74,7 @@ def patched(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     monkeypatch.setattr(decisions_mod, "get_db", _get_db)
     monkeypatch.setattr(images_mod, "get_db", _get_db)
-    monkeypatch.setattr(decisions_mod, "move_photo",
+    monkeypatch.setattr(folder_sink_mod, "move_photo",
                         lambda current, dest: str(current))
     monkeypatch.setattr(decisions_mod, "maybe_train_async", lambda *_a, **_k: None)
 
@@ -285,7 +286,7 @@ def test_undo_mirrors_to_companion(
     undo would 409 on a file that was never actually moved.
     """
     from backend.file_mover import move_photo as real_move_photo
-    monkeypatch.setattr(decisions_mod, "move_photo", real_move_photo)
+    monkeypatch.setattr(folder_sink_mod, "move_photo", real_move_photo)
 
     source_folder = tmp_path / "source"
     source_folder.mkdir()

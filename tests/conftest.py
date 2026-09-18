@@ -25,3 +25,36 @@ def tmp_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "test_pca.db"
     create_tables(db_path)
     return db_path
+
+
+# ---------------------------------------------------------------------------
+# Live Apple Photos tests
+# ---------------------------------------------------------------------------
+
+#: Only this library may be written to by tests. The name check — not merely
+#: "is a library open" — is the interlock: without it, running `pytest` on a
+#: normal day would write KaMeRa keywords into the real library, and the user
+#: would have to hunt them down afterwards.
+PHOTOS_TEST_LIBRARY_NAME = "KaMeRa-Test"
+
+
+@pytest.fixture(scope="session")
+def photos_test_library() -> str:
+    """Path to the test library, or skip.
+
+    Setup instructions live in docs/PLAN-photos-source.md.
+    """
+    from backend import photos_library
+
+    if not photos_library.is_available():
+        pytest.skip("Apple Photos support unavailable on this system")
+
+    current = photos_library.current_library_path()
+    if not current:
+        pytest.skip("No Photos library is open")
+    if Path(current).stem != PHOTOS_TEST_LIBRARY_NAME:
+        pytest.skip(
+            f"Photos has {Path(current).stem!r} open, not "
+            f"{PHOTOS_TEST_LIBRARY_NAME!r} — refusing to write to a real library"
+        )
+    return current

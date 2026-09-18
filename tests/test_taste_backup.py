@@ -146,7 +146,9 @@ def test_export_empty_corpus_is_valid(backup_env: Path) -> None:
     resp = model_mod.export_taste_model()
     payload = json.loads(resp.body)
     assert payload["format"] == "kamera-taste-model"
-    assert payload["format_version"] == 1
+    # Compare to the constant, not a literal — this assertion is about the
+    # envelope being well-formed, not about pinning a particular version.
+    assert payload["format_version"] == model_mod._BACKUP_FORMAT_VERSION
     assert payload["training_samples"] == []
     assert payload["settings"] == {}
     assert payload["app"]["feature_schema_version"] == FEATURE_SCHEMA_VERSION

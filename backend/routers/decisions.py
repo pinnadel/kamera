@@ -13,12 +13,8 @@ from pydantic import BaseModel
 
 from backend.constants import is_raw_format, companion_stem_matches, shot_at_to_unix as _shot_at_to_unix
 from backend.database import get_db, get_folder_overrides, get_setting
-from backend.file_mover import (
-    _KEEPS_REVIEWED_SUBFOLDER,
-    move_photo,
-    resolve_dest_folder,
-    trash_photo,
-)
+from backend.constants import is_photos_source_folder
+from backend.sources import sink_for
 from backend.routers.settings import get_raw_jpeg_display_mode
 from backend.state import _decision_move_lock, _personal_model
 from phase3_learning.auto_trainer import maybe_train_async
@@ -111,17 +107,6 @@ def _all_faces_eyes_closed(row: dict, face_count: int) -> bool:
         except (ValueError, TypeError):
             pass  # malformed JSON — fall through to count-based fallback
     return face_count <= 1
-
-
-def _reject_to_system_trash_enabled() -> bool:
-    """Read the `reject_to_system_trash` toggle. Default False — preserve the
-    existing _Rejects/ folder behaviour for users who want their rejects on
-    disk. When True, rejected photos go to the OS system Trash via
-    send2trash instead, and can be recovered from the Trash / Recycle Bin."""
-    raw = get_setting("reject_to_system_trash")
-    if raw is None:
-        return False
-    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _compute_auto_decision(
@@ -354,10 +339,12 @@ def _apply_decision(
         raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
     image_row = dict(image)
-    current_path  = image_row["file_path"]
-    source_folder = image_row.get("source_folder")
 
-    use_system_trash = decision == "reject" and _reject_to_system_trash_enabled()
+    # Where this decision is committed depends on where the photo came from:
+    # a folder move, or a keyword on an Apple Photos asset. See
+    # backend/sources/base.py.
+    sink = sink_for(image_row)
+    sink.preflight()
 
     # Hold _decision_move_lock across "file physically moved" → "images.file_path
     # updated to match". POST /sync-folder checks Path(file_path).exists() to
@@ -366,41 +353,7 @@ def _apply_decision(
     # and delete a row for a photo that's perfectly safe on disk. See the
     # incident note on _decision_move_lock in backend/state.py.
     with _decision_move_lock:
-        if use_system_trash:
-            try:
-                new_path = trash_photo(current_path)
-            except FileNotFoundError as exc:
-                raise HTTPException(status_code=409, detail=str(exc))
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"Trash failed: {exc}")
-        else:
-            # Default subfolder lives next to the photo at *ingest time* — mirrors
-            # the subfolder shape from recursive analysis (a photo in /root/Italy/
-            # goes to /root/Italy/_Keeps/ not /root/_Keeps/) while staying correct
-            # on re-decisions. Using `Path(current_path).parent` here would nest
-            # _Keeps/_Maybes/ when K→M because the photo has already been moved
-            # into _Keeps. `images.source_folder` is the durable ingest parent,
-            # captured at analysis time (analysis.py:424), so it always points to
-            # the original location regardless of intermediate moves.
-            photo_parent = source_folder or str(Path(current_path).parent)
-            overrides = get_folder_overrides(photo_parent)
-            # A manual keep (is_auto=False) already IS the human review
-            # Provenance's gate exists to guarantee — route it straight to
-            # _Keeps/_Keeps_reviewed so it skips the extra "mark reviewed"
-            # step. Auto-cull keeps (is_auto=True) land in plain _Keeps and
-            # wait for a human to confirm via mark_reviewed(). See
-            # docs/PLAN-keeps-reviewed.md.
-            dest_folder = resolve_dest_folder(
-                decision, photo_parent, overrides,
-                reviewed=(decision == "keep" and not is_auto),
-            )
-
-            try:
-                new_path = move_photo(current_path, dest_folder)
-            except FileNotFoundError as exc:
-                raise HTTPException(status_code=409, detail=str(exc))
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
+        new_path = sink.apply(image_row, decision, is_auto=is_auto)
 
         with get_db() as conn:
             conn.execute(
@@ -450,6 +403,12 @@ def _apply_decision(
         # only from the user's own judgments, not from its own predictions.
         # A later manual decision on the same photo (override or confirm)
         # comes through with is_auto=False and INSERTs the sample then.
+        #
+        # `corpus` partitions the training set by source_type. An iPhone HEIC
+        # out of a Photos album and a RAF off the camera score on entirely
+        # different sharpness / aperture / iso distributions, so folding them
+        # into one GBR would teach it contradictory labels — the same reason
+        # the RAW+JPEG companion mirror passes _train=False.
         sample_uuid = image_row.get("uuid")
         if is_auto or not _train:
             pass  # system decision, or a mirrored companion write — not a training sample
@@ -458,13 +417,14 @@ def _apply_decision(
                 conn.execute(
                     """
                     INSERT INTO training_samples
-                        (sample_uuid, decision, features_json, overall_score, schema_version, decided_at)
-                    VALUES (?, ?, ?, ?, ?, DATETIME('now'))
+                        (sample_uuid, decision, features_json, overall_score, schema_version, corpus, decided_at)
+                    VALUES (?, ?, ?, ?, ?, ?, DATETIME('now'))
                     ON CONFLICT(sample_uuid) DO UPDATE SET
                         decision       = excluded.decision,
                         features_json  = excluded.features_json,
                         overall_score  = excluded.overall_score,
                         schema_version = excluded.schema_version,
+                        corpus         = excluded.corpus,
                         decided_at     = excluded.decided_at
                     """,
                     (
@@ -473,6 +433,7 @@ def _apply_decision(
                         serialize_features(image_row),
                         image_row.get("overall_score"),
                         FEATURE_SCHEMA_VERSION,
+                        image_row.get("source_type") or "folder",
                     ),
                 )
             except Exception as exc:
@@ -494,7 +455,12 @@ def _apply_decision(
     # saw and judged one tile, but both files represent the same shot and
     # should carry the same decision. Best-effort: a companion-move failure
     # must never fail the visible photo's own (already-committed) decision.
-    if _mirror:
+    # Gated on the sink: a RAW/JPEG pair in a FOLDER is two files that must move
+    # together. In a Photos album there is nothing to keep in sync — and
+    # _find_companion_image_id matches on source_folder + filename stem, so two
+    # same-stem assets in one album would pair up and mirror a keyword onto a
+    # photo the user never judged.
+    if _mirror and sink.supports_companion_mirror:
         companion_id = _find_companion_image_id(image_row)
         if companion_id is not None and _companion_is_hidden(companion_id):
             try:
@@ -525,6 +491,10 @@ def _move_to_reviewed(image_id: int, _mirror: bool = True) -> dict:
     `_Keeps_reviewed`) — both are 400s, not silent no-ops, since calling
     this on the wrong photo is a caller bug, not a race.
 
+    Also stamps `decisions.reason = 'manual'` so the photo counts as
+    human-confirmed everywhere the UI asks that question — no training
+    sample is written (see the inline note below).
+
     Mirrors onto a hidden RAW/JPEG companion the same way _apply_decision
     does, so both files of a pair release to Provenance together.
     """
@@ -536,7 +506,16 @@ def _move_to_reviewed(image_id: int, _mirror: bool = True) -> dict:
         raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
     image_row = dict(image)
-    current_path = Path(image_row["file_path"])
+
+    sink = sink_for(image_row)
+    if not sink.supports_mark_reviewed:
+        # No _Keeps folder exists to promote out of. A Photos album records the
+        # decision as a keyword; there is no second location to move it to.
+        raise HTTPException(
+            status_code=400,
+            detail="Mark reviewed is not available for this source",
+        )
+    sink.preflight()
 
     with get_db() as conn:
         decision_row = conn.execute(
@@ -545,31 +524,36 @@ def _move_to_reviewed(image_id: int, _mirror: bool = True) -> dict:
     if decision_row is None or decision_row["decision"] != "keep":
         raise HTTPException(status_code=400, detail="Photo is not decided 'keep'")
 
-    parts = current_path.parts
-    if "_Keeps" not in parts:
-        raise HTTPException(status_code=400, detail="Photo is not currently in _Keeps")
-    if _KEEPS_REVIEWED_SUBFOLDER in parts:
-        raise HTTPException(status_code=400, detail="Photo is already in _Keeps_reviewed")
-
-    keeps_idx = parts.index("_Keeps")
-    keeps_folder = Path(*parts[: keeps_idx + 1])
-    dest_folder = keeps_folder / _KEEPS_REVIEWED_SUBFOLDER
-
     with _decision_move_lock:
-        try:
-            new_path = move_photo(current_path, dest_folder)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
+        new_path = sink.mark_reviewed(image_row)
 
         with get_db() as conn:
             conn.execute(
                 "UPDATE images SET file_path = ? WHERE id = ?",
                 (new_path, image_id),
             )
+            # Stamp the decision as human-seen. 'manual' is the frontend's
+            # single source of truth for "I already looked at this photo"
+            # (ui/format.js::isUnconfirmed), so the "only unconfirmed" grid
+            # filter can hide it in every bucket without re-deriving the
+            # answer from the file path. Deliberately does NOT write a
+            # training sample: marking reviewed means "I looked", not "here
+            # is a label" — a bulk review must never feed the model its own
+            # auto-cull output (see _apply_decision's is_auto note). The
+            # pre-review reason ('personal_keep', etc.) is not lost; it lives
+            # on in the durable auto_decision_log row written back when the
+            # auto-cull decided this photo.
+            conn.execute(
+                "UPDATE decisions SET reason = 'manual' WHERE image_id = ?",
+                (image_id,),
+            )
 
-    if _mirror:
+    # Gated on the sink: a RAW/JPEG pair in a FOLDER is two files that must move
+    # together. In a Photos album there is nothing to keep in sync — and
+    # _find_companion_image_id matches on source_folder + filename stem, so two
+    # same-stem assets in one album would pair up and mirror a keyword onto a
+    # photo the user never judged.
+    if _mirror and sink.supports_companion_mirror:
         companion_id = _find_companion_image_id(image_row)
         if companion_id is not None and _companion_is_hidden(companion_id):
             try:
@@ -657,59 +641,13 @@ def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) 
     current_path  = image_row["file_path"]
     sample_uuid   = image_row.get("uuid")
 
-    # Per-photo undo path: when the caller didn't supply a previous_path
-    # (i.e. the undo isn't replaying a recent action, it's "send this
-    # photo home"), move the file UP out of the K/M/R subfolder (and, for a
-    # reviewed keep, the extra _Keeps_reviewed level too). This handles four
-    # cases correctly:
-    #   - Default subfolders: .../source/_Keeps/photo.JPG → .../source/photo.JPG
-    #   - Subfolder analysis: .../source/sub/_Keeps/photo.JPG → .../source/sub/photo.JPG
-    #   - Custom override:    /any/where/MyKeeps/photo.JPG  → /any/where/photo.JPG
-    #   - Reviewed keep:      .../source/_Keeps/_Keeps_reviewed/photo.JPG → .../source/photo.JPG
-    # Using `images.source_folder + filename` would flatten subfolder structure
-    # and break custom-override undo. Filename comes from the live file (not the
-    # DB) so any de-dup suffix added by `_claim_path` during the original move
-    # comes along for the round trip.
-    if previous_path is None:
-        filename = Path(current_path).name
-        parent = Path(current_path).parent
-        # A reviewed keep sits two levels deep (_Keeps/_Keeps_reviewed/photo)
-        # instead of one (_Keeps/photo) — strip the extra level first so
-        # "home" lands outside _Keeps either way.
-        if parent.name == _KEEPS_REVIEWED_SUBFOLDER:
-            parent = parent.parent
-        home = parent.parent
-        previous_path = str(home / filename)
-
-    # Already at home (e.g. someone manually moved the file back, or path
-    # normalization quirks): skip the move and just clear DB state.
-    already_home = (
-        os.path.normpath(current_path).lower()
-        == os.path.normpath(previous_path).lower()
-    )
+    sink = sink_for(image_row)
+    sink.preflight()
 
     # Same move-then-update race as _apply_decision — see the incident note
     # on _decision_move_lock in backend/state.py.
     with _decision_move_lock:
-        new_path = current_path
-        if not already_home:
-            if not Path(current_path).exists():
-                raise HTTPException(
-                    status_code=409,
-                    detail="File missing — cannot undo (may be in system Trash)",
-                )
-            prev_parent = Path(previous_path).parent
-            if not prev_parent.exists():
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Source folder no longer exists: {prev_parent}",
-                )
-            try:
-                new_path = move_photo(current_path, prev_parent)
-            except FileNotFoundError as exc:
-                raise HTTPException(status_code=409, detail=str(exc))
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"File move failed: {exc}")
+        new_path = sink.undo(image_row, previous_path)
 
         with get_db() as conn:
             conn.execute(
@@ -738,7 +676,12 @@ def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) 
     # companion-hidden test: display setting OR an unscored jpeg_priority
     # skip row). Best-effort: a companion with nothing to undo (409) or a
     # missing companion file is silently skipped rather than failing this undo.
-    if _mirror:
+    # Gated on the sink: a RAW/JPEG pair in a FOLDER is two files that must move
+    # together. In a Photos album there is nothing to keep in sync — and
+    # _find_companion_image_id matches on source_folder + filename stem, so two
+    # same-stem assets in one album would pair up and mirror a keyword onto a
+    # photo the user never judged.
+    if _mirror and sink.supports_companion_mirror:
         companion_id = _find_companion_image_id(image_row)
         if companion_id is not None and _companion_is_hidden(companion_id):
             try:
@@ -839,7 +782,7 @@ def trash_rejects():
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT i.id, i.file_path
+            SELECT i.id, i.file_path, i.source_type
             FROM images i
             INNER JOIN decisions d ON d.image_id = i.id
             WHERE d.decision = 'reject'
@@ -848,13 +791,22 @@ def trash_rejects():
 
     trashed: int = 0
     skipped_missing: int = 0
+    skipped_unsupported: int = 0
     errors: list[dict] = []
     ids_to_delete: list[int] = []
 
     for row in rows:
         file_path = row["file_path"]
+        # This endpoint is not tab-scoped — it sweeps every reject in the DB.
+        # A source that cannot delete (Apple Photos: neither AppleScript nor,
+        # from this process, PhotoKit can remove an asset) is skipped rather
+        # than attempted, and its row is kept so the rejection survives.
+        sink = sink_for(dict(row))
+        if not sink.supports_bulk_trash:
+            skipped_unsupported += 1
+            continue
         try:
-            trash_photo(file_path)
+            sink.bulk_trash(dict(row))
             ids_to_delete.append(row["id"])
             trashed += 1
         except FileNotFoundError:
@@ -885,6 +837,7 @@ def trash_rejects():
     return {
         "trashed": trashed,
         "skipped_missing": skipped_missing,
+        "skipped_unsupported": skipped_unsupported,
         "failed": len(errors) - skipped_missing,
         "errors": errors,
     }
@@ -906,6 +859,12 @@ def auto_cull_preview(
     dedup deliberately does NOT use the grouping time-gap (see
     _group_undecided_into_bursts); grouping here is visual-similarity only.
     """
+    if is_photos_source_folder(source_folder):
+        raise HTTPException(
+            status_code=400,
+            detail="Auto-cull is not available for Photos albums — it runs on "
+                   "the personal model, which is trained on camera photos only",
+        )
     with get_db() as conn:
         if source_folder is not None:
             rows = conn.execute(
@@ -913,6 +872,10 @@ def auto_cull_preview(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                   AND i.source_folder = ?
                 """,
                 (source_folder,),
@@ -923,6 +886,10 @@ def auto_cull_preview(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                 """
             ).fetchall()
 
@@ -1465,6 +1432,12 @@ def run_auto_cull(
     dedup groups by visual similarity ONLY, not the grouping time-gap (see
     _group_undecided_into_bursts for why the time-gap was inert on fast bursts).
     """
+    if is_photos_source_folder(source_folder):
+        raise HTTPException(
+            status_code=400,
+            detail="Auto-cull is not available for Photos albums — it runs on "
+                   "the personal model, which is trained on camera photos only",
+        )
     with get_db() as conn:
         if source_folder is not None:
             rows = conn.execute(
@@ -1472,6 +1445,10 @@ def run_auto_cull(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                   AND i.source_folder = ?
                 """,
                 (source_folder,),
@@ -1482,6 +1459,10 @@ def run_auto_cull(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
+                  -- Auto-cull is folder-only: it runs on the personal
+                  -- model, which trains on the folder corpus and has
+                  -- never seen a Photos album's distribution.
+                  AND i.source_type = 'folder'
                 """
             ).fetchall()
 

@@ -61,11 +61,42 @@ def resolve_dest_folder(
     else:
         base = Path(source_folder) / _DECISION_FOLDERS[decision]
     if decision == "keep" and reviewed:
-        return base / _KEEPS_REVIEWED_SUBFOLDER
+        base = base / _KEEPS_REVIEWED_SUBFOLDER
+    # Catches a folder_settings override aimed into a Photos library before the
+    # destination ever reaches move_photo's mkdir.
+    _assert_outside_photos_library(base)
     return base
 
 
 _SIDECAR_EXTS: tuple[str, ...] = (".hif", ".HIF")
+
+
+def _assert_outside_photos_library(path: str | Path) -> None:
+    """
+    Refuse any filesystem mutation on a file inside an Apple Photos library.
+
+    A `.photoslibrary` package is a database, not a folder. Photos tracks every
+    asset by path in its own sqlite catalogue; moving, renaming or trashing a
+    file inside the package corrupts that catalogue irrecoverably — the photo
+    becomes an unreferenced blob and the library needs a rebuild to notice.
+
+    This module is the process's ONLY filesystem-mutation surface for photos
+    (nothing else in the repo calls shutil.move or send2trash on an image), so
+    refusing here makes library damage impossible for any caller, present or
+    future — not merely avoided by whoever remembered to check. The Photos
+    source type writes decisions as keywords via AppleScript and never routes
+    through this module at all; this guard exists for the paths that *don't*
+    know about Photos, e.g. a folder_settings override pointing into a library.
+
+    Matched on the parts of the RESOLVED path, so a symlink aimed into a
+    library is caught too, and a file merely *named* "...photoslibrary.RAF"
+    is not.
+    """
+    for part in Path(path).resolve(strict=False).parts:
+        if part.lower().endswith(".photoslibrary"):
+            raise OSError(
+                f"Refusing to touch a file inside a Photos library package: {path}"
+            )
 
 
 def move_photo(current_path: str | Path, dest_folder: str | Path) -> str:
@@ -87,6 +118,9 @@ def move_photo(current_path: str | Path, dest_folder: str | Path) -> str:
     """
     src = Path(current_path)
     dst_dir = Path(dest_folder)
+
+    _assert_outside_photos_library(src)
+    _assert_outside_photos_library(dst_dir)
 
     if src.is_symlink():
         raise OSError(f"Refusing to move symlink: {src}")
@@ -135,6 +169,7 @@ def trash_photo(current_path: str | Path) -> str:
     caller since the file is no longer addressable in the working tree.
     """
     src = Path(current_path)
+    _assert_outside_photos_library(src)
     if src.is_symlink():
         raise OSError(f"Refusing to trash symlink: {src}")
     if not src.exists():
@@ -157,6 +192,7 @@ def trash_photo(current_path: str | Path) -> str:
     logger.info("Trashed %s (system trash)", src)
     for sidecar in sidecars:
         try:
+            _assert_outside_photos_library(sidecar)
             send2trash(str(sidecar))
             logger.info("Trashed sidecar %s", sidecar.name)
         except OSError as e:

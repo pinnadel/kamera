@@ -182,7 +182,12 @@ def personal_model_info():
       min_decisions      — minimum samples required to train (30)
       decided_count      — how many durable training samples exist right now
                            (read from training_samples, not decisions — these
-                           persist across Clear Analysis / folder moves)
+                           persist across Clear Analysis / folder moves).
+                           Scoped to corpus='folder': this model never sees
+                           Photos-album decisions.
+      photos_sample_count— Photos-album decisions recorded so far. Kept in a
+                           separate corpus and not trained on yet; surfaced so
+                           Settings can show the corpus growing.
       trained_at         — ISO-8601 timestamp of last training run (or null)
       top_features       — all feature importances, descending [{name, importance}]
       auto_running       — bool, true if a background train is in flight
@@ -192,9 +197,15 @@ def personal_model_info():
                            the next auto-train will pick up
     """
     with get_db() as conn:
-        decided_count = conn.execute("SELECT COUNT(*) FROM training_samples").fetchone()[0]
+        decided_count = conn.execute(
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = 'folder'"
+        ).fetchone()[0]
+        photos_sample_count = conn.execute(
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = 'photos'"
+        ).fetchone()[0]
     info = _personal_model.info()
     info["decided_count"] = decided_count
+    info["photos_sample_count"] = photos_sample_count
     info.update(_auto_train_snapshot())
     info["pending_samples"] = max(0, decided_count - (info.get("training_size") or 0))
     return info
@@ -227,7 +238,8 @@ def reset_personal_model():
     """
     Destructive: clear all personal-model training progress.
 
-    Deletes every row in training_samples and pairwise_comparisons, removes
+    Deletes every folder-corpus row in training_samples (Photos-album samples
+    are kept — they belong to a separate corpus) and all pairwise_comparisons, removes
     the persisted personal_model.pkl, and resets the in-memory model so the
     banner falls back to 0/50. Decisions on photos (K/M/R) and analysis
     results are preserved — only the learned model and its inputs are wiped.
@@ -236,7 +248,10 @@ def reset_personal_model():
     """
     try:
         with get_db() as conn:
-            cur = conn.execute("DELETE FROM training_samples")
+            # Scoped to the corpus this model actually trains on. Resetting the
+            # camera model must not discard the Photos corpus being collected
+            # for a future second model.
+            cur = conn.execute("DELETE FROM training_samples WHERE corpus = 'folder'")
             samples_removed = cur.rowcount
             cur = conn.execute("DELETE FROM pairwise_comparisons")
             pairwise_removed = cur.rowcount
@@ -268,7 +283,12 @@ def reset_personal_model():
 # ---------------------------------------------------------------------------
 
 _BACKUP_FORMAT = "kamera-taste-model"
-_BACKUP_FORMAT_VERSION = 1
+# v2 (2026-09-18): training_samples rows carry `corpus`. A v1 backup has no
+# such field and its rows are read as corpus="folder", which is correct —
+# v1 predates the Photos source entirely. The version is bumped so an older
+# app REFUSES a v2 backup rather than silently folding Photos samples into
+# the camera corpus.
+_BACKUP_FORMAT_VERSION = 2
 _MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB — a 100k-sample corpus is well under this
 
 
@@ -277,7 +297,9 @@ def export_taste_model():
     """
     Export the personal taste model's durable state as a portable JSON backup.
 
-    Contents: the full training_samples corpus + pairwise_comparisons + the
+    Contents: every training_samples row across ALL corpora (each tagged with
+    its `corpus`, so a restore puts folder and Photos samples back where they
+    belong) + pairwise_comparisons + the
     user-tunable settings (decision thresholds/weights). The trained pickle is
     intentionally excluded — import rebuilds it via retrain. Returns a
     downloadable attachment; an empty corpus is a valid (never 404) export.
@@ -288,7 +310,7 @@ def export_taste_model():
         samples = [
             dict(r) for r in conn.execute(
                 "SELECT sample_uuid, decision, features_json, overall_score, "
-                "schema_version, decided_at FROM training_samples"
+                "schema_version, corpus, decided_at FROM training_samples"
             ).fetchall()
         ]
         pairwise = [
@@ -408,13 +430,14 @@ async def import_taste_model(request: Request, mode: str = "merge"):
                 """
                 INSERT INTO training_samples
                     (sample_uuid, decision, features_json, overall_score,
-                     schema_version, decided_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     schema_version, corpus, decided_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sample_uuid) DO UPDATE SET
                     decision       = excluded.decision,
                     features_json  = excluded.features_json,
                     overall_score  = excluded.overall_score,
                     schema_version = excluded.schema_version,
+                    corpus         = excluded.corpus,
                     decided_at     = excluded.decided_at
                 """,
                 [
@@ -424,6 +447,8 @@ async def import_taste_model(request: Request, mode: str = "merge"):
                         s.get("features_json"),
                         s.get("overall_score"),
                         s.get("schema_version", FEATURE_SCHEMA_VERSION),
+                        # v1 backups predate the Photos source — folder is right.
+                        s.get("corpus") or "folder",
                         s.get("decided_at"),
                     )
                     for s in valid_samples

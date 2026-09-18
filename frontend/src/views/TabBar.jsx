@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Plus, X } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Folder, Images, Plus, X } from 'lucide-react'
 import { tabLabel } from '../tabs'
 
 function TabItem({ tab, isActive, isDragOver, dragHandlers, onSelect, onClose, watchingTabName }) {
@@ -75,8 +75,57 @@ function TabItem({ tab, isActive, isDragOver, dragHandlers, onSelect, onClose, w
 // TabBar — slots inline into the app bar row as a flex-1 child.
 // Closable tabs scroll horizontally; the new-analysis button sits
 // inline at the end rather than pinned to the far right.
-export function TabBar({ tabs, activeTabId, onSelect, onClose, onReorder, onTrailingClick }) {
+
+// Two-item source picker hung off the "+" button.
+//
+// Closes on a document mousedown rather than a `fixed inset-0` backdrop: the
+// tab bar sits inside a transformed ancestor, where a fixed backdrop is
+// positioned against that ancestor instead of the viewport and stops
+// receiving the clicks it is supposed to catch. The data-dropdown marker is
+// how the listener recognises its own trigger and menu.
+function SourceMenu({ onClose, onFolder, onPhotos }) {
+  useEffect(() => {
+    const onDown = (e) => {
+      if (e.target.closest('[data-dropdown="true"]')) return
+      onClose()
+    }
+    const onKey = (e) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [onClose])
+
+  return (
+    <div
+      data-dropdown="true"
+      className="absolute left-0 top-full mt-1 z-50 w-44 bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] rounded-lg py-1 shadow-xl"
+    >
+      <button
+        onClick={onFolder}
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#151618] transition-colors"
+      >
+        <Folder size={14} className="text-[#6a6b6c]" />
+        <span className="text-xs text-[#f0f0f0]">Folder…</span>
+      </button>
+      <button
+        onClick={onPhotos}
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#151618] transition-colors"
+      >
+        <Images size={14} className="text-[#6a6b6c]" />
+        <span className="text-xs text-[#f0f0f0]">Photos album…</span>
+      </button>
+    </div>
+  )
+}
+
+export function TabBar({ tabs, activeTabId, onSelect, onClose, onReorder, onTrailingClick, onTrailingPhotosClick }) {
   const [dragId, setDragId] = useState(null)
+  // Source menu on '+'. Only shown when a Photos handler is wired, so the
+  // button keeps its original one-click behaviour everywhere else.
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false)
   const [dragOverId, setDragOverId] = useState(null)
   const trailingTab  = tabs[tabs.length - 1]
   const closableTabs = tabs.slice(0, -1)
@@ -109,14 +158,34 @@ export function TabBar({ tabs, activeTabId, onSelect, onClose, onReorder, onTrai
     <div className="flex items-center gap-1 flex-1 min-w-0">
       {/* New analysis — small icon button to the left of the tab pills */}
       {trailingTab && (
-        <button
-          onClick={() => (onTrailingClick ? onTrailingClick(trailingTab.id) : onSelect(trailingTab.id))}
-          className="new-analysis-btn w-8 h-8 flex-shrink-0 rounded-[6px] flex items-center justify-center mr-1"
-          title="Start a new analysis"
-          aria-label="Start a new analysis"
-        >
-          <Plus size={16} strokeWidth={2} />
-        </button>
+        <div className="relative flex-shrink-0 mr-1">
+          <button
+            onClick={() => {
+              if (onTrailingPhotosClick) { setSourceMenuOpen(o => !o); return }
+              return onTrailingClick ? onTrailingClick(trailingTab.id) : onSelect(trailingTab.id)
+            }}
+            className="new-analysis-btn w-8 h-8 rounded-[6px] flex items-center justify-center"
+            title="Start a new analysis"
+            aria-label="Start a new analysis"
+            data-dropdown="true"
+          >
+            <Plus size={16} strokeWidth={2} />
+          </button>
+
+          {sourceMenuOpen && (
+            <SourceMenu
+              onClose={() => setSourceMenuOpen(false)}
+              onFolder={() => {
+                setSourceMenuOpen(false)
+                return onTrailingClick ? onTrailingClick(trailingTab.id) : onSelect(trailingTab.id)
+              }}
+              onPhotos={() => {
+                setSourceMenuOpen(false)
+                onTrailingPhotosClick(trailingTab.id)
+              }}
+            />
+          )}
+        </div>
       )}
 
       {/* Scrollable tab pills */}

@@ -5,10 +5,31 @@
 // lands in _Keeps_reviewed directly (Piece 1), so this is false for those.
 export function needsReview(image) {
   if (image?.decision !== 'keep') return false
+  // A Photos asset never sits in a _Keeps folder — there is no promotion step
+  // to offer. The path check below would already say false for a library path,
+  // but stating it on the source is the honest version of that answer.
+  if (image?.source_type === 'photos') return false
   const path = image?.file_path
   if (!path) return false
   const parts = path.split('/')
   return parts.includes('_Keeps') && !parts.includes('_Keeps_reviewed')
+}
+
+// "Have I personally looked at this photo yet?" — the grid's "only
+// unconfirmed" filter. Source of truth is decisions.reason (surfaced by
+// GET /images): 'manual' is written by every human K/M/R and by Mark
+// reviewed, every other value names the auto-cull rule that fired.
+//
+// null counts as unconfirmed on purpose, and covers two cases: a photo with
+// no decision at all (open work — it belongs in the filter), and a decision
+// made before migration v49 added the column. Erring toward "show it" is the
+// safe direction; the opposite would let an unseen photo slip through a bulk
+// trash action.
+//
+// Distinct from needsReview() above: that one is keep-only and path-based,
+// and answers the narrower Provenance question "may this be archived yet?".
+export function isUnconfirmed(image) {
+  return image?.reason !== 'manual'
 }
 
 export function formatEta(seconds) {

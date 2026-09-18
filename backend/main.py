@@ -84,6 +84,7 @@ from backend.routers import (
     images,
     model,
     pairwise,
+    photos,
     search,
     settings,
     system,
@@ -137,6 +138,7 @@ app.include_router(decisions.router)
 app.include_router(images.router)
 app.include_router(model.router)
 app.include_router(pairwise.router)
+app.include_router(photos.router)
 app.include_router(search.router)
 app.include_router(settings.router)
 app.include_router(system.router)

@@ -43,6 +43,7 @@ import {
   CircleDot,
   Columns2,
   ExternalLink,
+  Eye,
   Folder,
   FolderInput as FolderInputIcon,
   FolderTree,
@@ -67,8 +68,8 @@ import {
 } from 'lucide-react'
 import { MoveIntoGroupModal } from './modals/MoveIntoGroupModal'
 import { API } from './api'
-import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, ACTIVE_TOGGLE } from './ui/buttons'
-import { formatEta, formatDuration, needsReview } from './ui/format'
+import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, ACTIVE_TOGGLE, ACTIVE_PILL } from './ui/buttons'
+import { formatEta, formatDuration, needsReview, isUnconfirmed } from './ui/format'
 import { Spinner, DecisionWord, Toggle } from './ui/primitives'
 import { DownloadToast, ToastStack } from './ui/toasts'
 import { ShortcutsModal } from './modals/ShortcutsModal'
@@ -88,10 +89,12 @@ import { TrainingModeView } from './views/TrainingModeView'
 import { PairwiseTrainingView } from './views/PairwiseTrainingView'
 import { DashboardView } from './views/DashboardView'
 import { TabBar } from './views/TabBar'
+import PhotosAlbumPicker from './modals/PhotosAlbumPicker'
 import { TabFoldersForm } from './views/TabFoldersForm'
 import { PersonalModelBanner } from './views/PersonalModelBanner'
+import { PhotosLibraryBanner } from './views/PhotosLibraryBanner'
 import { BannerStates } from './views/BannerStates'
-import { makeNewTab, makeReadyTab, tabLabel } from './tabs'
+import { makeNewTab, makeReadyTab, tabLabel, isPhotosTab } from './tabs'
 import { buildTrainingQueue } from './training'
 import { usePolling } from './hooks/usePolling'
 import { useTabs } from './hooks/useTabs'
@@ -103,6 +106,7 @@ import { useSettings } from './hooks/useSettings'
 import { useHideOnScroll } from './hooks/useHideOnScroll'
 import { useGroupScrub } from './hooks/useGroupScrub'
 import { useSort } from './hooks/useSort'
+import { useLocalStorageState } from './hooks/useLocalStorageState'
 import { compareImages as sortComparator } from './sortMetrics'
 import { SortPill } from './ui/SortPill'
 import { FilterPill } from './ui/FilterPill'
@@ -162,6 +166,12 @@ export default function App() {
   }, [advanceDir])
   const [toasts, setToasts]               = useState([])
   const [decisionFilter, setDecisionFilter] = useState(null)
+  // "Only unconfirmed" — hides every photo already carrying a human verdict
+  // (decisions.reason === 'manual'), in whichever bucket it currently sits.
+  // Stacks with decisionFilter rather than replacing it, so it works both as
+  // "the rest of my work, everywhere" (All view) and as a per-bucket queue.
+  // Persisted: a culling session spans reloads.
+  const [unconfirmedOnly, setUnconfirmedOnly] = useLocalStorageState('pca.unconfirmedOnly', false)
   // searchInput is the immediately-controlled input value. searchQuery is
   // the debounced value that flows into filtering and HighlightedText. With
   // 741 cards each running a HighlightedText loop, every keystroke previously
@@ -427,6 +437,10 @@ export default function App() {
     setResultDismissed,
     loadImages,
     runAnalysisForTab,
+    runPhotosAnalysisForTab,
+    photosPickerRequest,
+    startPhotosAnalysis,
+    dismissPhotosPicker,
     stopAnalysis,
     stopping,
     errorsExpanded,
@@ -858,7 +872,7 @@ export default function App() {
     const result = await _sendGroupDecision(imageId, decision)
     if (result) {
       setImages(prev => prev.map(img =>
-        img.id === imageId ? { ...img, decision: result.decision, file_path: result.new_path } : img
+        img.id === imageId ? { ...img, decision: result.decision, file_path: result.new_path, reason: 'manual' } : img
       ))
       undoStack.push({
         kind: 'decision',
@@ -995,6 +1009,18 @@ export default function App() {
     reject:    images.filter(img => img.decision === 'reject').length,
   }), [images])
 
+  // How many photos in the CURRENT bucket still carry no human verdict — the
+  // "Only unconfirmed" pill's badge. Scoped to the active decision filter so
+  // the number always answers "how much is left in front of me right now";
+  // on the All view that widens to the whole remaining workload, undecided
+  // photos included.
+  const unconfirmedCount = useMemo(() => images.filter(img => {
+    if (!isUnconfirmed(img)) return false
+    if (decisionFilter === null) return true
+    if (decisionFilter === 'undecided') return !img.decision && img.analysis_status === 'done'
+    return img.decision === decisionFilter
+  }).length, [images, decisionFilter])
+
   // Auto-culled keepers still awaiting a human "mark reviewed" — the "Mark
   // all reviewed" bulk bar's scope (docs/PLAN-keeps-reviewed.md Piece 3).
   // Manual keeps never appear here (they skip straight to _Keeps_reviewed).
@@ -1028,17 +1054,26 @@ export default function App() {
       const summary = partnerSummaryByImageId.get(id)
       return !!summary && summary.members.length > 1
     })
-    if (decisionMatches || compositionMatches || groupingMatches) {
+    // "Only unconfirmed": drop anything already carrying a human verdict, so a
+    // photo you promoted out of one bucket never shows up again in the next.
+    // Runs HERE, before the decidedGroup clustering further down, so a
+    // collapsed group run can't re-gather members this filter just removed.
+    const unconfirmedMatches = unconfirmedOnly ? isUnconfirmed : null
+    if (decisionMatches || compositionMatches || groupingMatches || unconfirmedMatches) {
       const passesAll = img =>
         (!decisionMatches    || decisionMatches(img)) &&
         (!compositionMatches || compositionMatches(img)) &&
-        (!groupingMatches    || groupingMatches(img))
+        (!groupingMatches    || groupingMatches(img)) &&
+        (!unconfirmedMatches || unconfirmedMatches(img))
       filtered = filtered.flatMap(item => {
         if (item.type !== 'group') {
           return passesAll(item.image) ? [item] : []
         }
         // Group tile: excluded by any decision filter other than Undecided.
         if (decisionFilter && decisionFilter !== 'undecided') return []
+        // No unconfirmedMatches check here: a group tile holds only undecided
+        // members by construction, and an undecided photo has no decisions row
+        // and therefore no reason — it is unconfirmed by definition.
         // A group tile is grouped by definition — no need to ask per member,
         // and asking would be wrong for 'ungrouped' (every member answers no,
         // so `.some()` would keep the tile).
@@ -1178,7 +1213,7 @@ export default function App() {
       return clustered
     }
     return filtered
-  }, [gridItems, decisionFilter, filters, searchQuery, searchMode, semanticResults, partnerSummaryByImageId])
+  }, [gridItems, decisionFilter, unconfirmedOnly, filters, searchQuery, searchMode, semanticResults, partnerSummaryByImageId])
 
   // Index of the currently-focused grid cell — drives scrollIntoView and the
   // GroupTile's selection ring. Computed against the filtered/visible list so
@@ -1340,9 +1375,15 @@ export default function App() {
         return
       }
 
+      // `reason` is mirrored optimistically alongside decision/file_path
+      // everywhere a decision is applied or undone. Without it the "only
+      // unconfirmed" filter would keep showing a photo you just decided until
+      // the next /images poll caught up — exactly the double-look the filter
+      // exists to prevent. Undo sets it back to null: the backend deletes the
+      // whole decisions row, and the reason goes with it.
       setImages(prev =>
         prev.map((img, idx) =>
-          idx === selectedIdx ? { ...img, decision, file_path: data.new_path } : img
+          idx === selectedIdx ? { ...img, decision, file_path: data.new_path, reason: 'manual' } : img
         )
       )
       undoStack.push({
@@ -1407,10 +1448,26 @@ export default function App() {
   // selected photo), GroupLoupe (U on the focused photo in the loupe), and
   // DetailView (U on the open photo). Backend reconstructs previous_path
   // from images.source_folder so the caller doesn't have to remember it.
-  // Silent no-op when the photo has no decision (matches Cmd+Z conventions).
+  // Says so when there is nothing to undo, rather than doing nothing silently.
+  //
+  // This is the most-hit dead end in the app: U reverses the SELECTED photo's
+  // decision, but K/M/R advance the cursor onto the next photo, which is
+  // undecided by definition. The in-memory undo stack normally catches that
+  // case first (runUndo), so pressing U straight after a decision works — but
+  // the stack does not survive a page reload, and then U lands here and did
+  // nothing at all. "Nothing happened" reads as a broken feature; naming the
+  // reason turns it into a one-second correction.
   const undoImage = useCallback(async (imageId) => {
     const img = images.find(i => i.id === imageId)
-    if (!img || !img.decision) return  // nothing to undo
+    if (!img) return
+    if (!img.decision) {
+      addToast({
+        type: 'info',
+        message: 'Nothing to undo here — select a decided photo, then press U',
+        duration: 4000,
+      })
+      return
+    }
 
     try {
       const res = await fetch(`${API}/undo-decision`, {
@@ -1432,7 +1489,7 @@ export default function App() {
         return
       }
       setImages(prev => prev.map(i =>
-        i.id === imageId ? { ...i, decision: null, file_path: data.new_path } : i
+        i.id === imageId ? { ...i, decision: null, file_path: data.new_path, reason: null } : i
       ))
       loadModelInfo()
     } catch (err) {
@@ -1457,7 +1514,7 @@ export default function App() {
         return
       }
       setImages(prev => prev.map(img =>
-        img.id === imageId ? { ...img, file_path: data.new_path } : img
+        img.id === imageId ? { ...img, file_path: data.new_path, reason: 'manual' } : img
       ))
     } catch (err) {
       addToast({ type: 'error', message: `Network error: ${err.message}`, duration: 6000 })
@@ -1925,7 +1982,7 @@ export default function App() {
       const patchMap = new Map(patches.map(p => [p.id, p]))
       setImages(prevImgs => prevImgs.map(img => {
         const p = patchMap.get(img.id)
-        return p ? { ...img, decision, file_path: p.new_path } : img
+        return p ? { ...img, decision, file_path: p.new_path, reason: 'manual' } : img
       }))
       undoStack.push({
         kind: 'decision',
@@ -1975,7 +2032,7 @@ export default function App() {
       const patchMap = new Map(patches.map(p => [p.id, p]))
       setImages(prevImgs => prevImgs.map(img => {
         const p = patchMap.get(img.id)
-        return p ? { ...img, decision: null, file_path: p.new_path } : img
+        return p ? { ...img, decision: null, file_path: p.new_path, reason: null } : img
       }))
     }
     loadModelInfo()
@@ -2025,7 +2082,7 @@ export default function App() {
         setImages(prev => prev.map(img => {
           const p = patchMap.get(img.id)
           if (!p) return img
-          return { ...img, decision: p.decision, file_path: p.new_path }
+          return { ...img, decision: p.decision, file_path: p.new_path, reason: p.decision === null ? null : 'manual' }
         }))
       }
       loadModelInfo()
@@ -2137,7 +2194,7 @@ export default function App() {
     const patchMap = new Map(patches.map(p => [p.id, p]))
     setImages(prev => prev.map(img => {
       const p = patchMap.get(img.id)
-      return p ? { ...img, decision, file_path: p.new_path } : img
+      return p ? { ...img, decision, file_path: p.new_path, reason: 'manual' } : img
     }))
 
     // Replace the stale entry: keep each item's *original* prev so Undo still
@@ -2281,7 +2338,17 @@ export default function App() {
       // app may have grabbed them first), so warn instead of claiming success.
       const trashed = data.trashed ?? 0
       const notTrashed = (data.skipped_missing ?? 0) + (data.failed ?? 0)
-      if (notTrashed > 0) {
+      // Photos assets cannot be deleted from here at all — Photos exposes no
+      // delete to AppleScript, and PhotoKit refuses this process. Their reject
+      // rows survive, so say so rather than reporting a smaller count with no
+      // explanation.
+      const skippedPhotos = data.skipped_unsupported ?? 0
+      if (skippedPhotos > 0) {
+        addToast({
+          type: 'warning',
+          message: `${trashed} sent to Trash · ${skippedPhotos} in Photos albums can only be deleted in Photos`,
+        })
+      } else if (notTrashed > 0) {
         addToast({
           type: 'warning',
           message: `${trashed} sent to Trash · ${notTrashed} couldn't be trashed (still in your reject list)`,
@@ -2535,6 +2602,15 @@ export default function App() {
           onClose={() => setAutoCullOpen(false)}
           onComplete={handleAutoCullComplete}
           onToast={addToast}
+        />
+      )}
+
+      {photosPickerRequest && (
+        <PhotosAlbumPicker
+          onClose={dismissPhotosPicker}
+          onPick={(libraryPath, albumUuid, albumName) =>
+            runPhotosAnalysisForTab(photosPickerRequest.tabId, libraryPath, albumUuid, albumName)
+          }
         />
       )}
 
@@ -2933,6 +3009,10 @@ export default function App() {
                 setActiveTabId(tabId)
               }
             }}
+            onTrailingPhotosClick={(tabId) => {
+              setActiveTabId(tabId)
+              startPhotosAnalysis(tabId)
+            }}
           />
 
           {/* Right actions */}
@@ -3295,7 +3375,32 @@ export default function App() {
                   Cancel
                 </button>
               </>
-            ) : null}
+            ) : (
+              /* Only unconfirmed — stacks on top of the decision filter and
+                 hides everything already carrying a human verdict. Cyan when
+                 on, per the "this control is narrowing" rule (ui/buttons.js).
+                 Kept out of select mode so it never competes with the bulk
+                 actions for the same corner. */
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setUnconfirmedOnly(v => !v)}
+                title={unconfirmedOnly
+                  ? 'Showing only photos you have not decided on yourself — click to show all'
+                  : 'Hide photos you have already decided on yourself, in every bucket'}
+                aria-pressed={unconfirmedOnly}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs border transition-colors ${
+                  unconfirmedOnly
+                    ? ACTIVE_PILL
+                    : 'bg-[#0d0e0f] border-[rgba(255,255,255,0.08)] text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.03)]'
+                }`}
+              >
+                <Eye size={14} />
+                Only unconfirmed
+                {unconfirmedCount > 0 && (
+                  <span className="font-mono tabular-nums">{unconfirmedCount}</span>
+                )}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -3311,14 +3416,19 @@ export default function App() {
               {decisionCounts.undecided} {decisionCounts.undecided === 1 ? 'photo' : 'photos'} undecided
             </span>
             <span className="text-[#6a6b6c] flex items-center gap-1.5">
-              Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">M</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to decide, or let the AI sort them
+              Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">M</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to decide{isPhotosTab(activeTab) ? '' : ', or let the AI sort them'}
             </span>
-            <button
-              onClick={() => setAutoCullOpen(true)}
-              className={`${BTN_PRIMARY} !py-1 !px-3 !text-xs`}
-            >
-              <WandSparkles size={15} /> Auto cull
-            </button>
+            {/* Auto cull runs on the personal model, which trains on the camera
+                corpus and has never seen a Photos album's distribution — so it
+                is absent here rather than present and disabled. */}
+            {!isPhotosTab(activeTab) && (
+              <button
+                onClick={() => setAutoCullOpen(true)}
+                className={`${BTN_PRIMARY} !py-1 !px-3 !text-xs`}
+              >
+                <WandSparkles size={15} /> Auto cull
+              </button>
+            )}
           </div>
         )}
 
@@ -3404,19 +3514,27 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('trash-rejects')}
-                className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.12)] border border-[rgba(201,123,123,0.30)] text-[#C97B7B] hover:opacity-70 transition-opacity">
-                <Trash2 size={14} /> Move to system trash
-              </button>
+              !isPhotosTab(activeTab) && (
+                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('trash-rejects')}
+                  className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.12)] border border-[rgba(201,123,123,0.30)] text-[#C97B7B] hover:opacity-70 transition-opacity">
+                  <Trash2 size={14} /> Move to system trash
+                </button>
+              )
             )}
           </div>
+        )}
+
+        {activeView === 'grid' && isPhotosTab(activeTab) && (
+          <PhotosLibraryBanner sourceFolder={activeTab.folderPath} />
         )}
 
         {/* Personal-model status banner — visible in grid view until the
             model reaches the "ready" tier OR the user dismisses it. Hidden
             inside training mode (TrainingModeView already shows the full
-            PersonalModelPanel). */}
-        {activeView === 'grid' && images.length > 0 && !bannerDismissed && (decisionFilter === null || decisionFilter === 'undecided') && (
+            PersonalModelPanel), and on Photos tabs: it reports the camera
+            model's progress toward auto-cull, and neither the corpus nor the
+            auto-cull it promises applies there. */}
+        {activeView === 'grid' && images.length > 0 && !bannerDismissed && !isPhotosTab(activeTab) && (decisionFilter === null || decisionFilter === 'undecided') && (
           <PersonalModelBanner
             modelInfo={modelInfo}
             onDismiss={() => setBannerDismissConfirm(true)}
@@ -3657,14 +3775,21 @@ export default function App() {
                 No photos matched <span className="text-[#cecece]">"{searchQuery}"</span> — try a broader description.
               </div>
             )}
-            {displayGridItems.length === 0 && searchMode !== 'semantic' && decisionFilter && (
+            {displayGridItems.length === 0 && searchMode !== 'semantic' && (decisionFilter || unconfirmedOnly) && (
               <div className="col-span-full flex flex-col items-center gap-3 py-16">
-                <span className="text-[#9c9c9d] text-sm">No photos in this filter.</span>
+                {/* An empty "only unconfirmed" view is a finished pass, not a
+                    dead end — say so, and offer the escape hatch that actually
+                    matches which filter emptied the grid. */}
+                <span className="text-[#9c9c9d] text-sm">
+                  {unconfirmedOnly
+                    ? 'Nothing left to confirm here'
+                    : 'No photos in this filter.'}
+                </span>
                 <button
-                  onClick={() => setDecisionFilter(null)}
+                  onClick={() => unconfirmedOnly ? setUnconfirmedOnly(false) : setDecisionFilter(null)}
                   className="text-sm text-[#5BB8D4] hover:text-[#7ECDE3] transition-colors"
                 >
-                  Clear filter
+                  {unconfirmedOnly ? 'Show confirmed photos too' : 'Clear filter'}
                 </button>
               </div>
             )}
@@ -4177,7 +4302,7 @@ export default function App() {
           {activeTab?.status === 'ready' && (() => {
             const watchingTab = tabs.find(t => t.watchLive)
             const watchingElsewhere = watchingTab && watchingTab.id !== activeTab.id
-            const canToggleHere = !!activeTab.folderPath
+            const canToggleHere = !!activeTab.folderPath && !isPhotosTab(activeTab)
             return (
             <div className="relative" data-dropdown="true">
               <button
@@ -4248,7 +4373,7 @@ export default function App() {
                   </div>
 
                   {/* ── Folders ── */}
-                  {activeTab?.folderPath && (
+                  {activeTab?.folderPath && !isPhotosTab(activeTab) && (
                     <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
                       <p className="label mb-1">Folders</p>
                       <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
@@ -4259,6 +4384,17 @@ export default function App() {
                         onToast={addToast}
                         autoLoad={tabSettingsOpen}
                       />
+                    </div>
+                  )}
+
+                  {isPhotosTab(activeTab) && (
+                    <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
+                      <p className="label mb-1">Decisions</p>
+                      <p className="text-xs text-[#9c9c9d] leading-relaxed">
+                        Each K / M / R writes a <span className="text-[#cecece]">KaMeRa:Keep</span> / <span className="text-[#cecece]">Maybe</span> / <span className="text-[#cecece]">Reject</span> keyword
+                        onto the photo in Photos. Files are never moved, and undo removes the keyword again.
+                        Build a Smart Album on a keyword to collect them.
+                      </p>
                     </div>
                   )}
 

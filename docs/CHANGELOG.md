@@ -4,6 +4,96 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## macOS 27 reaps what an applet spawns (2026-09-18, later)
+
+Four "failed to fetch" reports in one afternoon — folder picker, closing a tab, closing a tab again, ERR_CONNECTION_REFUSED on reload. One cause, and not in any of the endpoints being clicked: the backend was already dead, and the click was just the first thing to notice.
+
+**The measurement.** Sampling the whole process family twice a second, twice in a row, to the tenth of a second:
+
+```
+18:11:29.7  applet starts
+18:11:32.2  launcher.py + uvicorn up
+18:11:35.9  applet exits          ← its script ended; applets quit then
+18:11:36.6  launcher.py: SIGTERM
+18:11:37.2  uvicorn gone
+```
+
+When the AppleScript applet finishes — it waits for `/health`, opens the PWA, and is done — macOS terminates the process group it spawned. The `perl -e 'fork and exit; POSIX::setsid(); exec @ARGV'` detach that the applet's own comment called "verified" no longer shields anything: a new session is not a new owner. `launchctl submit` was tried next and died exactly the same way, for the same reason — it runs in the caller's bootstrap context too.
+
+**The fix is ownership, not detachment.** The backend is now a user LaunchAgent (`com.philippklein.kamera.backend`) bootstrapped into `gui/<uid>`; the applet's whole job is `launchctl kickstart`. Verified: applet exits at 19:20:42, backend still serving at 19:21:52 and beyond, `/clear-folder` round-trips, no SIGTERM in the log. Provenance's autopilot agent has lived on that same footing for months.
+
+**Why it took four reports.** uvicorn's stdout and stderr went to `DEVNULL`, so a backend dying at any point left nothing behind — `data/app.log` carries only KaMeRa's own logger and simply stopped mid-sentence. They now go to `data/backend.log`. A second blind spot compounded it: the launcher's status `print`s were block-buffered into a redirected file, so a killed launcher took its own "Backend did not start" message with it and the log always ended mid-word at "Waiting for backend…", which read like a hang. Both fixed; the launcher also names the signal that ends it now.
+
+**Two wrong turns worth recording.** A genuine 2-second race in `_watch_pwa_macos` was found and fixed on the way (it tore the backend down while looking for a window the AppleScript opens afterwards) — real bug, guarded by `tests/test_launcher_supervisor.py`, but not the cause of these outages. And an attempt to name the *sending* pid via `sigwaitinfo` backfired: macOS has no `sigwaitinfo`, the waiter thread died on `AttributeError` while `pthread_sigmask` stayed in effect, and the launcher became immune to SIGTERM — which then read as "macOS kills uvicorn but spares the launcher" and pointed at the wrong mechanism entirely. Instrument, then check the instrument.
+
+Separately, the macOS 27 update reset TCC: the Photos library was unreadable until Full Disk Access was granted (that grant is itself what killed the backend the first time — macOS restarts an app's processes when its permissions change), and `~/Downloads` remains a distinct scope that a headless detached process cannot be prompted for.
+
+---
+
+## The launcher was killing its own backend (2026-09-18)
+
+Three separate "failed to fetch" reports in one afternoon — folder picker, closing the last tab, then ERR_CONNECTION_REFUSED on hard reload. None of them was a bug in the endpoint being clicked. The backend was simply dead, and the click was just the first thing to notice.
+
+`_watch_pwa_macos` slept 2 seconds, ran `pgrep` for the PWA's `app_mode_loader`, and terminated uvicorn if it found nothing. That grace period silently assumed *this process opened the window* — true on the plain path, where `main()` calls `webbrowser.open` immediately before the supervisor. The .app bundle takes the other path: it runs `start.sh --no-browser`, waits for `/health` to answer, and opens the PWA **after** that — the same instant the launcher comes out of `_wait_for_backend`. Chrome needs longer than two seconds to produce that process, so the supervisor tore the backend down before the window it was waiting for had ever existed. The window then opened against a dead server and rendered happily from the service-worker cache.
+
+Intermittent, because `pgrep` matches *any* process carrying that path: a leftover KaMeRa window from an earlier session kept the supervisor quiet. That is why the same launch sometimes ran for six minutes through a 184-photo batch and sometimes died in seconds.
+
+**The supervisor is now two-phase.** Wait for the window to appear (90s), and only then treat its disappearance as "the user quit". If none ever appears the backend is left running — that is the Provenance case, which drives the API with `--no-browser` and brings no window. A lingering backend is recoverable; one killed under a live window is not.
+
+**Why it took three reports to find:** uvicorn's stdout and stderr went to `DEVNULL`, so a backend dying at any point left no trace — `data/app.log` only carries KaMeRa's own logger and simply stopped mid-sentence. They now go to `data/backend.log`, truncated per launch. And every launcher status `print` got `flush=True`: stdout redirected to a file is block-buffered, so a killed launcher took its own "Backend did not start" message with it. The launch log kept ending at "Waiting for backend…", which read like a hang and was really just an unflushed buffer.
+
+Also aligned `_wait_for_backend`'s 60s default with the AppleScript's 120s health loop. The longer patience there could never pay off while launcher.py gave up first and terminated uvicorn — the cold-start fix had only ever been applied to one of the two places that needed it.
+
+`tests/test_launcher_supervisor.py` covers all four cases, including the late-opening window that started this.
+
+---
+
+## Apple Photos as a second source type (2026-09-18)
+
+The question was whether KaMeRa could work on the Photos library without exporting first. It splits into two: can it *read* in place, and can it express a decision *without* touching the filesystem. A spike answered both before a line was written.
+
+Reading is easy once you have Full Disk Access — `originals/<hex>/<UUID>.ext` are real files, and `rawpy` / `pillow-heif` decode them directly (RAF 1.3 s half-size, HEIC 0.2 s). Writing was where both obvious designs died. **PhotoKit** returns `denied` instantly with no prompt, because a bare Python binary has no `NSPhotoLibraryUsageDescription`. **An album per decision** looked fine until the cost was measured: AppleScript cannot remove a photo from an album, so `photoscript` deletes and rebuilds it — 1.27 s to remove one photo from an album of six, i.e. ~0.21 s per photo already in it. One undo on a 500-photo Keeps album: ninety seconds.
+
+Keywords are O(1) in both directions (set 0.03 s, clear 0.19 s) and Photos builds Smart Albums from them, so the album view survives — Photos maintains it instead of KaMeRa.
+
+**What shipped:**
+
+- **`backend/sources/`** — a `SourceSink` seam. `FolderSink` is today's file-move behaviour lifted *verbatim* out of `decisions.py` (moved, not rewritten, so behaviour is byte-identical); `PhotosSink` writes `KaMeRa:Keep` / `:Maybe` / `:Reject` keywords. Dispatch is on the new `images.source_type` column, never on parsing a path. Capability flags (`supports_auto_cull`, `supports_bulk_trash`, `supports_path_reaper`, …) let routers decline a feature rather than scattering `if source_type ==`.
+- **A structural safety floor.** `file_mover._assert_outside_photos_library()` refuses any mutation on a path with a `.photoslibrary` component, checked on the *resolved* path so symlinks pointing in are caught too. It guards `move_photo` (source and destination), `trash_photo` (and every sidecar) and `resolve_dest_folder` — that last one catches a `folder_settings` override aimed into a library. Dispatch is an if-statement; this is the guarantee.
+- **`training_samples.corpus`** (v52) partitions the training set. An iPhone HEIC and a camera RAF score on incompatible sharpness / aperture / ISO distributions, so folding both into one GBR teaches contradictory labels — the same reasoning as the RAW+JPEG companion's `_train=False`. Photos rows get `personal_score = null` rather than a confident number from a model that has never seen them.
+- **`.heic` / `.heif` into `SUPPORTED_EXTENSIONS`.** A Photos library is ~75 % HEIC and the extension set silently excluded it, despite `pillow-heif` being registered globally and `burst_ranker` already listing the format. Side effect worth naming: HEIC is now analysable in ordinary folder tabs too.
+- **A `photos` tab kind**, its own album picker (tkinter can only choose directories, so there is no `/pick-folder` equivalent), and a warning strip when Photos has a different library open. The K/M/R keys stay live there on purpose — the 409 names the library to open, which beats a silently dead keyboard.
+
+**The wrong-library problem, and why the obvious guard is not the real one.** AppleScript writes always land in whatever library Photos.app currently has open, and `photoscript…name` returns "Photos" (the app), not the library. Comparing `get_last_library_path()` is advisory and can go stale between check and write. The binding guarantee is that asset UUIDs are per-library: looking one up in the wrong library returns *nothing*, so a mis-targeted write cannot happen. The keyword is then read back and verified before the `decisions` row is written.
+
+**Two things the plan missed, found while implementing.** The taste-model export/import wrote `training_samples` with no `corpus`, so a backup round-trip would have re-filed every Photos sample as `folder` — the exact pollution the split exists to prevent. Fixed, with the backup format bumped to v2 so an older app *refuses* a new file rather than mis-reading it. And `trash-rejects` iterates by decision, not by source, so it needed sink dispatch plus a `skipped_unsupported` count — Photos exposes no delete at all, and a reject there must survive a sweep that could not act on it.
+
+**Verified beyond green tests:** a real analysis run over a 6-photo album against the live library — filenames as `IMG_4012.HEIC` rather than UUIDs, `source_type='photos'`, scores 68.5–97.7, faces and scene detected, and the 37 existing folder rows untouched. Plus a single-photo proof that the full scorer pipeline reads a HEIC out of `originals/` at its true 3024×4032, not a derivative.
+
+Setup, test-library instructions and known limitations: [docs/PLAN-photos-source.md](docs/PLAN-photos-source.md).
+
+---
+
+## "Only unconfirmed": one filter that makes the bucket order irrelevant (2026-09-18)
+
+Started as a workflow question — *after an auto-cull, in what order do I walk the buckets without seeing a photo twice?* The honest answer was that no order is safe. Rejects promote to Keep, Maybes split both ways, Keeps demote; every bucket feeds the other two, so whichever you visit last collects photos from everything before it.
+
+Except the app was already recording the thing that dissolves the problem. `decisions.reason` (migration v49) is `'manual'` after any human K/M/R and names the auto-cull rule otherwise — a per-photo "I have looked at this", independent of which bucket the photo currently sits in. It had just never left the backend: `GET /images` selected `d.decision` and nothing else, so the UI could only derive the answer for Keeps, and only from the `_Keeps_reviewed` path. One column in one SELECT was the whole gap.
+
+**What shipped:**
+
+- **`d.reason` in `GET /images`** ([images.py:154](backend/routers/images.py#L154)), and `isUnconfirmed()` in `ui/format.js` reading it. `null` counts as unconfirmed — that covers both undecided photos (open work, belongs in the filter) and decisions predating v49. Showing a photo one extra time is the safe direction; hiding an unseen one from a bulk trash action is not.
+- **A toggle pill in the filter bar**, cyan when on, stacking with the decision segment rather than replacing it. On the All view it becomes "everything still waiting for me"; inside a bucket it's that bucket's queue. Persisted, because a culling session outlives a reload.
+- **`_move_to_reviewed()` now stamps `reason = 'manual'`** ([decisions.py:566](backend/routers/decisions.py#L566)). Without it the ✓ affordance would move the file and still leave the photo in the filter — two sources of truth disagreeing about the same word. It deliberately writes no training sample: Mark reviewed means "I looked", K means "here is a label".
+
+**The bug that would have eaten the feature:** the optimistic `setImages` patches after every decision carried `decision` and `file_path` but not `reason`, so a photo you just decided would have lingered in the filtered grid until the next `/images` poll — exactly the double-look the filter exists to prevent. All eight patch sites now mirror `reason`, including the two undo paths, which set it back to `null` because the backend deletes the whole `decisions` row.
+
+`needsReview()` was left alone. It stays keep-only and path-based and answers the narrower Provenance question "may this be archived yet?" — a different question from "have I looked at this?", and worth keeping as a separate function rather than merging the two.
+
+The recommended order is now in the FAQ anyway, for anyone not using the filter: **Rejects → Maybes → Keeps**, which works only because a manual keep skips straight to `_Keeps_reviewed`.
+
+---
+
 ## Group peek: click to open, and a real grouped/ungrouped filter (2026-09-17)
 
 Three asks in one pass. The filter one turned out not to be a bug.

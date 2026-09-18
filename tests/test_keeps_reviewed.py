@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import backend.routers.decisions as decisions_mod
+import backend.sources.folder as folder_sink_mod
 from backend.database import get_db
 
 
@@ -106,8 +107,10 @@ def test_manual_keep_with_folder_override_nests_correctly(
 
     # get_folder_overrides defaults to the real data/pca.db — redirect it to
     # our tmp DB the same way the `patched` fixture redirects get_db.
+    # get_folder_overrides is read by the folder SINK now (backend/sources/
+    # folder.py), not by decisions.py — patch it where it is actually called.
     monkeypatch.setattr(
-        decisions_mod, "get_folder_overrides",
+        folder_sink_mod, "get_folder_overrides",
         lambda sf: get_folder_overrides(sf, db_path=patched),
     )
 
@@ -224,3 +227,71 @@ def test_bulk_mark_reviewed_skips_already_reviewed(patched: Path, tmp_path: Path
     assert result["moved"] == 1
     assert result["skipped"] == 1
     assert result["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# reason='manual' — the "I have looked at this" stamp the grid's
+# "only unconfirmed" filter reads (frontend/src/ui/format.js::isUnconfirmed).
+# ---------------------------------------------------------------------------
+
+
+def _reason(db_path: Path, image_id: int) -> str | None:
+    with get_db(db_path) as conn:
+        row = conn.execute(
+            "SELECT reason FROM decisions WHERE image_id = ?", (image_id,)
+        ).fetchone()
+    return None if row is None else row["reason"]
+
+
+def test_auto_cull_decision_is_not_marked_manual(patched: Path, tmp_path: Path) -> None:
+    source = str(tmp_path / "source")
+    photo = _make_photo(tmp_path, "source", "AUTO.RAF")
+    _insert_image(patched, image_id=20, uuid="auto-keep",
+                  file_path=str(photo), source_folder=source)
+
+    decisions_mod._apply_decision(20, "keep", is_auto=True, reason="personal_keep")
+
+    assert _reason(patched, 20) == "personal_keep"
+
+
+def test_mark_reviewed_stamps_reason_manual(patched: Path, tmp_path: Path) -> None:
+    """The ✓ affordance counts as 'I looked', so the photo drops out of the
+    unconfirmed filter — even though it writes no training sample."""
+    source = str(tmp_path / "source")
+    photo = _make_photo(tmp_path, "source", "REVIEWED.RAF")
+    _insert_image(patched, image_id=21, uuid="to-stamp",
+                  file_path=str(photo), source_folder=source)
+    decisions_mod._apply_decision(21, "keep", is_auto=True, reason="personal_keep")
+    assert _reason(patched, 21) == "personal_keep"
+
+    decisions_mod._move_to_reviewed(21)
+
+    assert _reason(patched, 21) == "manual"
+
+
+def test_manual_override_of_auto_decision_stamps_reason_manual(
+    patched: Path, tmp_path: Path,
+) -> None:
+    source = str(tmp_path / "source")
+    photo = _make_photo(tmp_path, "source", "OVERRIDE.RAF")
+    _insert_image(patched, image_id=22, uuid="override",
+                  file_path=str(photo), source_folder=source)
+    decisions_mod._apply_decision(22, "reject", is_auto=True, reason="closed_eyes")
+
+    decisions_mod._apply_decision(22, "keep", reason="manual")
+
+    assert _reason(patched, 22) == "manual"
+
+
+def test_undo_clears_reason_with_the_decision_row(patched: Path, tmp_path: Path) -> None:
+    """Undo deletes the decisions row outright, so the photo returns to the
+    unconfirmed filter as open work."""
+    source = str(tmp_path / "source")
+    photo = _make_photo(tmp_path, "source", "UNDONE.RAF")
+    _insert_image(patched, image_id=23, uuid="undone",
+                  file_path=str(photo), source_folder=source)
+    decisions_mod._apply_decision(23, "keep", reason="manual")
+
+    decisions_mod._apply_undo(23, None)
+
+    assert _reason(patched, 23) is None

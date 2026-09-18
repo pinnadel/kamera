@@ -285,6 +285,57 @@ If `reject_to_system_trash` is enabled, the reject branch routes through
 `send2trash` instead of `_Rejects/` and skips the XMP write (the file is no
 longer addressable).
 
+### In what order should I work through the buckets after an auto-cull?
+
+**Short answer:** turn on **Only unconfirmed** and the order stops mattering.
+Without it, the one order that never shows you the same photo twice is
+**Rejects → Maybes → Keeps**.
+
+The naive instinct is to rank the buckets by importance. The useful question is
+where a photo *goes* when you touch it. Every bucket feeds the other two —
+Rejects promote to Keep, Maybes split both ways, Keeps demote — so on paper no
+linear order is safe: whatever you visit last receives photos from everything
+before it.
+
+What breaks the tie is that a human verdict is recorded per photo, not per
+bucket. `decisions.reason` is `'manual'` after any K/M/R you press and after
+Mark reviewed, and names the auto-cull rule (`personal_keep`, `closed_eyes`,
+`burst_duplicate`, `uncertain`, …) otherwise
+([decisions.py:600](backend/routers/decisions.py#L600)). The **Only unconfirmed**
+pill in the filter bar filters on exactly that, in every bucket at once
+([format.js::isUnconfirmed](frontend/src/ui/format.js)). With it on, a photo
+you decide leaves the view immediately and never comes back, wherever it
+landed — so you can work the buckets in any order, and the All view plus the
+filter is your whole remaining workload in one list.
+
+**If you'd rather not use the filter,** Rejects → Maybes → Keeps still works,
+for a specific reason:
+
+1. **Rejects** is untouched, so it holds only machine verdicts. A rescue (R→K)
+   goes straight to `_Keeps/_Keeps_reviewed` because manual keeps skip the
+   review gate ([decisions.py:387](backend/routers/decisions.py#L387)) — so it
+   won't show up as awaiting-review work in step 3. Sort by `personal_score`
+   descending and the model's most likely mistakes come first. The one rule:
+   don't press M here, or you'll refill the bucket you visit next.
+2. **Maybes** still holds only auto-Maybes; step 1 pushed nothing into it. K
+   exits to the reviewed folder, R exits into a bucket you're already done with.
+3. **Keeps** last, because both earlier passes feed it. Everything you promoted
+   by hand is already marked reviewed, so the "N auto-culled photos awaiting
+   review" bar scopes itself to the genuine leftovers. Demotions from here fall
+   into finished buckets.
+
+**Pressing the same key again is a confirmation, and it trains.** K on a photo
+auto-culled to Keep writes a `training_samples` row — a human label at the
+model's decision boundary, which is the most valuable kind. **Mark reviewed**
+(the ✓ on hover) is the other half of the pair: it marks the photo as seen
+*without* writing a training sample, so a bulk review can never feed the model
+its own output. Both set `reason = 'manual'`, so both remove the photo from the
+unconfirmed filter.
+
+There is deliberately no "confirm all Maybes/Rejects" button. That would be
+rubber-stamping at scale and would defeat the guard described in "Does
+auto-cull teach the personal model?" above.
+
 ### How do I re-test auto-cull on an already-analysed group without re-analysing?
 
 **Short answer:** Multi-select the group's photos, press **U** (or **Cmd+Z**)

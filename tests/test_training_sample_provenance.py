@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import backend.routers.decisions as decisions_mod
+import backend.sources.folder as folder_sink_mod
 from backend.database import get_db
 
 
@@ -50,7 +51,7 @@ def patched(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             yield conn
 
     monkeypatch.setattr(decisions_mod, "get_db", _get_db)
-    monkeypatch.setattr(decisions_mod, "move_photo",
+    monkeypatch.setattr(folder_sink_mod, "move_photo",
                         lambda current, dest: str(current))
     monkeypatch.setattr(decisions_mod, "maybe_train_async", lambda *_a, **_k: None)
     return tmp_db

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from backend.constants import (
     SUPPORTED_EXTENSIONS, DECISION_SUBFOLDERS, is_standalone_hif,
     is_raw_format, companion_stem_matches, has_processed_sibling,
+    is_photos_source_folder,
 )
 from backend.database import get_db
 from backend.routers.settings import get_raw_jpeg_display_mode
@@ -53,8 +54,16 @@ def _filter_raw_jpeg_pairs(rows: list[dict]) -> list[dict]:
         return rows
 
     # Group candidate rows by (source_folder, stem) to find pairs cheaply.
+    #
+    # Photos rows are never grouped, so they can never land in hide_ids and are
+    # always returned. Pairing is a folder concept — two files sharing a stem in
+    # one directory. Hiding one half of a "pair" inside an album would also
+    # leave it unmirrored (the decision mirror is gated on the same capability),
+    # i.e. permanently undecided and invisible.
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
+        if row.get("source_type") == "photos":
+            continue
         key = (row.get("source_folder"), Path(row["filename"]).stem.lower())
         groups.setdefault(key, []).append(row)
 
@@ -136,7 +145,7 @@ def list_images(source_folder: str | None = None):
     base_sql = """
         SELECT
             i.id, i.file_path, i.filename, i.camera, i.format,
-            i.shot_at, i.preview_path, i.source_folder,
+            i.shot_at, i.preview_path, i.source_folder, i.source_type,
             i.focal_length_mm, i.aperture, i.shutter_speed, i.iso,
             i.sharpness_score, i.exposure_score, i.overall_score,
             i.highlight_clip_pct, i.shadow_clip_pct,
@@ -151,7 +160,7 @@ def list_images(source_folder: str | None = None):
             i.iqa_score, i.aesthetic_score,
             i.manual_group_id,
             i.explanation,
-            d.decision
+            d.decision, d.reason
         FROM images i
         LEFT JOIN decisions d ON d.image_id = i.id
     """
@@ -169,10 +178,15 @@ def list_images(source_folder: str | None = None):
 
     # Annotate with personal_score if the model has been trained.
     # predict_batch() calls pipeline.predict() once for all N rows — fast.
+    #
+    # Photos-album rows are scored None regardless: _personal_model is trained
+    # on the 'folder' corpus only, so running it over iPhone HEICs would emit a
+    # confident number from a model that has never seen that distribution. A
+    # separate Photos model is deferred until its corpus is worth training.
     if _personal_model.ready:
         personal_scores = _personal_model.predict_batch(rows_dicts)
         for img, ps in zip(rows_dicts, personal_scores):
-            img["personal_score"] = ps
+            img["personal_score"] = None if img.get("source_type") == "photos" else ps
     else:
         for img in rows_dicts:
             img["personal_score"] = None
@@ -218,18 +232,27 @@ def list_folders():
     Return distinct source folders that currently have analyzed images.
 
     Used by the multi-tab UI on launch to rebuild one tab per folder.
+
+    `source_type` tells the UI which kind of tab to rebuild. `label` and
+    `library_path` are only populated for Photos albums, whose source_folder is
+    an opaque photos:// URI — without the label the tab bar would show a raw
+    album UUID, since it otherwise renders the last path segment.
     """
     with get_db() as conn:
         rows = conn.execute(
             """
             SELECT
-                source_folder,
-                COUNT(*)            AS image_count,
-                MAX(imported_at)    AS last_imported_at
-            FROM images
-            WHERE source_folder IS NOT NULL
-            GROUP BY source_folder
-            ORDER BY MAX(imported_at) DESC
+                i.source_folder,
+                COUNT(*)              AS image_count,
+                MAX(i.imported_at)    AS last_imported_at,
+                MAX(i.source_type)    AS source_type,
+                a.album_name          AS label,
+                a.library_path        AS library_path
+            FROM images i
+            LEFT JOIN photos_albums a ON a.source_folder = i.source_folder
+            WHERE i.source_folder IS NOT NULL
+            GROUP BY i.source_folder
+            ORDER BY MAX(i.imported_at) DESC
             """
         ).fetchall()
     return {"folders": [dict(r) for r in rows]}
@@ -258,6 +281,14 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
     match analyze_folder's walk semantics — otherwise a freshly-moved photo
     would count as "unfinished" forever.
     """
+    # Walks the filesystem — there is nothing to walk for an album. The
+    # Resume banner is folder-only for now.
+    if is_photos_source_folder(folder_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Unfinished counts are not available for Photos albums",
+        )
+
     folder = Path(folder_path)
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
@@ -337,6 +368,15 @@ def sync_folder(request: ClearFolderRequest):
             status_code=409,
             detail="Analysis is running for this folder — wait or stop it first.",
         )
+
+    # "The file is gone, so drop the row" is wrong in BOTH directions for a
+    # Photos album. Removing an asset from the album leaves the original file
+    # sitting in the library (stale row survives), and an iCloud offload of a
+    # still-perfectly-fine photo makes its original vanish from disk (row and
+    # decision deleted for no reason). Album membership, not file existence,
+    # is the right predicate there — deferred, so for now simply never reap.
+    if is_photos_source_folder(request.source_folder):
+        return {"status": "skipped", "images_removed": 0, "previews_removed": 0}
 
     # Read + existence-check under _decision_move_lock so this can't observe a
     # photo mid-move (file already relocated on disk, file_path not updated

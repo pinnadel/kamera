@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.constants import is_photos_source_folder
 from backend.database import get_db, get_folder_overrides, set_folder_override
 from backend.state import PREVIEW_CACHE_DIR, _personal_model
 
@@ -445,6 +446,15 @@ def update_folder_settings(request: FolderSettingsRequest):
     src = request.source_folder.strip()
     if not src:
         raise HTTPException(status_code=400, detail="source_folder is required")
+    # An override is a destination folder, and resolve_dest_folder() turns it
+    # into a real move target. Accepting one for a Photos album would be the
+    # one route by which a library path could reach move_photo.
+    if is_photos_source_folder(src):
+        raise HTTPException(
+            status_code=400,
+            detail="Photos albums have no destination folders — decisions are "
+                   "written as keywords and files are never moved",
+        )
 
     fields_set = request.model_fields_set
     decision_for_field = {
