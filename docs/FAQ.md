@@ -283,7 +283,114 @@ run against real Sony or Canon files.
 
 If `reject_to_system_trash` is enabled, the reject branch routes through
 `send2trash` instead of `_Rejects/` and skips the XMP write (the file is no
-longer addressable).
+longer addressable). *This setting did nothing until 2026-09-19* — it was
+written as `"1"` and read with a `== "true"` test, so it always evaluated
+False and rejects kept going to `_Rejects/`. Fixed in
+[sources/folder.py](../backend/sources/folder.py) via
+`database.get_bool_setting()`; if you had the toggle on before that date,
+it is live now.
+
+### Does auto-cull respect "send rejects to system Trash"?
+
+**Short answer:** yes — and that is the one setting that makes auto-cull
+irreversible, so the modal now says so before you click.
+
+Auto-cull does not have its own file-moving code. It commits through the same
+sink as a manual **R** press
+([sources/folder.py:65](../backend/sources/folder.py#L65)), which means
+`reject_to_system_trash` applies to it in full. With the toggle on, pressing
+**Cull** sends every rejected file to the OS Trash in one action.
+
+That changes what you can take back:
+
+| Route | Where rejects go | Can `U` undo it? |
+|---|---|---|
+| Default | `_Rejects/` inside the source folder | **Yes** — the file never left |
+| `reject_to_system_trash` on | The system Trash | **No** — recoverable from the Trash, but KaMeRa can no longer address the file |
+
+`GET /auto-cull/preview` resolves the actual destination server-side and
+returns it as `reject_destination` (`mode`, `label`, `undoable`), honouring any
+per-folder `rejects_folder` override. The modal renders that instead of a fixed
+sentence, switches the confirm button to the coral destructive variant in Trash
+mode, and leads with the count that leaves the shoot rather than the total.
+
+### Can I cull a Smart Album?
+
+**Yes, since 2026-09-19.** They appear in the album picker with a cyan sparkle
+icon and the note *"contents update themselves"*.
+
+Two differences from a regular album, both worth knowing:
+
+**Photos has to be running** with that library open. A Smart Album is a stored
+query, not a stored list — Photos keeps no membership rows for one and
+evaluates the predicate live, so its contents can only come from Photos itself
+(over AppleScript, ~0.3 s for 2000 photos). Regular albums are read straight
+from the library catalogue and need none of that. If Photos is closed you get a
+503 that says so; if it is closed while the *picker* is open, the Smart Album
+simply shows `—` instead of a count.
+
+**Membership moves under you.** That is the point of a Smart Album, but it
+interacts with culling: a Smart Album built on `KaMeRa:Keep` (the pattern this
+app suggests elsewhere) gains and loses photos *as you decide them*. Analysis
+takes a snapshot — the `images` rows are created once — so your grid stays
+stable, but **Compare with Photos** will then report those photos under *"No
+longer in this album"*. That class defaults to leaving rows alone, so it is
+noise rather than risk; just do not bulk-drop it on a keyword-based Smart Album.
+
+Apple's own smart albums (Favourites, Recents, Screenshots, Selfies…) are not
+offered. They are not addressable the same way and their names exist only as
+runtime localisations, so KaMeRa offers the ones you made yourself.
+
+### I changed a KaMeRa keyword in Photos — does KaMeRa notice?
+
+**Not on its own.** Decisions flow one way: KaMeRa writes the keyword and never
+reads it back. Open the Photos tab's settings and press **Compare with Photos**
+to see the drift and decide what wins.
+
+The comparison sorts every disagreement into five kinds, because they do not all
+have the same answer:
+
+| What it found | What it usually means | Default |
+|---|---|---|
+| Decided here, unmarked in Photos | The write never landed, or you deleted the keyword | **Re-apply the keyword** |
+| The two disagree | Both sides carry a decision, and they differ | Leave alone |
+| Decided in Photos only | You set the keyword directly in Photos | Leave alone |
+| No longer in this album | The photo left the album | Leave alone |
+| Gone from the library | The photo was deleted | Leave alone |
+
+**Why only the first one is preselected:** Photos and KaMeRa disagree for good
+reasons in both directions — a keyword you set by hand is a real decision, and so
+is one you made here. Picking a winner automatically would be wrong about half the
+time and you would never see it happen. The first row is different: there is no
+contradiction there, one side simply never got the message.
+
+Two things it refuses rather than guesses:
+
+- A photo carrying **both** `KaMeRa:Keep` and `KaMeRa:Reject` has no single "what
+  Photos says". Adopting it is refused and reported, so you resolve it in Photos.
+- **Removing a row** for a photo that left the album is a separate choice from
+  removing one whose photo was deleted. Dropping the second never drops the first.
+
+Removing a row only removes KaMeRa's record — the photo in your library is never
+touched. Photos exposes no delete to KaMeRa at all
+([sources/photos.py](../backend/sources/photos.py)).
+
+The comparison re-reads the whole library catalogue on purpose, which takes a
+moment on a large library: a cached read would report drift that is already gone
+and miss the drift you are looking for.
+
+### Does "Move to system trash" affect other tabs?
+
+**No — not since 2026-09-19.** It used to. `POST /trash-rejects` swept *every*
+reject in the database, while the bar it lives in is labelled with the active
+tab's reject count — so pressing it in one folder tab emptied another's rejects
+under a number that described neither.
+
+`source_folder` is now a required body field
+([decisions.py](../backend/routers/decisions.py)): a call that omits it gets a
+422 rather than falling back to a wider sweep, and the confirm line names the
+tab it will act on. Photos albums were never affected — `supports_bulk_trash`
+is `False` there, because Photos exposes no delete to AppleScript at all.
 
 ### In what order should I work through the buckets after an auto-cull?
 
@@ -597,7 +704,7 @@ off.
 
 ### The grouping defaults look wrong on my library. Can I tune them?
 
-Yes — Settings → Model → Grouping section has the Similarity threshold
+Yes — Settings → Workflow → Grouping section has the Similarity threshold
 (0.80–0.99, default 0.90) and Time gap (15s–10min, default 60s) sliders.
 Slider changes take effect immediately and re-cluster the whole library.
 This is a power-user escape; for most "this photo doesn't belong here"

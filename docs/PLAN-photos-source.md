@@ -121,11 +121,27 @@ This is a different thing, and on macOS 26+ the toggle for a bare binary
 **cannot reliably be switched on**. Observed 2026-09-18: the `python3.14` entry
 appears, and the Photos toggle refuses to enable.
 
-That matters because the backend is its own TCC identity. The launcher detaches
-uvicorn via `perl POSIX::setsid`, so its process chain is
-`uvicorn → Python → /bin/bash → launchd` — no app ancestor, so Full Disk Access
-granted to KaMeRa.app does not reach it, and neither does anything inherited
-from a terminal.
+That matters because the backend is its own TCC identity. Since `787d13f` it runs
+as a user LaunchAgent, so its process chain is
+`uvicorn → Python → /bin/bash → launchd` with launchd as the responsible process —
+no app ancestor, so Full Disk Access granted to KaMeRa.app does not reach it, and
+neither does anything inherited from a terminal.
+
+### Measured under the LaunchAgent — 2026-09-19
+
+Everything below was originally measured against the *old* applet-spawned process.
+Re-verified against `gui/502/com.philippklein.kamera.backend`, and the answers hold:
+
+| Call | Result |
+|---|---|
+| `GET /photos-libraries` | 200, both libraries found by the directory scan, `readable: true` |
+| `GET /photos-albums` | 200, selected library opens, album with 1248 photos listed |
+| `detected` field | still `null` — `get_last_library_path()` remains blocked |
+
+So the move to launchd changed nothing about Photos access: **the folder permission
+the backend needs, it has; the Photos-container preference it still cannot read.**
+The explicit-choice design is what makes that irrelevant, exactly as intended — no
+new grant is required after installing the agent.
 
 ### The consequence: auto-detection is a hint, not a dependency
 

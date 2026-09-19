@@ -13,7 +13,7 @@ the package, and `training_samples` staying split (`folder` 2971 / `photos` 7).
 
 ---
 
-## 0. Verify TCC under the LaunchAgent — do this first
+## 0. Verify TCC under the LaunchAgent — ✅ done 2026-09-19
 
 `787d13f` moved the backend out of an applet-spawned process and into a user
 LaunchAgent (`gui/<uid>`). **Every TCC finding in this feature was measured against
@@ -33,12 +33,16 @@ curl -s localhost:8000/photos-libraries | head -c 300
 - `403` with the Full Disk Access message → the agent needs its own grant.
 - Empty list → the directory scan is blocked; the typed-path route still works.
 
-Record the answer in [PLAN-photos-source.md](PLAN-photos-source.md)'s TCC section,
-which currently describes the *old* process.
+**Answer: libraries listed, nothing to do.** `/photos-libraries` returned both
+libraries with `readable: true`, `/photos-albums` opened the selected one and listed
+the 1248-photo album. `detected` is still `null` (`get_last_library_path()` stays
+blocked), which the explicit-choice design already handles. Recorded in
+[PLAN-photos-source.md](PLAN-photos-source.md)'s TCC section, which now describes the
+LaunchAgent process.
 
 ---
 
-## 1. Reconcile KaMeRa ↔ Photos
+## 1. Reconcile KaMeRa ↔ Photos — ✅ shipped 2026-09-19
 
 **The gap.** Decisions flow one way. Philipp deleted three `KaMeRa:*` keywords by
 hand in Photos on 2026-09-18 and KaMeRa never noticed — two photos kept a `keep`
@@ -61,9 +65,39 @@ reports per photo: decision, actual keyword, and the mismatch class —
 
 Then a `POST /photos-album/reconcile` applying a chosen direction per class.
 
-**Decide first:** is Photos or KaMeRa authoritative? They disagree for good reasons
-in both directions. Recommendation: show the diff, let the user choose per class,
-default only `keyword_missing` to auto-fix — that one has no ambiguity.
+**Decided as recommended:** neither side is authoritative. `GET /photos-album/diff`
+shows the drift, the user picks a direction per class, and only `keyword_missing`
+defaults to acting — there the two sides do not actually contradict each other, one
+simply never arrived. `POST /photos-album/reconcile` applies it.
+
+Shipped shape:
+
+| Class | Actions (first is the default) |
+|---|---|
+| `keyword_missing` | **apply** · clear (drop our decision) · skip |
+| `keyword_foreign` | **skip** · kamera (overwrite keyword) · photos (adopt keyword) |
+| `decision_missing` | **skip** · import · clear (strip the marker) |
+| `not_in_album` | **skip** · drop the row |
+| `asset_gone` | **skip** · drop the row |
+
+Classification is a pure function in `backend/photos_reconcile.py` so the dangerous
+half — which rows get deleted — is testable without a Photos library
+(`tests/test_photos_reconcile.py`, `tests/test_photos_reconcile_apply.py`). Every
+write reuses an existing path: the sink for keywords, `_apply_decision` for
+decisions, `_delete_image_rows` for removals. Reconcile re-reads the diff rather
+than trusting the client, so an edit made in Photos while the modal sat open is not
+overwritten by the picture the user was shown.
+
+UI: **Compare with Photos** in a Photos tab's settings popover
+(`frontend/src/modals/PhotosReconcileModal.jsx`).
+
+Two refusals worth keeping: an asset carrying **two** KaMeRa keywords is reported,
+never resolved by a coin flip, and a photo that merely left the album is never
+dropped by the `asset_gone` action.
+
+**Not yet observed live:** no photo in the available library currently carries a
+`KaMeRa:*` keyword, so a non-empty keyword read has not been seen end to end. Add
+one by hand in Photos and run Compare to close that gap.
 
 **Note:** this also subsumes the deferred album-membership reaper. `sync-folder`'s
 `Path.exists()` test is disabled for Photos tabs (`supports_path_reaper = False`)
@@ -124,12 +158,18 @@ the Mac. See [MOBILE_STATUS.md](MOBILE_STATUS.md) and the `sync-mobile` skill.
 
 ## 4. Smaller items from this work
 
-**`trash-rejects` is not tab-scoped.** `POST /trash-rejects` sweeps *every* reject in
-the DB; the button ([App.jsx:2310](../frontend/src/App.jsx#L2310)) posts no body. Photos rows are
-safe (`supports_bulk_trash = False`, skipped and counted), but a reject in folder tab
-A is still trashed by pressing the button in tab B. Pre-existing, unrelated to Photos,
-and worth scoping to the active tab — a behaviour change to the folder workflow, so
-it deserves its own decision.
+**~~`trash-rejects` is not tab-scoped.~~ Fixed 2026-09-19.** `source_folder` is now a
+required body field — omitting it is a 422, not a wider sweep — and the frontend posts
+the active tab's folder. The confirm line names the tab. Worth recording *why* it was
+worth doing: the bar the button sits in was already labelled with the active tab's
+reject count, so the number shown never described what the server did. Guarded by
+`tests/test_trash_rejects_scope.py`.
+
+**Found while fixing the above: `reject_to_system_trash` never worked.** Written as
+`"1"` by `POST /settings`, read with a literal `== "true"` test in `sources/folder.py`,
+so it always evaluated False. Fixed via `database.get_bool_setting()`, which the three
+other (already-correct) boolean readers now share. Relevant here because it is the
+setting that decides whether a folder-tab reject is reversible at all.
 
 **The undo stack does not survive a reload.** `useUndoStack` is in-memory. After a
 reload, `U` falls through to per-photo undo, which acts on the *selected* photo — and
@@ -172,10 +212,10 @@ impossible today.
 
 ## Suggested order
 
-1. **§0** — verify TCC under the LaunchAgent. Everything else assumes it.
+1. ~~**§0** — verify TCC under the LaunchAgent.~~ Done 2026-09-19: no new grant needed.
 2. **Cull for a few real sessions.** Several items above ask a question that only
    use answers: is auto-cull missed, does drift bite, is the undo dead end real.
-3. **§1 reconcile** — the one gap with demonstrated, non-hypothetical consequences.
+3. ~~**§1 reconcile**~~ — shipped 2026-09-19.
 4. **§3 mobile** — small, and currently an outright breakage.
 5. **§2 Phase B** — only once the Photos corpus is in the hundreds *and* the
    session in step 2 says auto-cull is missed.

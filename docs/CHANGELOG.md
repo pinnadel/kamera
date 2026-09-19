@@ -4,6 +4,73 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## Smart Albums are selectable (2026-09-19, later still)
+
+The album picker now lists user-created Smart Albums alongside regular ones. Getting there needed one finding first.
+
+**A Smart Album is a stored query, not a stored list.** Photos keeps *no* album↔asset rows for one — verified against a Smart Album holding 2114 photos: zero rows in the join table. The predicate is evaluated live. That is why `osxphotos` does not expose Smart Albums at all, and why no amount of catalogue reading was going to work.
+
+Photos' **AppleScript** does treat them as ordinary albums, and it is fast: 2114 member UUIDs in 0.26 s, batched counts in 0.23 s. Addressed by `album id`, never by name — album names are not unique in Photos and `album "Foo"` silently resolves to whichever comes first, which is a wrong read that looks like a right one.
+
+How it fits together:
+
+- `smart_albums()` finds them in the catalogue by `kind = 1507` **with a stored title**. Apple's built-ins (Favourites, Recents, Screenshots, …) share the kind range but carry no title — Photos localises those at runtime — so a title is exactly the marker for "the user made this".
+- `smart_album_member_uuids()` asks Photos over AppleScript and strips the `/L0/001` suffix off each id.
+- `_album_photos()` is now the single membership resolver for both kinds, so `album_assets`, `album_keyword_state` and `album_name` all gained Smart Album support without branching themselves. Photos' own ordering is preserved rather than the lookup's.
+- `smart_album_counts()` batches every count into one `osascript` call, and is best-effort: the picker has to open when Photos is closed, so a missing count shows as `—` rather than failing the list.
+
+**The one hard requirement this adds:** a running Photos.app with the library open, for Smart Albums only. Regular albums still read straight from the catalogue. `SmartAlbumUnavailable` → 503 saying exactly that, instead of a generic error.
+
+**Worth knowing when culling one:** membership moves. A Smart Album built on `KaMeRa:*` keywords — which the app's own copy suggests — changes as you decide, so reconcile's `not_in_album` will show traffic there. It still defaults to leaving rows alone, so this is noise rather than risk. Verified live end to end: 2114 members → 1868 analysable (242 movies, 4 evicted originals), keyword state and reconcile classification both run against it.
+
+---
+
+## The memo that never fired, and a Settings tab that was filed by accident (2026-09-19, later still)
+
+Two things came out of looking at grid performance, and the first one was not what was expected.
+
+**`ImageCard`'s `memo()` was decorative.** The component has been memoised for a long time, but `memo` compares props shallowly and the call site passed `onDragStart={(e) => {…}}` — a fresh function identity on every render. The comparison failed on that one prop every single time, so **every App render re-rendered all N cards**. The place that hurts is the primary culling loop: one arrow key changes `isSelected` on exactly two tiles, and a thousand were re-rendering. `ImageCard` now hands its own `image` back to the handler (`onDragStart(e, image)`), which lets App hold one stable `useCallback`; the multi-select state it needs is read through a ref, so the callback never has to be rebuilt. Creating the small arrow *inside* the card is free — `memo` stops that function running at all when nothing about the card changed. `useGroupScrub`'s return object got the same treatment (it was a fresh literal per render, passed straight to the memoised group tiles), and `images` now falls back to a module-level constant instead of a new `[]`.
+
+**Virtualization was considered and not built.** After the prop fix, what remains is initial render and DOM weight — real, but much smaller than the per-keystroke win, and a JS virtualizer would have to be paid for in exactly the places this grid is most intricate: roving `tabIndex`, `data-grid-idx` lookups, `.focus()` from arrow navigation, drag-and-drop, scroll-into-view. All of those address cells directly and none of them survive unmounting. `content-visibility: auto` on the cell wrapper buys most of the same benefit — the browser skips layout and paint for off-screen tiles — while leaving the DOM tree untouched, so nothing above needed changing. `contain-intrinsic-size: auto 15rem` keeps the scrollbar honest. Checked first that nothing in a cell paints outside its box (no negative offsets, no `position: fixed`, and the hover scrub panel portals to `body`), because `content-visibility` brings `contain: paint` with it.
+
+**Settings grew a third tab.** Not for density — for meaning. **Reject destination** sat under *Display*, three sections below the interface size, and it is the switch that decides whether a rejected photo lands in a recoverable `_Rejects/` folder or in the system Trash. *Advance cursor* was there too, and *Grouping* was filed under *Model* despite being neither. The new **Workflow** tab holds those three. `Analysis scope` stays under Model on purpose: it shares the sticky-footer Apply state with the presets, and splitting it would orphan its own Apply button.
+
+---
+
+## Photos reconcile — the way back in (2026-09-19, later)
+
+Decisions only ever flowed outward: KaMeRa wrote `KaMeRa:Keep|Maybe|Reject` keywords and never read them back. Three keywords deleted by hand in Photos on 2026-09-18 went unnoticed, and two photos kept a `keep` decision with nothing behind it — which is also what sent a debugging session chasing a bug that did not exist.
+
+`GET /photos-album/diff` now reports the drift per photo in five classes, and `POST /photos-album/reconcile` applies a chosen direction per class. **Neither side is authoritative**, because they disagree for good reasons in both directions: a keyword set by hand in Photos is a real decision, and so is one made here. Only `keyword_missing` defaults to acting — there the two sides do not contradict each other, one simply never arrived. Everything else defaults to `skip`.
+
+The classification lives in `backend/photos_reconcile.py` as a **pure function** — rows in, diff out, no library and no database. That is deliberate: the half of this feature that deletes rows must be testable on a machine with no Photos at all, not only on the developer's Mac. Every write reuses an existing path (the sink for keywords, `_apply_decision` for decisions, `_delete_image_rows` for removals) so reconcile cannot grow its own idea of what a decision is, and it re-reads the diff instead of trusting the client — an edit made in Photos while the modal sat open must not be overwritten by the picture the user was shown.
+
+Two refusals rather than guesses: an asset carrying **two** KaMeRa keywords has no "what Photos says", so adopting it is refused and reported instead of coin-flipping; and a photo that merely left the album is never removed by the `asset_gone` action, because "gone from the library" and "gone from the album" are different facts with different consequences.
+
+**Two robustness fixes fell out of testing it.** Forcing a catalogue re-read (reconcile's whole point is to see edits made since KaMeRa last looked) made this the first caller to hit a library that had been deleted — and osxphotos' bare `FileNotFoundError` surfaced as a 500. It is now a 404 naming the library and telling the user to pick another. Getting there required care: `Path.exists()` returns False under a TCC denial too, so a naive existence check would have reintroduced exactly the absence/denial conflation this project already lost a day to. `_library_is_really_absent()` only claims absence when it can **list the parent directory and see the package is not in it**; when the parent is unreadable it makes no claim and the caller reports an access problem, which is the one with an action attached. Separately, the library picker listed the same library twice — the directory scan and Spotlight returned it spelled differently, and a set of raw strings does not de-duplicate `/a/b` against `/a/b/`. Paths are resolved before de-duplication now.
+
+**Not yet observed live:** no photo in the available library currently carries a `KaMeRa:*` keyword, so a non-empty keyword read has not been seen end to end. The read path is verified (315 assets and 6118 library UUIDs came back correctly); the parsing of a populated keyword list is covered only by tests.
+
+---
+
+## Three honesty fixes after an outside review (2026-09-19)
+
+An external review pass (ChatGPT Codex) re-derived most of [PLAN-photos-next.md](PLAN-photos-next.md) as new findings, but three items survived verification against the code, and one more turned up while checking them.
+
+**TCC under the LaunchAgent: verified, nothing to do.** Every TCC finding in the Photos feature had been measured against the old applet-spawned process. Re-measured against `gui/502/com.philippklein.kamera.backend`: `/photos-libraries` lists both libraries `readable: true`, `/photos-albums` opens the selected one and returns the 1248-photo album. Only `detected` stays `null` — `get_last_library_path()` is still blocked, which the explicit-choice design already routes around. No new grant is needed after installing the agent. Recorded in [PLAN-photos-source.md](PLAN-photos-source.md).
+
+**`reject_to_system_trash` never worked.** Found while verifying the auto-cull copy below. `POST /settings` writes booleans as `"1"`/`"0"`; `sources/folder.py` read the key with a literal `== "true"` test, so the toggle evaluated False no matter how it was set. It shipped that way and went unnoticed because it fails in the *safe* direction — rejects kept landing in the recoverable `_Rejects/` folder instead of the OS Trash. Every other boolean reader in the codebase used the correct truthy set; this was the one that re-derived it. Parsing now lives in `database.get_bool_setting()` next to the writer's format, and the three already-correct duplicates read through it too, so there is one truthy set instead of four. `tests/test_bool_setting_roundtrip.py` exercises the real writer and the real reader — mocking either one is what let this hide.
+
+**Auto-cull's modal promised something it could not keep.** It said *"Files move immediately"* in every case, but auto-cull commits through the same sink as a manual R press, so with the Trash route on one click sends N files to the OS Trash. `GET /auto-cull/preview` now resolves the real destination server-side (`reject_destination`: mode, label, `undoable`) — honouring per-folder `rejects_folder` overrides — and the modal states it before the click, including that `U` cannot take a trashed file back because it is no longer addressable. In Trash mode the confirm button turns coral-outlined (new `BTN_PRIMARY_DANGER` / `.btn-destructive`) and leads with the number that leaves the shoot: `Cull 1248 · trash 312`, not the reassuring total alone.
+
+**`POST /trash-rejects` was not tab-scoped.** It swept every reject in the database, while the button that calls it sits in a bar labelled with the *active tab's* reject count — so pressing it in tab B trashed tab A's rejects under a number that described neither. `source_folder` is now a required body field: omitting it is a 422, not a wider sweep. The confirm line names the tab. Photos rows were already safe via `supports_bulk_trash = False`. Guarded by `tests/test_trash_rejects_scope.py`.
+
+**Mid-batch `/images` refetching was quadratic.** The grid reloaded on *every* completed photo, and `/images` always returns the tab's whole list — measured at ~1.27 KB per row, so a 1248-photo album meant ~1248 fetches averaging ~0.8 MB, each one also re-running the tab's filter/sort memo and re-rendering every card. Payload slimming was measured and rejected: no single field dominates (`explanation` is null until DetailView asks for it), so dropping columns buys ~20% at best. The frequency was the lever — mid-batch refetches are now throttled to one per 1500 ms (`IMAGE_REFETCH_MIN_MS`). Safe because batch completion already does one unconditional full fetch, so the end state stays exact.
+
+Not done, and deliberately separate: grid virtualization, Photos↔KaMeRa reconcile, Settings information architecture. Each needs its own decisions.
+
+---
+
 ## macOS 27 reaps what an applet spawns (2026-09-18, later)
 
 Four "failed to fetch" reports in one afternoon — folder picker, closing a tab, closing a tab again, ERR_CONNECTION_REFUSED on reload. One cause, and not in any of the endpoints being clicked: the backend was already dead, and the click was just the first thing to notice.
