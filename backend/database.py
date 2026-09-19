@@ -654,6 +654,27 @@ def get_setting(key: str, default: str | None = None, db_path: Path = DEFAULT_DB
     return row["value"] if row else default
 
 
+# The settings table stores booleans as "1"/"0" (see routers/settings.py's
+# write path), but earlier hand-written readers each re-implemented the
+# parse and one of them accepted only the string "true" — so
+# `reject_to_system_trash` read as OFF no matter how it was set, and the
+# toggle silently did nothing from the day it shipped. It failed in the safe
+# direction (rejects kept going to the recoverable _Rejects/ folder), which
+# is exactly why nobody noticed.
+#
+# One parser, next to the writer's format. Any new boolean setting reads
+# through this; nothing re-derives the truthy set.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def get_bool_setting(key: str, default: bool = False, db_path: Path = DEFAULT_DB_PATH) -> bool:
+    """Return a boolean setting, accepting every form the writer may have used."""
+    raw = get_setting(key, db_path=db_path)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUTHY
+
+
 def set_setting(key: str, value: str, db_path: Path = DEFAULT_DB_PATH) -> None:
     """Insert or replace a setting value."""
     with get_db(db_path) as conn:

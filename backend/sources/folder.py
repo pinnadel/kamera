@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from backend.database import get_folder_overrides, get_setting
+from backend.database import get_bool_setting, get_folder_overrides
 from backend.file_mover import (
     _KEEPS_REVIEWED_SUBFOLDER,
     move_photo,
@@ -40,7 +40,10 @@ def _reject_to_system_trash_enabled() -> bool:
     a reject goes through send2trash instead, and can be recovered from the
     Trash / Recycle Bin.
     """
-    return (get_setting("reject_to_system_trash", "false") or "false").lower() == "true"
+    # Reads through get_bool_setting: settings are written as "1"/"0", and the
+    # literal `== "true"` test that used to live here never matched, so this
+    # toggle did nothing from the day it shipped (see database.get_bool_setting).
+    return get_bool_setting("reject_to_system_trash", False)
 
 
 class FolderSink:

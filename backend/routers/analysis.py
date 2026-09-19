@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from phase1_technical.exposure import compute_histogram as _compute_histogram
 
-from backend.database import get_db, get_setting, write_shooting_log
+from backend.database import get_bool_setting, get_db, get_setting, write_shooting_log
 from backend.state import (
     PREVIEW_CACHE_DIR,
     _personal_model,
@@ -166,8 +166,7 @@ def _is_sidecar_preview_preferred() -> bool:
     global _sidecar_pref_cache
     if _sidecar_pref_cache is not None:
         return _sidecar_pref_cache
-    raw = get_setting("prefer_sidecar_preview")
-    val = raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+    val = get_bool_setting("prefer_sidecar_preview", False)
     _sidecar_pref_cache = val
     return val
 

@@ -223,11 +223,8 @@ def get_analysis_mode() -> str:
 
 def _is_sidecar_preview_preferred() -> bool:
     """Read the current value of the prefer_sidecar_preview toggle."""
-    from backend.database import get_setting
-    raw = get_setting("prefer_sidecar_preview")
-    if raw is None:
-        return False
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    from backend.database import get_bool_setting
+    return get_bool_setting("prefer_sidecar_preview", False)
 
 
 # ---------------------------------------------------------------------------

@@ -147,12 +147,12 @@ def _read_float(key: str, default: float, lo: float, hi: float) -> float:
 
 
 def _read_bool(key: str, default: bool) -> bool:
+    # Parsing lives in database.get_bool_setting — one truthy set for the whole
+    # app. The try/except stays: this is called from the scoring path, which
+    # must survive a missing/locked DB by falling back to the default.
     try:
-        from backend.database import get_setting
-        raw = get_setting(key)
-        if raw is None:
-            return default
-        return raw.strip().lower() in ("1", "true", "yes", "on")
+        from backend.database import get_bool_setting
+        return get_bool_setting(key, default)
     except Exception:
         return default
 
