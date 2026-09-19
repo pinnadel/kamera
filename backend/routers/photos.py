@@ -19,7 +19,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend import photos_library
-from backend.photos_library import PhotosAccessError
+from backend.photos_library import (
+    PhotosAccessError,
+    PhotosLibraryMissing,
+    SmartAlbumUnavailable,
+)
 from backend.database import get_db
 from backend.routers.analysis import _run_batch
 from backend.state import _progress, _stop_event, watcher
@@ -73,6 +77,37 @@ _ACCESS_HELP = (
     "\u201cpython\u201d entry may need it too."
 )
 
+
+
+
+def _smart_album_unreachable(exc: Exception) -> HTTPException:
+    """Photos would not answer for a Smart Album's contents.
+
+    A Smart Album is a stored query, so its members exist only inside Photos —
+    unlike a regular album, whose membership KaMeRa reads straight from the
+    catalogue. That makes a running Photos.app a hard requirement here and only
+    here, which is worth saying plainly rather than reporting a generic error.
+    """
+    return HTTPException(
+        status_code=503,
+        detail=f"Photos could not list this Smart Album's photos ({exc}). A Smart "
+               f"Album is a live query, so Photos has to be running with this "
+               f"library open to answer it — regular albums do not need that.",
+    )
+
+def _missing_library(library_path: str) -> HTTPException:
+    """A gone library is a 404 with an instruction, not a 403 or a 500.
+
+    Distinct from the access-denied path on purpose: nothing about granting a
+    permission helps here, and telling the user to open System Settings for a
+    library that no longer exists sends them somewhere useless.
+    """
+    name = Path(library_path).stem
+    return HTTPException(
+        status_code=404,
+        detail=f"The Photos library “{name}” is no longer at {library_path}. "
+               f"It was moved or deleted — pick another library in the album picker.",
+    )
 
 class SelectLibraryRequest(BaseModel):
     library_path: str | None = None
@@ -141,6 +176,8 @@ def photos_albums(refresh: bool = False, library_path: str | None = None):
         )
     try:
         albums = photos_library.list_albums(library, refresh=refresh)
+    except PhotosLibraryMissing:
+        raise _missing_library(library)
     except PhotosAccessError as exc:
         logger.warning("Photos library not readable: %s", exc)
         raise HTTPException(status_code=403, detail=_ACCESS_HELP)
@@ -208,6 +245,10 @@ def analyze_photos_album(request: AnalyzePhotosAlbumRequest):
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except SmartAlbumUnavailable as exc:
+        raise _smart_album_unreachable(exc)
+    except PhotosLibraryMissing:
+        raise _missing_library(request.library_path)
     except PhotosAccessError as exc:
         logger.warning("Photos library not readable: %s", exc)
         raise HTTPException(status_code=403, detail=_ACCESS_HELP)
@@ -295,4 +336,225 @@ def analyze_photos_album(request: AnalyzePhotosAlbumRequest):
         "total": len(to_analyze),
         "skipped": skipped,
         "total_found": len(assets),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reconcile — KaMeRa ↔ Photos drift
+# ---------------------------------------------------------------------------
+
+
+class ReconcileRequest(BaseModel):
+    source_folder: str
+    # Class name → action. Omitted classes fall back to DEFAULT_ACTIONS, which
+    # leaves everything alone except keyword_missing. Validated strictly: this
+    # endpoint deletes rows, so an unrecognised key is an error, not a no-op.
+    actions: dict[str, str] = {}
+
+
+def _photos_tab(source_folder: str) -> dict:
+    """The photos_albums row for a tab, or 404."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM photos_albums WHERE source_folder = ?",
+            (source_folder,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not a known Photos album tab")
+    return dict(row)
+
+
+def _tab_rows(source_folder: str) -> list[dict]:
+    """This tab's images joined to their decision, in a stable order."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.filename, i.photos_uuid, i.source_folder,
+                   i.file_path, i.source_type, d.decision
+            FROM images i
+            LEFT JOIN decisions d ON d.image_id = i.id
+            WHERE i.source_folder = ?
+            ORDER BY i.filename
+            """,
+            (source_folder,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _build_diff(source_folder: str):
+    """Shared by the diff endpoint and reconcile, so both see one truth.
+
+    Reconcile deliberately re-reads rather than trusting what the client was
+    shown: the user may have changed something in Photos while the diff sat on
+    screen, and acting on a stale picture is how a reconcile would destroy the
+    very edit it was meant to adopt.
+    """
+    from backend import photos_reconcile
+
+    _require_photos()
+    tab = _photos_tab(source_folder)
+    _require_open_library(tab["library_path"])
+
+    try:
+        in_album, library_uuids = photos_library.album_keyword_state(
+            tab["library_path"], tab["album_uuid"]
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Album “{tab['album_name']}” no longer exists in this library",
+        )
+    except SmartAlbumUnavailable as exc:
+        raise _smart_album_unreachable(exc)
+    except PhotosLibraryMissing:
+        raise _missing_library(tab["library_path"])
+    except PhotosAccessError:
+        raise HTTPException(status_code=403, detail=_ACCESS_HELP)
+
+    rows = _tab_rows(source_folder)
+    diff = photos_reconcile.classify(rows, in_album, library_uuids)
+    return tab, rows, diff
+
+
+@router.get("/photos-album/diff")
+def photos_album_diff(source_folder: str):
+    """What disagrees between this tab and the Photos library, per photo.
+
+    Read-only. Re-parses the library catalogue so the answer reflects keyword
+    edits made in Photos since KaMeRa last looked — a cached read would report
+    drift that is already gone and miss the drift that matters.
+    """
+    from backend import photos_reconcile
+
+    tab, _rows, diff = _build_diff(source_folder)
+    return {
+        "source_folder": source_folder,
+        "album_name": tab["album_name"],
+        "library_path": tab["library_path"],
+        "library_name": Path(tab["library_path"]).stem,
+        "actions": photos_reconcile.ACTIONS,
+        "default_actions": photos_reconcile.DEFAULT_ACTIONS,
+        **diff.as_dict(),
+    }
+
+
+@router.post("/photos-album/reconcile")
+def photos_album_reconcile(request: ReconcileRequest):
+    """Apply a chosen direction per mismatch class.
+
+    Every write goes through the same paths a normal decision uses — the sink
+    for keywords, `_apply_decision` for decisions, `_delete_image_rows` for
+    removals — so reconcile cannot develop its own idea of what a decision is.
+
+    Failures are per-photo and never abort the run: a keyword write that 409s
+    because the library changed under us leaves that one row untouched and
+    reported, rather than half-applying the batch and claiming success.
+    """
+    from backend import photos_reconcile
+    from backend.routers.decisions import _apply_decision
+    from backend.routers.images import _delete_image_rows
+    from backend.sources import sink_for
+
+    try:
+        actions = photos_reconcile.validate_actions(request.actions)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    tab, rows, diff = _build_diff(request.source_folder)
+    by_id = {r["id"]: r for r in rows}
+    sink = sink_for({"source_type": "photos"})
+
+    applied: dict[str, int] = {name: 0 for name in photos_reconcile.CLASSES}
+    errors: list[dict] = []
+    drop_ids: list[int] = []
+
+    def _fail(entry: dict, exc: Exception) -> None:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        errors.append({
+            "image_id": entry.get("image_id"),
+            "filename": entry.get("filename"),
+            "error": detail,
+        })
+        logger.warning("reconcile: %s failed: %s", entry.get("filename"), detail)
+
+    for name in photos_reconcile.CLASSES:
+        action = actions[name]
+        if action == "skip":
+            continue
+
+        for entry in diff.classes[name]:
+            image_id = entry.get("image_id")
+            row = by_id.get(image_id)
+            try:
+                if row is None and action != "drop":
+                    # The row vanished between the diff and now (a concurrent
+                    # Clear Analysis, another tab). Say so rather than failing
+                    # deeper with a confusing NoneType error.
+                    raise ValueError("row no longer exists — re-run the diff")
+
+                if entry.get("ambiguous") and action == "photos":
+                    # Two KaMeRa keywords on one asset: there is no "what
+                    # Photos says". Picking the first would be a coin flip
+                    # recorded as a decision, so this one goes back to the user.
+                    raise ValueError(
+                        "carries more than one KaMeRa keyword — remove one in "
+                        "Photos, then reconcile again"
+                    )
+
+                if action == "drop":
+                    # Deferred: one batched delete after the loop, so a
+                    # partial failure elsewhere cannot leave rows half-removed.
+                    drop_ids.append(image_id)
+
+                elif action == "apply":
+                    # KaMeRa is right, the write simply never landed.
+                    sink.apply(row, entry["decision"], is_auto=False)
+
+                elif action == "kamera":
+                    # Conflict resolved toward KaMeRa: overwrite the marker.
+                    sink.apply(row, entry["decision"], is_auto=False)
+
+                elif action in ("photos", "import"):
+                    # Conflict resolved toward Photos, or a decision made
+                    # there. _apply_decision re-writes the same keyword
+                    # (idempotent) and records it as a manual decision — which
+                    # it is: a human set that keyword by hand.
+                    decision = photos_reconcile.KEYWORD_DECISIONS.get(entry.get("keyword"))
+                    if decision is None:
+                        raise ValueError(f"Unreadable keyword {entry.get('keyword')!r}")
+                    _apply_decision(image_id, decision, reason="manual")
+
+                elif action == "clear":
+                    if name == "keyword_missing":
+                        # Drop OUR decision — Photos is treated as the record.
+                        with get_db() as conn:
+                            conn.execute(
+                                "DELETE FROM decisions WHERE image_id = ?", (image_id,)
+                            )
+                    else:
+                        # Drop THEIR marker — KaMeRa has no decision to back it.
+                        sink.undo(row, None)
+
+                applied[name] += 1
+            except Exception as exc:  # noqa: BLE001 — reported, never fatal
+                _fail(entry, exc)
+
+    dropped = 0
+    if drop_ids:
+        try:
+            _delete_image_rows(drop_ids)
+            dropped = len(drop_ids)
+        except Exception as exc:  # noqa: BLE001
+            # Report honestly instead of letting the successful keyword writes
+            # above disappear behind a 500.
+            errors.append({"image_id": None, "filename": None,
+                           "error": f"could not drop {len(drop_ids)} row(s): {exc}"})
+            for name in ("not_in_album", "asset_gone"):
+                applied[name] = 0
+
+    return {
+        "applied": applied,
+        "dropped_rows": dropped,
+        "errors": errors,
+        "actions": actions,
     }

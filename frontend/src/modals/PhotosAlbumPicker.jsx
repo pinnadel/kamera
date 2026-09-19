@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronLeft, Images, Library, Search, X } from 'lucide-react'
+import { Check, ChevronLeft, Images, Library, Search, Sparkles, X } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_SECONDARY } from '../ui/buttons'
 
@@ -237,14 +237,27 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
                   onClick={() => onPick(library.path, album.uuid, album.name)}
                   className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left hover:bg-[#151618] transition-colors"
                 >
-                  <Images size={14} className="text-[#6a6b6c] shrink-0" />
+                  {/* Smart Albums get their own icon and label because they
+                      behave differently in a way that matters here: they are a
+                      live query, so their contents can change between one
+                      analysis and the next. Everything downstream treats them
+                      the same, but the user should know which kind they picked. */}
+                  {album.smart
+                    ? <Sparkles size={14} className="text-[#5BB8D4] shrink-0" />
+                    : <Images size={14} className="text-[#6a6b6c] shrink-0" />}
                   <span className="min-w-0 flex-1">
                     <span className="block text-xs text-[#f0f0f0] truncate">{album.name}</span>
-                    {album.folders?.length > 0 && (
+                    {album.smart ? (
+                      <span className="block text-xs text-[#5BB8D4] truncate">Smart Album — contents update themselves</span>
+                    ) : album.folders?.length > 0 && (
                       <span className="block text-xs text-[#6a6b6c] truncate">{album.folders.join(' / ')}</span>
                     )}
                   </span>
-                  <span className="text-xs font-mono text-[#6a6b6c] shrink-0">{album.count}</span>
+                  <span className="text-xs font-mono text-[#6a6b6c] shrink-0">
+                    {/* A Smart Album count comes from Photos, not the
+                        catalogue, so it is absent when Photos is closed. */}
+                    {album.count ?? '—'}
+                  </span>
                 </button>
               ))}
             </div>

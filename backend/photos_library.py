@@ -182,10 +182,19 @@ def list_libraries() -> list[dict]:
 
     open_library = detected_library_path()
     seen, libraries = set(), []
-    for path in sorted(set(found) | ({open_library} if open_library else set())):
-        if not _is_user_library(path) or path in seen:
+    # Normalise before de-duplicating: the directory scan and Spotlight can
+    # return the same library spelled differently (a trailing slash, a symlink
+    # through /Users vs /System/Volumes/Data), and a set of raw strings then
+    # lists it twice in the picker.
+    candidates = {
+        str(Path(p).resolve()): p
+        for p in (set(found) | ({open_library} if open_library else set()))
+    }
+    for path in sorted(candidates.values(), key=lambda p: p.lower()):
+        resolved = str(Path(path).resolve())
+        if not _is_user_library(path) or resolved in seen:
             continue
-        seen.add(path)
+        seen.add(resolved)
         libraries.append({
             "path": path,
             "name": Path(path).stem,
@@ -263,6 +272,41 @@ class PhotosAccessError(Exception):
     """
 
 
+class PhotosLibraryMissing(Exception):
+    """The library package is not at that path any more.
+
+    Kept distinct from PhotosAccessError on purpose. On macOS a permission
+    denial and a deleted file are indistinguishable at the syscall level, and
+    conflating them is what sent a whole debugging session in the wrong
+    direction (docs/Learning-Journal.md, 2026-09-18): "not found" was reported
+    where "not allowed" was meant. Here the cause IS absence, and the user
+    needs a different instruction — pick another library, not grant a
+    permission — so it gets its own type and its own message.
+    """
+
+
+def _library_is_really_absent(library_path: str) -> bool:
+    """True only when we can actually SEE that the library is not there.
+
+    `Path.exists()` cannot answer this. Under a TCC denial it returns False for
+    a package that exists and is perfectly readable by another process, which
+    is the exact confusion that cost a debugging session on 2026-09-18 —
+    "not found" reported where "not allowed" was meant.
+
+    Listing the PARENT directory can answer it: if the parent enumerates and
+    the package is not among its entries, it is genuinely gone. If the parent
+    itself is unreadable we have learned nothing, and must not claim absence —
+    so the ambiguous case returns False and the caller reports an access
+    problem instead, which is the one that has an action attached to it.
+    """
+    path = Path(library_path)
+    try:
+        names = {entry.name for entry in path.parent.iterdir()}
+    except OSError:
+        return False
+    return path.name not in names
+
+
 def _db_for(library_path: str, refresh: bool = False):
     from osxphotos import PhotosDB
 
@@ -274,6 +318,13 @@ def _db_for(library_path: str, refresh: bool = False):
             logger.info("Reading Photos library catalogue: %s", library_path)
             try:
                 db = PhotosDB(dbfile=library_path)
+            except FileNotFoundError as exc:
+                # osxphotos decides this with its own exists() check, so it
+                # inherits the same ambiguity. Only claim "gone" when the
+                # parent directory proves it.
+                if _library_is_really_absent(library_path):
+                    raise PhotosLibraryMissing(library_path) from exc
+                raise PhotosAccessError(str(exc)) from exc
             except PermissionError as exc:
                 raise PhotosAccessError(str(exc)) from exc
             except OSError as exc:
@@ -285,8 +336,121 @@ def _db_for(library_path: str, refresh: bool = False):
         return db
 
 
+# Photos stores a user-created Smart Album with this kind. Apple's own
+# built-ins (Favourites, Recents, Screenshots, …) use the 1500–1650 range too
+# but carry no stored title — Photos localises those at runtime — so requiring
+# a title is what separates "the user made this" from "the app ships this".
+_SMART_ALBUM_KIND = 1507
+
+
+class SmartAlbumUnavailable(Exception):
+    """Photos could not be asked for a Smart Album's members.
+
+    Smart Albums are the one thing here that cannot be answered from the
+    catalogue, so this failure is structural rather than incidental — see
+    smart_album_member_uuids().
+    """
+
+
+def _osascript(script: str, timeout: int = 120) -> str:
+    """Run one AppleScript and return its stdout, or raise SmartAlbumUnavailable."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError as exc:            # not macOS
+        raise SmartAlbumUnavailable("osascript is not available") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SmartAlbumUnavailable("Photos did not answer in time") from exc
+    if proc.returncode != 0:
+        raise SmartAlbumUnavailable((proc.stderr or "Photos refused the request").strip())
+    return proc.stdout
+
+
+def smart_albums(library_path: str, refresh: bool = False) -> dict[str, str]:
+    """uuid → title for every user-created Smart Album in the library."""
+    db = _db_for(library_path, refresh=refresh)
+    return {
+        uuid: detail["title"]
+        for uuid, detail in db._dbalbum_details.items()
+        if detail.get("kind") == _SMART_ALBUM_KIND
+        and detail.get("title")
+        and not detail.get("intrash")
+    }
+
+
+def smart_album_member_uuids(album_uuid: str) -> list[str]:
+    """The assets currently matching a Smart Album, via AppleScript.
+
+    **This cannot come from the catalogue.** A Smart Album is a stored query,
+    not a stored list: its rows in the album↔asset join table are empty
+    (verified 2026-09-19 — 0 rows for a Smart Album holding 2114 photos) and
+    Photos evaluates the predicate live. osxphotos therefore does not expose
+    Smart Albums at all, and asking AppleScript is the only route.
+
+    Addressed by `album id`, never by name. Album names are not unique in
+    Photos, and `album "Foo"` silently resolves to whichever one comes first —
+    a wrong-album read that looks like a correct one.
+
+    Measured at ~0.5s for 2114 members, so this is cheap enough to call per
+    analysis run. It does require Photos.app to be running with this library
+    open, which every write already requires.
+    """
+    raw = _osascript(
+        f'tell application "Photos" to get id of media items in album id "{album_uuid}"'
+    )
+    # Photos returns "<uuid>/L0/001, <uuid>/L0/001, …"; KaMeRa keys on the
+    # bare UUID, which is what osxphotos uses too.
+    return [
+        part.strip().split("/")[0]
+        for part in raw.split(",")
+        if part.strip()
+    ]
+
+
+def smart_album_counts(album_uuids: list[str]) -> dict[str, int]:
+    """Member counts for several Smart Albums in ONE osascript call.
+
+    Batched because the cost here is process spawn plus Photos IPC, not the
+    counting — asking separately would make the album picker wait half a
+    second per Smart Album. Best-effort by design: the picker must still open
+    when Photos is closed, so a failure yields no counts rather than an error.
+    """
+    if not album_uuids:
+        return {}
+    lines = "\n".join(
+        f'set out to out & "{u}=" & (count of media items in album id "{u}") & linefeed'
+        for u in album_uuids
+    )
+    script = f'tell application "Photos"\nset out to ""\n{lines}\nreturn out\nend tell'
+    try:
+        raw = _osascript(script, timeout=60)
+    except SmartAlbumUnavailable as exc:
+        logger.debug("Smart Album counts unavailable: %s", exc)
+        return {}
+
+    counts: dict[str, int] = {}
+    for line in raw.splitlines():
+        uuid, _, value = line.partition("=")
+        try:
+            counts[uuid.strip()] = int(value.strip())
+        except ValueError:
+            continue
+    return counts
+
+
 def list_albums(library_path: str, refresh: bool = False) -> list[dict]:
-    """Every album in the library, with its folder path and asset count."""
+    """Every album in the library — regular and Smart — with its count.
+
+    Smart Albums carry `smart: True` and may carry `count: None`. Their counts
+    come from Photos over AppleScript (the catalogue does not store Smart Album
+    membership at all), batched into one call and treated as best-effort: the
+    picker has to open even when Photos is closed, so a missing count is a
+    missing number, never an error.
+    """
     db = _db_for(library_path, refresh=refresh)
     albums = []
     for album in db.album_info:
@@ -297,9 +461,51 @@ def list_albums(library_path: str, refresh: bool = False) -> list[dict]:
             "path": "/".join(folders + [album.title]),
             "folders": folders,
             "count": len(album),
+            "smart": False,
         })
+
+    smart = smart_albums(library_path, refresh=refresh)
+    counts = smart_album_counts(list(smart)) if smart else {}
+    for uuid, title in smart.items():
+        albums.append({
+            "uuid": uuid,
+            "name": title,
+            # Photos shows Smart Albums at the top level, not inside the folder
+            # tree the catalogue records for regular albums.
+            "path": title,
+            "folders": [],
+            "count": counts.get(uuid),
+            "smart": True,
+        })
+
     albums.sort(key=lambda a: a["path"].lower())
     return albums
+
+
+def _album_photos(db, library_path: str, album_uuid: str) -> list:
+    """Every PhotoInfo in an album — regular or Smart.
+
+    One resolver for both kinds so nothing downstream has to know the
+    difference. A regular album's membership comes from the catalogue; a Smart
+    Album's can only come from Photos itself (see smart_album_member_uuids),
+    and the UUIDs it returns are then looked back up in the catalogue so both
+    paths hand back the same objects.
+    """
+    album = next((a for a in db.album_info if a.uuid == album_uuid), None)
+    if album is not None:
+        return list(album.photos)
+
+    smart = smart_albums(library_path)
+    if album_uuid not in smart:
+        raise KeyError(f"Album {album_uuid} not found in {library_path}")
+
+    member_uuids = smart_album_member_uuids(album_uuid)
+    if not member_uuids:
+        return []
+    # Order follows Photos' own, not the lookup's, so the grid's initial
+    # ordering matches what the user sees in the album.
+    by_uuid = {p.uuid: p for p in db.photos(uuid=member_uuids, movies=True)}
+    return [by_uuid[u] for u in member_uuids if u in by_uuid]
 
 
 def album_assets(library_path: str, album_uuid: str, refresh: bool = False) -> tuple[list[PhotoAsset], dict]:
@@ -315,14 +521,12 @@ def album_assets(library_path: str, album_uuid: str, refresh: bool = False) -> t
       - anything whose suffix KaMeRa cannot decode.
     """
     db = _db_for(library_path, refresh=refresh)
-    album = next((a for a in db.album_info if a.uuid == album_uuid), None)
-    if album is None:
-        raise KeyError(f"Album {album_uuid} not found in {library_path}")
+    photos = _album_photos(db, library_path, album_uuid)
 
     assets: list[PhotoAsset] = []
     skipped = {"movies": 0, "missing_originals": 0, "unsupported": 0}
 
-    for photo in album.photos:
+    for photo in photos:
         if photo.ismovie:
             skipped["movies"] += 1
             continue
@@ -345,7 +549,44 @@ def album_assets(library_path: str, album_uuid: str, refresh: bool = False) -> t
     return assets, skipped
 
 
+def album_keyword_state(
+    library_path: str, album_uuid: str, refresh: bool = True
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Read every album asset's keywords, plus the library's whole UUID set.
+
+    Returns `(in_album, library_uuids)`:
+      - `in_album` maps asset UUID → its keywords, for EVERY photo in the
+        album. Deliberately unfiltered, unlike album_assets(): a movie, an
+        unsupported format or an original evicted by "Optimize Mac Storage" is
+        still *in the album*, and treating it as absent would misreport it as
+        `not_in_album` and invite dropping a perfectly good row.
+      - `library_uuids` is every asset UUID in the library, which is what
+        separates "this photo left the album" from "this photo is gone".
+
+    `refresh=True` by default: the catalogue is cached per library path, and a
+    reconcile's entire job is to see keywords the user changed in Photos since
+    that cache was built. Reading a stale copy would report drift that is not
+    there and miss the drift that is. Costs one catalogue re-parse, which is
+    the price of an answer that is true right now.
+    """
+    db = _db_for(library_path, refresh=refresh)
+    # Smart Albums go through the same resolver, which means a reconcile on one
+    # compares against its membership AS IT IS RIGHT NOW. That is the honest
+    # reading: the album is a live query, so "in the album" has no other
+    # meaning. It does mean a Smart Album built on KaMeRa keywords will show
+    # members coming and going as you cull — expected, and the reason
+    # `not_in_album` still defaults to leaving rows alone.
+    in_album = {
+        photo.uuid: list(photo.keywords or [])
+        for photo in _album_photos(db, library_path, album_uuid)
+    }
+    library_uuids = {photo.uuid for photo in db.photos()}
+    return in_album, library_uuids
+
+
 def album_name(library_path: str, album_uuid: str) -> str | None:
     db = _db_for(library_path)
     album = next((a for a in db.album_info if a.uuid == album_uuid), None)
-    return album.title if album else None
+    if album is not None:
+        return album.title
+    return smart_albums(library_path).get(album_uuid)

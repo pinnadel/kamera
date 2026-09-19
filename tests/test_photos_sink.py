@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -210,3 +211,53 @@ def test_eperm_from_osxphotos_is_translated(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(pl.PhotosAccessError):
         pl._db_for("/Users/x/Pictures/Test.photoslibrary")
+
+
+def test_a_genuinely_deleted_library_is_reported_as_missing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parent listable + entry absent = we can see it is gone."""
+    import backend.photos_library as pl
+
+    monkeypatch.setitem(sys.modules, "osxphotos", type("m", (), {
+        "PhotosDB": staticmethod(lambda dbfile=None: (_ for _ in ()).throw(
+            FileNotFoundError(2, "No such file or directory")))
+    }))
+    monkeypatch.setattr(pl, "_db_cache", {})
+
+    gone = tmp_path / "Deleted.photoslibrary"      # parent exists, entry does not
+    with pytest.raises(pl.PhotosLibraryMissing):
+        pl._db_for(str(gone))
+
+
+def test_an_unreadable_parent_is_not_called_missing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ambiguous case must claim access trouble, never absence.
+
+    Path.exists() is False under a TCC denial too, so "I cannot see it" is not
+    evidence that it is gone. Telling the user their library was deleted when
+    it is merely unreadable sends them looking for a backup they do not need.
+    """
+    import backend.photos_library as pl
+
+    monkeypatch.setitem(sys.modules, "osxphotos", type("m", (), {
+        "PhotosDB": staticmethod(lambda dbfile=None: (_ for _ in ()).throw(
+            FileNotFoundError(2, "No such file or directory")))
+    }))
+    monkeypatch.setattr(pl, "_db_cache", {})
+    # Stand in for a parent directory the process may not enumerate.
+    monkeypatch.setattr(pl, "_library_is_really_absent", lambda _p: False)
+
+    with pytest.raises(pl.PhotosAccessError):
+        pl._db_for(str(tmp_path / "Unknown.photoslibrary"))
+
+
+def test_absence_check_says_no_when_the_parent_is_unreadable(monkeypatch) -> None:
+    import backend.photos_library as pl
+
+    def _deny(self):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(Path, "iterdir", _deny)
+    assert pl._library_is_really_absent("/nowhere/Test.photoslibrary") is False
