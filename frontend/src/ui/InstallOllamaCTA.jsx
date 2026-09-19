@@ -67,7 +67,7 @@ export function InstallOllamaCTA({ compact = false }) {
         >
           Install Ollama <ExternalLink size={12} />
         </a>
-        <span className="text-xs text-[#6a6b6c]">or</span>
+        <span className="text-xs text-[#8a8b8c]">or</span>
         <button
           type="button"
           onClick={handleCopy}

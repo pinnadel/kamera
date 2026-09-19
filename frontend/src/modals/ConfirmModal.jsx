@@ -1,4 +1,5 @@
 import { Check, X } from 'lucide-react'
+import { useDialog } from '../hooks/useDialog'
 
 // ConfirmModal — generic two-button confirmation. `confirmIcon` defaults to
 // Check; pass a custom Lucide component (e.g. Trash2 from lucide-react) when
@@ -10,6 +11,7 @@ export function ConfirmModal({
   cancelIcon:  CancelIcon  = X,
   onConfirm, onCancel,
 }) {
+  const dialogRef = useDialog(onCancel)
   const confirmClass = confirmTone === 'danger'
     ? 'bg-[rgba(201,123,123,0.18)] text-[#C97B7B] border border-[rgba(201,123,123,0.40)] hover:opacity-80'
     : 'bg-[rgba(91,184,212,0.18)] text-[#5BB8D4] border border-[rgba(91,184,212,0.40)] hover:opacity-80'
@@ -20,11 +22,17 @@ export function ConfirmModal({
       onClick={onCancel}
     >
       <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl p-5 max-w-md w-full shadow-2xl"
+        ref={dialogRef}
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-title"
+        aria-describedby="confirm-body"
+        tabIndex={-1}
+        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl p-5 max-w-md w-full shadow-2xl focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
-        <p className="text-sm font-semibold text-[#f0f0f0] mb-2">{title}</p>
-        <p className="text-xs text-[#cecece] leading-relaxed mb-4">{body}</p>
+        <p id="confirm-title" className="text-sm font-semibold text-[#f0f0f0] mb-2">{title}</p>
+        <p id="confirm-body" className="text-xs text-[#cecece] leading-relaxed mb-4">{body}</p>
         <div className="flex justify-end gap-2">
           <button
             onClick={onCancel}

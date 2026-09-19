@@ -149,7 +149,7 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
                 <p className="text-xs text-[#cecece] truncate leading-tight">
                   <span className="text-[#9c9c9d]">Group · </span>{undecidedCount} undecided
                 </p>
-                <p className="text-[10px] text-[#6a6b6c] truncate font-mono leading-tight" title={`Best pick: ${hero.filename}`}>
+                <p className="text-[10px] text-[#8a8b8c] truncate font-mono leading-tight" title={`Best pick: ${hero.filename}`}>
                   <span className="text-[#9c9c9d] font-sans">Best: </span>{middleTruncate(hero.filename)}
                 </p>
               </div>
@@ -279,7 +279,7 @@ function DecidedGroupTileImpl({
                 <p className="text-xs text-[#cecece] truncate leading-tight">
                   <span className="text-[#9c9c9d]">Group · </span>{count} {decisionWord}
                 </p>
-                <p className="text-[10px] text-[#6a6b6c] truncate font-mono leading-tight" title={`Best pick: ${hero.filename}`}>
+                <p className="text-[10px] text-[#8a8b8c] truncate font-mono leading-tight" title={`Best pick: ${hero.filename}`}>
                   <span className="text-[#9c9c9d] font-sans">Best: </span>{middleTruncate(hero.filename)}
                 </p>
               </div>

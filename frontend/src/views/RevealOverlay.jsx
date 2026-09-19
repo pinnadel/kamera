@@ -21,7 +21,7 @@ export function RevealOverlay({ reveal }) {
             )}
           </>
         ) : (
-          <span className="text-xs text-[#6a6b6c]">No AI score yet</span>
+          <span className="text-xs text-[#8a8b8c]">No AI score yet</span>
         )}
       </div>
     </div>

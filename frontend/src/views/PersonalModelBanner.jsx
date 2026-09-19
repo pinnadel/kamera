@@ -304,7 +304,7 @@ export function PersonalModelBanner({ modelInfo, onDismiss }) {
           </span>
 
           {autoRunning && (
-            <span className="inline-flex items-center gap-1.5 text-[11px] text-[#5BB8D4]">
+            <span className="inline-flex items-center gap-1.5 text-xs text-[#5BB8D4]">
               <span className="w-1.5 h-1.5 rounded-full bg-[#5BB8D4] animate-pulse" />
               re-training…
             </span>
@@ -315,7 +315,7 @@ export function PersonalModelBanner({ modelInfo, onDismiss }) {
               onClick={onDismiss}
               aria-label="Hide personal model banner"
               title="Hide — manual retraining is still available in Settings"
-              className="ml-auto text-[#6a6b6c] hover:opacity-70 transition-opacity px-1"
+              className="ml-auto text-[#8a8b8c] hover:opacity-70 transition-opacity px-1"
             >
               <X size={16} />
             </button>
@@ -361,7 +361,7 @@ export function PersonalModelBanner({ modelInfo, onDismiss }) {
 
         {/* Row 3 — milestone labels under bar */}
         {isGrowth ? (
-          <div className="flex justify-between mt-1.5 text-[10px] text-[#6a6b6c] tabular-nums">
+          <div className="flex justify-between mt-1.5 text-xs text-[#8a8b8c] tabular-nums">
             <span>{growthTier.start}</span>
             <span className={growthPct >= 1 && growthTier.nextLabel ? 'text-[#5BB8D4]' : ''}>
               {growthTier.end
@@ -370,7 +370,7 @@ export function PersonalModelBanner({ modelInfo, onDismiss }) {
             </span>
           </div>
         ) : (
-          <div className="flex justify-between mt-1.5 text-[10px] text-[#6a6b6c] tabular-nums">
+          <div className="flex justify-between mt-1.5 text-xs text-[#8a8b8c] tabular-nums">
             <span>0</span>
             <span className={pctA >= 1 ? 'text-[#7DB89A]' : ''}>
               {minDecisions} · first training pass

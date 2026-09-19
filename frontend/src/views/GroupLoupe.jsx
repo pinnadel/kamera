@@ -902,7 +902,7 @@ export function GroupLoupe({
         {railCollapsed && !isDragOverRail ? (
           <button
             onClick={() => setRailCollapsed(false)}
-            className="w-full h-full flex flex-col items-center pt-4 gap-2 text-[#6a6b6c] hover:text-[#cecece] hover:bg-[rgba(255,255,255,0.02)] transition-colors"
+            className="w-full h-full flex flex-col items-center pt-4 gap-2 text-[#8a8b8c] hover:text-[#cecece] hover:bg-[rgba(255,255,255,0.02)] transition-colors"
             title="Expand group list"
             aria-label="Expand group list"
           >
@@ -919,7 +919,7 @@ export function GroupLoupe({
               </span>
               <button
                 onClick={() => setRailCollapsed(true)}
-                className="p-1 rounded text-[#6a6b6c] hover:text-[#cecece] hover:bg-[rgba(255,255,255,0.05)]"
+                className="p-1 rounded text-[#8a8b8c] hover:text-[#cecece] hover:bg-[rgba(255,255,255,0.05)]"
                 title="Collapse"
                 aria-label="Collapse group list"
               >
@@ -1109,7 +1109,7 @@ export function GroupLoupe({
         >
           <ArrowLeft size={13} /> Back
         </button>
-        <span className="text-xs text-[#6a6b6c] flex-shrink-0 select-none">
+        <span className="text-xs text-[#8a8b8c] flex-shrink-0 select-none">
           {group.size} photos{group.threshold != null ? ` · ≥${(group.threshold * 100).toFixed(0)}%` : ''}
         </span>
         <BurstRankStatus
@@ -1142,7 +1142,7 @@ export function GroupLoupe({
         <div className="w-px h-4 bg-[#2a2b2d]" />
         {finishWarnOpen ? (
           <span className="inline-flex items-center gap-2 text-xs whitespace-nowrap">
-            <span className="text-[#6a6b6c]">Nothing kept —</span>
+            <span className="text-[#8a8b8c]">Nothing kept —</span>
             <button
               onClick={sweepRejectRest}
               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[rgba(201,123,123,0.12)] text-[#C97B7B] border border-[rgba(201,123,123,0.30)] hover:opacity-70 transition-opacity"
@@ -1482,7 +1482,7 @@ function SurveyTile({ img, isHero, heroReason, rank, isDuplicateRank = false, is
       <div className="px-2 py-1.5 flex items-center gap-1.5 bg-[#101111] border-t border-[rgba(255,255,255,0.04)]">
         <ScoreBadge score={pickHeadlineScore(img, modelInfo)} />
         {img.decision && <DecisionBadge decision={img.decision} />}
-        <span className="ml-auto text-[10px] font-mono text-[#9c9c9d] truncate" title={img.filename}>
+        <span className="ml-auto text-[11px] font-mono text-[#9c9c9d] truncate" title={img.filename}>
           {img.filename}
         </span>
       </div>

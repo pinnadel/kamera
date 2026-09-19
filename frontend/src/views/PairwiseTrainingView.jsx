@@ -86,7 +86,7 @@ export function PairwiseTrainingView({ images, sourceFolder, onExit, modelInfo }
           <span className="text-xs text-[#8a8a8a] font-mono">
             A/B training · {done} / {total} compared
           </span>
-          <p className="text-[10px] text-[#9c9c9d] mt-0.5">
+          <p className="text-xs text-[#9c9c9d] mt-0.5">
             Pick the photo you prefer — no right answer, just your taste
           </p>
         </div>
@@ -97,10 +97,10 @@ export function PairwiseTrainingView({ images, sourceFolder, onExit, modelInfo }
           />
         </div>
         <div className="flex items-center gap-4">
-          <span className="text-[10px] text-[#6a6b6c]">← / → to pick · Esc to exit</span>
+          <span className="text-xs text-[#8a8b8c]">← / → to pick · Esc to exit</span>
           <button
             onClick={onExit}
-            className="inline-flex items-center gap-1.5 text-xs text-[#6a6b6c] hover:opacity-70 transition-opacity"
+            className="inline-flex items-center gap-1.5 text-xs text-[#8a8b8c] hover:opacity-70 transition-opacity"
           >
             <LogOut size={14} /> Exit
           </button>
@@ -109,7 +109,7 @@ export function PairwiseTrainingView({ images, sourceFolder, onExit, modelInfo }
 
       {/* A/B content */}
       {loading ? (
-        <div className="flex-1 flex items-center justify-center text-[#6a6b6c] text-sm">
+        <div className="flex-1 flex items-center justify-center text-[#8a8b8c] text-sm">
           Loading pairs…
         </div>
       ) : !currentPair || !imgA || !imgB ? (
@@ -169,10 +169,10 @@ export function PairwiseTrainingView({ images, sourceFolder, onExit, modelInfo }
                 </div>
                 {/* Footer */}
                 <div className="flex items-center gap-2 px-3 py-2 bg-[#101111] border-t border-[rgba(255,255,255,0.04)] flex-shrink-0">
-                  <span className="text-[10px] font-mono text-[#6a6b6c] w-4">{label}</span>
+                  <span className="text-[10px] font-mono text-[#8a8b8c] w-4">{label}</span>
                   <ScoreBadge score={pickHeadlineScore(img, modelInfo)} />
                   {img.decision && <DecisionBadge decision={img.decision} />}
-                  <span className="ml-auto text-[10px] font-mono text-[#9c9c9d] truncate" title={img.filename}>
+                  <span className="ml-auto text-[11px] font-mono text-[#9c9c9d] truncate" title={img.filename}>
                     {img.filename}
                   </span>
                 </div>

@@ -4,7 +4,7 @@ import { API } from '../api'
 
 // FolderInput — text input that opens a native OS folder picker on click.
 // The backend uses tkinter, which shows the native folder dialog on every platform.
-export function FolderInput({ value, onChange, placeholder, className, defaultHint, placeholderClassName = 'placeholder-[#6a6b6c]', prompt }) {
+export function FolderInput({ value, onChange, placeholder, className, defaultHint, placeholderClassName = 'placeholder-[#8a8b8c]', prompt }) {
   const [picking, setPicking] = useState(false)
 
   async function openPicker() {
@@ -34,7 +34,7 @@ export function FolderInput({ value, onChange, placeholder, className, defaultHi
       <button
         type="button"
         onClick={openPicker}
-        className={`inline-flex items-center gap-2 text-left cursor-pointer bg-[#07080a] border border-dashed border-[rgba(255,255,255,0.10)] rounded-lg h-9 px-3 text-[13px] text-[#6a6b6c] hover:text-[#9c9c9d] hover:border-[rgba(255,255,255,0.18)] focus:outline-none focus:shadow-[0_0_0_3px_rgba(91,184,212,0.18)] transition-colors ${className}`}
+        className={`inline-flex items-center gap-2 text-left cursor-pointer bg-[#07080a] border border-dashed border-[rgba(255,255,255,0.10)] rounded-lg h-9 px-3 text-[13px] text-[#8a8b8c] hover:text-[#9c9c9d] hover:border-[rgba(255,255,255,0.18)] focus:outline-none focus:shadow-[0_0_0_3px_rgba(91,184,212,0.18)] transition-colors ${className}`}
         title="Click to choose a custom folder"
       >
         <Folder size={16} className="flex-shrink-0" />

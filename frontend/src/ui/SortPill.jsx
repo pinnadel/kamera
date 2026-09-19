@@ -112,11 +112,11 @@ export function SortPill({
               onClick={() => pickField(field)}
               onMouseEnter={() => setScoreOpen(false)}
               className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between gap-3 ${
-                sortField === field ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                sortField === field ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
               }`}
             >
               <span>{label}</span>
-              <span className="text-[10px] text-[#6a6b6c] whitespace-nowrap">
+              <span className="text-xs text-[#8a8b8c] whitespace-nowrap">
                 {getDirectionShort(field, sortDir)} {DIR_GLYPH[sortDir]}
               </span>
             </button>
@@ -128,7 +128,7 @@ export function SortPill({
                 onClick={() => setScoreOpen(v => !v)}
                 onMouseEnter={() => setScoreOpen(true)}
                 className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between ${
-                  isScoreField(sortField) ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                  isScoreField(sortField) ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
                 }`}
               >
                 Score
@@ -155,11 +155,11 @@ export function SortPill({
                           key={metric.id}
                           onClick={() => pickField(metric.id)}
                           className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between gap-3 ${
-                            sortField === metric.id ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                            sortField === metric.id ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
                           }`}
                         >
                           <span>{metric.label}</span>
-                          <span className="text-[10px] text-[#6a6b6c] whitespace-nowrap">
+                          <span className="text-xs text-[#8a8b8c] whitespace-nowrap">
                             {getDirectionShort(metric.id, sortDir)} {DIR_GLYPH[sortDir]}
                           </span>
                         </button>

@@ -126,7 +126,7 @@ export function ScoreBadge({ score }) {
   if (score == null) return (
     <span className="flex items-center gap-1">
       <span className="w-1.5 h-1.5 rounded-full bg-[#2a2a2a] flex-shrink-0" />
-      <span className="text-xs font-mono text-[#6a6b6c]">—</span>
+      <span className="text-xs font-mono text-[#8a8b8c]">—</span>
     </span>
   )
   return (
@@ -194,13 +194,14 @@ export function ScoreBar({ value, color = 'bg-[#a8a8a8]', tooltip }) {
   )
 }
 
-export function Toggle({ enabled, onChange }) {
+export function Toggle({ enabled, onChange, label }) {
   return (
     <button
       role="switch"
       aria-checked={enabled}
+      aria-label={label}
       onClick={() => onChange(!enabled)}
-      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none ${
+      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#5BB8D4] focus-visible:ring-offset-2 focus-visible:ring-offset-[#101111] ${
         enabled ? 'bg-[#5BB8D4]' : 'bg-[#3a3a3a]'
       }`}
     >
@@ -298,13 +299,14 @@ export function InfoTooltip({ children }) {
     <span className="relative inline-flex items-center">
       <span
         ref={iconRef}
-        aria-hidden="true"
+        role="button"
+        aria-label="More information"
         tabIndex={0}
         onMouseEnter={open}
         onMouseLeave={close}
         onFocus={open}
         onBlur={close}
-        className={`inline-flex items-center justify-center w-3.5 h-3.5 cursor-help select-none transition-colors focus:outline-none ${pos ? 'text-[#5BB8D4]' : 'text-current opacity-60 hover:opacity-100'}`}
+        className={`inline-flex items-center justify-center w-3.5 h-3.5 cursor-help select-none transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-[#5BB8D4] rounded-full ${pos ? 'text-[#5BB8D4]' : 'text-current opacity-60 hover:opacity-100'}`}
       >
         <svg viewBox="0 0 14 14" className="w-full h-full" fill="currentColor" aria-hidden="true">
           <circle cx="7" cy="7" r="6.2" fill="none" stroke="currentColor" strokeWidth="1" />
@@ -319,5 +321,50 @@ export function InfoTooltip({ children }) {
         document.body,
       )}
     </span>
+  )
+}
+
+// Segmented — the app's one control for a small set of mutually exclusive
+// choices. Lived inside SettingsModal until the Dashboard needed the same
+// thing for its corpus + timeframe switches; two hand-rolled copies of a
+// radiogroup is exactly the drift CLAUDE.md's "all enumerated choices use
+// Segmented" rule exists to prevent.
+//
+// Arrow-key navigation is implemented rather than merely implied: role=radio
+// promises it to screen-reader users, and a radiogroup that only responds to
+// Tab is a broken promise.
+export function Segmented({ options, value, onChange, ariaLabel, busy = false, compact = false }) {
+  const onKeyDown = (e) => {
+    const dir = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1
+              : e.key === 'ArrowLeft'  || e.key === 'ArrowUp'   ? -1
+              : 0
+    if (!dir) return
+    e.preventDefault()
+    const i = options.findIndex(o => o.key === value)
+    const next = options[(i + dir + options.length) % options.length]
+    if (next) onChange(next.key)
+  }
+
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      onKeyDown={onKeyDown}
+      className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${busy ? 'opacity-50 pointer-events-none' : ''}`}
+    >
+      {options.map(({ key, label, title }, i) => (
+        <button
+          key={key}
+          role="radio"
+          aria-checked={value === key}
+          tabIndex={value === key ? 0 : -1}
+          onClick={() => onChange(key)}
+          title={title}
+          className={`inline-flex items-center gap-1.5 ${compact ? 'px-4' : 'px-3'} py-1.5 text-xs font-medium transition-colors whitespace-nowrap focus:outline-none focus-visible:bg-[#1a1b1d] focus-visible:text-[#5BB8D4] ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${value === key ? 'bg-[#26282b] text-[#f9f9f9] shadow-[inset_0_-2px_0_#5BB8D4]' : 'text-[#9c9c9d] hover:opacity-70'}`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
   )
 }

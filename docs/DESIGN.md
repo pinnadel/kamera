@@ -77,7 +77,7 @@ Maybe, faded coral for Reject) that read as UI chrome, never compete with the im
 | Light Gray | `#cecece` | Secondary body text, EXIF values |
 | Silver | `#c0c0c0` | Tertiary text, panel labels |
 | Medium Gray | `#9c9c9d` | Default link / nav, undecided meta text |
-| Dim Gray | `#6a6b6c` | Disabled text, low-emphasis labels, info-hint microcopy paired with ⓘ icon (footnotes below action surfaces — e.g. the "Decisions immediately move…" line under the K/M/R hotkey card on the empty state). Embedded literals inside hint text step up to Medium Gray `#9c9c9d` for readability. |
+| Dim Gray | `#6a6b6c` | **Disabled only** (WCAG exempts it; ~3.5:1 on `#101111`). Anything a user is meant to read — hints, inactive tabs, placeholders, footnotes — uses **Muted `#8a8b8c`** (~5.5:1) instead, as of 2026-09-19. Historical role: low-emphasis labels, info-hint microcopy paired with ⓘ icon (footnotes below action surfaces — e.g. the "Decisions immediately move…" line under the K/M/R hotkey card on the empty state). Embedded literals inside hint text step up to Medium Gray `#9c9c9d` for readability. |
 | Dark Gray | `#434345` | Inactive borders, score-bar fill (low score) |
 | Border | `hsl(195, 5%, 15%)` / `~#252829` | Card and divider border |
 | Dark Border | `#2f3031` | Toolbar separators, table rows |
@@ -222,6 +222,19 @@ The toolbar is a horizontal strip that sits at the bottom of the inspector and a
 top of the contact-sheet grid. It hosts the three decision actions (Keep / Maybe /
 Reject) and contextual buttons (Analyze, Stop, Settings).
 
+**Which edge owns which control** (same rule in the grid and in GroupLoupe):
+
+| Edge | Owns | Examples |
+|---|---|---|
+| Top — app bar | Where you are + app-level switches | tabs, Dashboard, Settings, Help |
+| Top — filter row | *Status*: what is in the pile, and what you do to a selection | Keeps / Maybes / Rejects segmented filter, Only unconfirmed, bulk K/M/R, select-mode actions |
+| Bottom pill | *View*: how the photos are arranged and found | Sort, **Filter photos** (composition: date, portraits, camera, grouped), View, Select, Tab settings, Search |
+
+The two "filters" are different questions — the top one is *"which decisions?"*,
+the bottom one is *"which kind of photo?"* — which is why the bottom funnel is labelled
+"Filter photos". New controls go to the edge whose question they answer; don't split
+one question across both edges.
+
 - **Surface**: `#101111` background, 1px solid `rgba(255, 255, 255, 0.06)` border
 - **Height**: 56px
 - **Padding**: 0 16px
@@ -276,7 +289,7 @@ sitting on a light table.
 
 **Thumbnail Overlays (absolutely positioned over the image):**
 - **Score badge** (top-right): GeistMono numeral at 12px weight 500, white on `rgba(0, 0, 0, 0.6)` pill, 4px radius, 4px padding. Hidden when score is null.
-- **Decision pill** (top-left): K / M / X glyph in Caption Bold (12px/600), 16x16px square pill in matching decision color. Hidden when undecided.
+- **Decision glyph** (bottom-right, **All view only**): ✓ / ◐ / ✕ (the filter bar's icons), 18px dark disc, icon in the decision colour. Exists because keep-green and reject-coral are a red/green confusable pair — colour alone must not carry K/M/R. Hidden when undecided, in filtered decision views (the filter already says which), and inside a group-run frame. (Supersedes the earlier top-left K/M/X pill, which the implementation had dropped.)
 - **Filename** (bottom strip): GeistMono 11px in `#cecece` over a 24px gradient veil from `rgba(0,0,0,0.0)` to `rgba(0,0,0,0.7)`. Truncate with ellipsis.
 - **Best-in-group badge** (top-center, Groups view only): "BEST" in 11px weight 600 Inter, Warm Amber on `rgba(0, 0, 0, 0.7)` pill, 4px radius
 

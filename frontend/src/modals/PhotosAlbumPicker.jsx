@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ChevronLeft, Images, Library, Search, Sparkles, X } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_SECONDARY } from '../ui/buttons'
+import { useDialog } from '../hooks/useDialog'
 
 // PhotosAlbumPicker — choose a Photos library, then an album inside it.
 //
@@ -20,7 +21,7 @@ import { BTN_ICON, BTN_SECONDARY } from '../ui/buttons'
 function ManualPath({ value, onChange, onSubmit }) {
   return (
     <div className="px-3 pt-3">
-      <p className="text-xs text-[#6a6b6c] mb-1.5">Or enter the path to a .photoslibrary</p>
+      <p className="text-xs text-[#8a8b8c] mb-1.5">Or enter the path to a .photoslibrary</p>
       <div className="flex items-center gap-2">
         <input
           value={value}
@@ -28,7 +29,7 @@ function ManualPath({ value, onChange, onSubmit }) {
           onKeyDown={e => { if (e.key === 'Enter' && value.trim()) onSubmit() }}
           placeholder="~/Downloads/KaMeRa-Test.photoslibrary"
           spellCheck={false}
-          className="flex-1 min-w-0 bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-lg px-3 py-2 text-xs text-[#f0f0f0] placeholder-[#6a6b6c] outline-none focus:border-[rgba(91,184,212,0.40)]"
+          className="flex-1 min-w-0 bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-lg px-3 py-2 text-xs text-[#f0f0f0] placeholder-[#8a8b8c] outline-none focus:border-[rgba(91,184,212,0.40)]"
         />
         <button className={`${BTN_SECONDARY} !py-2`} onClick={onSubmit}>Use</button>
       </div>
@@ -49,11 +50,7 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
   const [manualPath, setManualPath] = useState('')
   const inputRef = useRef(null)
 
-  useEffect(() => {
-    const onKey = (e) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  const dialogRef = useDialog(onClose)
 
   const loadAlbums = useCallback(async (lib) => {
     setStep('loading')
@@ -121,8 +118,8 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
 
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-center justify-center" onClick={onClose}>
-      <div
-        className="bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] rounded-xl w-[520px] max-h-[72vh] flex flex-col"
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Choose a Photos album" tabIndex={-1}
+        className="focus:outline-none bg-[#0d0e10] border border-[rgba(255,255,255,0.10)] rounded-xl w-[520px] max-h-[72vh] flex flex-col"
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-start justify-between px-5 pt-4 pb-3 border-b border-[rgba(255,255,255,0.07)]">
@@ -142,7 +139,7 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
                 {showLibraries ? 'Choose a Photos library' : 'Choose a Photos album'}
               </h2>
               {step === 'albums' && library && (
-                <p className="text-xs text-[#6a6b6c] mt-0.5 truncate" title={library.path}>
+                <p className="text-xs text-[#8a8b8c] mt-0.5 truncate" title={library.path}>
                   {library.name}
                 </p>
               )}
@@ -154,7 +151,7 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
         {step === 'loading' && (
           <div className="px-5 py-8 text-center">
             <p className="text-xs text-[#9c9c9d]">Reading your Photos library…</p>
-            <p className="text-xs text-[#6a6b6c] mt-1">The first read parses the whole catalogue and can take a moment</p>
+            <p className="text-xs text-[#8a8b8c] mt-1">The first read parses the whole catalogue and can take a moment</p>
           </div>
         )}
 
@@ -187,10 +184,10 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
                 className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left hover:bg-[#151618] transition-colors disabled:opacity-40"
                 title={lib.path}
               >
-                <Library size={14} className="text-[#6a6b6c] shrink-0" />
+                <Library size={14} className="text-[#8a8b8c] shrink-0" />
                 <span className="min-w-0 flex-1">
                   <span className="block text-xs text-[#f0f0f0] truncate">{lib.name}</span>
-                  <span className="block text-xs text-[#6a6b6c] truncate">{lib.path}</span>
+                  <span className="block text-xs text-[#8a8b8c] truncate">{lib.path}</span>
                 </span>
                 {lib.is_open && (
                   <span className="text-xs text-[#5BB8D4] shrink-0 inline-flex items-center gap-1">
@@ -204,7 +201,7 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
               onChange={setManualPath}
               onSubmit={() => chooseLibrary({ path: manualPath.trim().replace(/\/+$/, '') })}
             />
-            <p className="px-3 pb-3 text-xs text-[#6a6b6c]">
+            <p className="px-3 pb-3 text-xs text-[#8a8b8c]">
               Decisions are written through Photos, so they land in whichever library Photos itself has open
             </p>
           </div>
@@ -214,20 +211,20 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
           <>
             <div className="px-5 py-3 border-b border-[rgba(255,255,255,0.07)]">
               <div className="flex items-center gap-2 bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-lg px-3 py-2">
-                <Search size={14} className="text-[#6a6b6c] shrink-0" />
+                <Search size={14} className="text-[#8a8b8c] shrink-0" />
                 <input
                   ref={inputRef}
                   value={query}
                   onChange={e => setQuery(e.target.value)}
                   placeholder="Filter albums"
-                  className="bg-transparent text-xs text-[#f0f0f0] placeholder-[#6a6b6c] outline-none w-full"
+                  className="bg-transparent text-xs text-[#f0f0f0] placeholder-[#8a8b8c] outline-none w-full"
                 />
               </div>
             </div>
 
             <div className="overflow-y-auto px-2 py-2 flex-1">
               {filtered.length === 0 && (
-                <p className="text-xs text-[#6a6b6c] text-center py-8">
+                <p className="text-xs text-[#8a8b8c] text-center py-8">
                   {albums.length ? 'No album matches that filter' : 'This library has no albums yet'}
                 </p>
               )}
@@ -244,16 +241,16 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
                       the same, but the user should know which kind they picked. */}
                   {album.smart
                     ? <Sparkles size={14} className="text-[#5BB8D4] shrink-0" />
-                    : <Images size={14} className="text-[#6a6b6c] shrink-0" />}
+                    : <Images size={14} className="text-[#8a8b8c] shrink-0" />}
                   <span className="min-w-0 flex-1">
                     <span className="block text-xs text-[#f0f0f0] truncate">{album.name}</span>
                     {album.smart ? (
                       <span className="block text-xs text-[#5BB8D4] truncate">Smart Album — contents update themselves</span>
                     ) : album.folders?.length > 0 && (
-                      <span className="block text-xs text-[#6a6b6c] truncate">{album.folders.join(' / ')}</span>
+                      <span className="block text-xs text-[#8a8b8c] truncate">{album.folders.join(' / ')}</span>
                     )}
                   </span>
-                  <span className="text-xs font-mono text-[#6a6b6c] shrink-0">
+                  <span className="text-xs font-mono text-[#8a8b8c] shrink-0">
                     {/* A Smart Album count comes from Photos, not the
                         catalogue, so it is absent when Photos is closed. */}
                     {album.count ?? '—'}
@@ -262,7 +259,7 @@ export default function PhotosAlbumPicker({ onPick, onClose }) {
               ))}
             </div>
 
-            <p className="px-5 py-3 text-xs text-[#6a6b6c] border-t border-[rgba(255,255,255,0.07)]">
+            <p className="px-5 py-3 text-xs text-[#8a8b8c] border-t border-[rgba(255,255,255,0.07)]">
               Photos are analysed where they are. Decisions become
               {' '}<span className="text-[#9c9c9d]">KaMeRa:Keep</span> /
               {' '}<span className="text-[#9c9c9d]">Maybe</span> /

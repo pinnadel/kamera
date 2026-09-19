@@ -3,6 +3,7 @@ import { AlertTriangle, ChevronDown, ChevronUp, WandSparkles, X } from 'lucide-r
 import { API } from '../api'
 import { BTN_ICON, BTN_PRIMARY, BTN_PRIMARY_DANGER, BTN_SECONDARY } from '../ui/buttons'
 import { DecisionWord } from '../ui/primitives'
+import { useDialog } from '../hooks/useDialog'
 
 // RuleBreakdown — collapsible "Why rejected?" section shown below the K/M/X bars.
 // Only rendered when there are rejects and rule_breakdown is present in the preview.
@@ -27,7 +28,7 @@ function RuleBreakdown({ breakdown, total }) {
         className="w-full flex items-center justify-between px-3 py-2 text-left hover:opacity-80 transition-opacity"
       >
         <span className="text-xs text-[#9c9c9d]">Why rejected?</span>
-        <span className="text-[#6a6b6c] flex items-center">
+        <span className="text-[#8a8b8c] flex items-center">
           {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
         </span>
       </button>
@@ -101,7 +102,7 @@ function Consequence({ dest, rejects }) {
           <p className="text-xs text-[#f0f0f0] font-medium mb-1">
             {rejects} {rejects === 1 ? 'file goes' : 'files go'} to {dest.label}
           </p>
-          <p className="text-[11px] text-[#cecece] leading-relaxed">
+          <p className="text-xs text-[#cecece] leading-relaxed">
             <DecisionWord kind="reject">Reject</DecisionWord> is set to the system Trash in
             Settings → Workflow, and auto-cull uses the same route as a manual R. You can restore them
             from the Trash, but{' '}
@@ -177,9 +178,10 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
     { key: 'reject', label: 'Rejects', fill: 'bg-[#C97B7B]',  text: 'text-[#C97B7B]' },
   ]
 
+  const dialogRef = useDialog(onClose)
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-center justify-center" onClick={onClose}>
-      <div className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl p-6 w-96 shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]" onClick={e => e.stopPropagation()}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Auto-cull" tabIndex={-1} className="focus:outline-none bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl p-6 w-96 shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[#f9f9f9] font-semibold text-base">Auto-cull</h2>
           <button onClick={onClose} className={BTN_ICON} aria-label="Close">
@@ -194,7 +196,7 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
         {!loading && previewError && (
           <div className="text-sm text-[#C97B7B] text-center py-6 mb-2">
             Couldn't load preview — {previewError}.
-            <p className="text-xs text-[#6a6b6c] mt-1">Check the backend is running, then close and retry.</p>
+            <p className="text-xs text-[#8a8b8c] mt-1">Check the backend is running, then close and retry.</p>
           </div>
         )}
 
@@ -205,7 +207,7 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
                 <span className="inline-block px-2 py-0.5 rounded text-xs bg-[rgba(123,130,201,0.20)] text-[#7B82C9]">
                   Personal model · {preview.scoring_info}
                 </span>
-                <p className="text-[11px] text-[#6a6b6c] mt-1.5">
+                <p className="text-xs text-[#8a8b8c] mt-1.5">
                   Decisions reflect what you previously kept and rejected.
                 </p>
               </div>
@@ -219,11 +221,11 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
                   <span className="inline-block px-2 py-0.5 rounded text-xs bg-[rgba(232,184,74,0.18)] text-[#E8B84A] font-medium">
                     Quality thresholds
                   </span>
-                  <span className="text-[11px] text-[#9c9c9d]">
+                  <span className="text-xs text-[#9c9c9d]">
                     not your personal taste
                   </span>
                 </div>
-                <p className="text-[11px] text-[#cecece] leading-relaxed">
+                <p className="text-xs text-[#cecece] leading-relaxed">
                   {preview.scoring_info && preview.scoring_info !== 'quality thresholds'
                     ? preview.scoring_info.charAt(0).toUpperCase() + preview.scoring_info.slice(1) + '.'
                     : 'Generic sharpness + exposure rules — they don\'t know what you actually like.'}
@@ -261,11 +263,11 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
                 <div className="px-3 py-2 mb-2 border border-[rgba(255,255,255,0.07)] rounded-lg text-[11px] leading-relaxed text-[#9c9c9d]">
                   <span className="text-[#cecece] font-mono tabular-nums">{dedup}</span>
                   {' rejected as redundant burst frames '}
-                  <span className="text-[#6a6b6c]">(Similarity slider + burst budgets)</span>
+                  <span className="text-[#8a8b8c]">(Similarity slider + burst budgets)</span>
                   {' · '}
                   <span className="text-[#cecece] font-mono tabular-nums">{model}</span>
                   {' from per-photo quality '}
-                  <span className="text-[#6a6b6c]">(the model's own call)</span>
+                  <span className="text-[#8a8b8c]">(the model's own call)</span>
                 </div>
               )
             })()}

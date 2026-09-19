@@ -2,16 +2,25 @@ import { Check, CircleDot, Undo2 } from 'lucide-react'
 import { API } from '../api'
 import { BTN_SECONDARY, BTN_DANGER } from '../ui/buttons'
 import { DecisionWord } from '../ui/primitives'
+import { useDialog } from '../hooks/useDialog'
 
+// Split so useDialog only runs while a conflict is actually showing — the
+// wrapper is always mounted, and a dialog that registered while hidden would
+// sit on top of the Escape/Tab stack and starve every real dialog below it.
 export function ConflictModal({ conflict, onResolve }) {
   if (!conflict) return null
+  return <ConflictDialog conflict={conflict} onResolve={onResolve} />
+}
+
+function ConflictDialog({ conflict, onResolve }) {
+  const dialogRef = useDialog(null)
 
   const { image, previous, latest } = conflict
   const decisionLabel = d => d === 'keep' ? 'Keep' : d === 'reject' ? 'Reject' : 'Maybe'
 
   return (
     <div className="fixed inset-0 z-[80] flex items-center justify-center bg-[rgba(7,8,10,0.80)]">
-      <div className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-2xl p-6 shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10),inset_0_1px_0_rgba(255,255,255,0.05)] max-w-xs w-full flex flex-col gap-4">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Changed your mind?" tabIndex={-1} className="focus:outline-none bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-2xl p-6 shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10),inset_0_1px_0_rgba(255,255,255,0.05)] max-w-xs w-full flex flex-col gap-4">
         {/* Thumbnail */}
         <div className="bg-[#07080a] rounded-lg overflow-hidden h-36 flex items-center justify-center">
           <img

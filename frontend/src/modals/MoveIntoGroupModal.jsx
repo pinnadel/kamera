@@ -6,8 +6,10 @@
 import { useMemo, useState } from 'react'
 import { Search, X } from 'lucide-react'
 import { API } from '../api'
+import { useDialog } from '../hooks/useDialog'
 
 export function MoveIntoGroupModal({ groups, selectionCount, onPick, onClose }) {
+  const dialogRef = useDialog(onClose)
   const [query, setQuery] = useState('')
 
   const filtered = useMemo(() => {
@@ -24,7 +26,12 @@ export function MoveIntoGroupModal({ groups, selectionCount, onPick, onClose }) 
       onClick={onClose}
     >
       <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl shadow-2xl flex flex-col"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Move into a group"
+        tabIndex={-1}
+        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl shadow-2xl flex flex-col focus:outline-none"
         style={{ width: 'min(900px, 92vw)', maxHeight: '82vh' }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -41,19 +48,21 @@ export function MoveIntoGroupModal({ groups, selectionCount, onPick, onClose }) 
           <div className="relative">
             <Search
               size={13}
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#6a6b6c] pointer-events-none"
+              className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#8a8b8c] pointer-events-none"
             />
             <input
               type="text"
               autoFocus
+              aria-label="Filter groups by filename"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Filter by filename…"
-              className="pl-7 pr-2 py-1 rounded text-xs bg-[#1a1b1d] border border-[rgba(255,255,255,0.08)] text-[#f0f0f0] placeholder-[#6a6b6c] focus:outline-none focus:border-[rgba(91,184,212,0.40)] w-56"
+              className="pl-7 pr-2 py-1 rounded text-xs bg-[#1a1b1d] border border-[rgba(255,255,255,0.08)] text-[#f0f0f0] placeholder-[#8a8b8c] focus:outline-none focus:border-[rgba(91,184,212,0.40)] w-56"
             />
           </div>
           <button
             onClick={onClose}
+            aria-label="Close"
             className="p-1 rounded text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.05)]"
           >
             <X size={16} />
@@ -63,7 +72,7 @@ export function MoveIntoGroupModal({ groups, selectionCount, onPick, onClose }) 
         {/* Group grid */}
         <div className="flex-1 overflow-y-auto p-4">
           {filtered.length === 0 ? (
-            <p className="text-center text-xs text-[#6a6b6c] py-8">
+            <p className="text-center text-xs text-[#8a8b8c] py-8">
               {groups.length === 0
                 ? 'No groups exist yet. Use "New group from selection" instead.'
                 : 'No groups match that filter.'}
@@ -90,7 +99,7 @@ export function MoveIntoGroupModal({ groups, selectionCount, onPick, onClose }) 
                       {g.size}
                     </div>
                   </div>
-                  <div className="px-2 py-1.5 text-[11px] text-[#cecece] truncate">
+                  <div className="px-2 py-1.5 text-xs text-[#cecece] truncate">
                     {(g.images?.[0]?.filename || '').split('/').pop()}
                   </div>
                 </button>

@@ -3,6 +3,7 @@ import { BookOpen, Keyboard, MessageSquare, ExternalLink, X } from 'lucide-react
 import { BTN_ICON } from '../ui/buttons'
 import { DecisionWord } from '../ui/primitives'
 import { KAMERA_VERSION, FEEDBACK_URL } from '../version'
+import { useDialog } from '../hooks/useDialog'
 
 // Inline keycap matching the DetailView header style (18×18 square,
 // inset/shadow gradient). Used in copy and in the Shortcuts table.
@@ -71,13 +72,14 @@ export function ShortcutsModal({ onClose }) {
     ]},
   ]
 
+  const dialogRef = useDialog(onClose)
   const TAB_ACTIVE   = 'text-[#f9f9f9] border-b border-[#5BB8D4]'
-  const TAB_INACTIVE = 'text-[#6a6b6c] hover:opacity-70 border-b border-transparent transition-opacity'
+  const TAB_INACTIVE = 'text-[#8a8b8c] hover:opacity-70 border-b border-transparent transition-opacity'
 
   return (
     <div className="fixed inset-0 z-[90] flex items-start justify-center bg-[rgba(7,8,10,0.85)] pt-[5vh]" onClick={onClose}>
-      <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Help and keyboard shortcuts" tabIndex={-1}
+        className="focus:outline-none bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
         onClick={e => e.stopPropagation()}
       >
         {/* Upper section — darker band, matches SettingsModal */}

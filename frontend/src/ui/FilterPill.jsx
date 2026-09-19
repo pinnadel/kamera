@@ -117,8 +117,8 @@ export function FilterPill({
         <button
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => (open ? closeAll() : onOpen())}
-          title="Filter"
-          aria-label="Filter"
+          title="Filter photos"
+          aria-label="Filter photos"
           className={`px-2 py-1 text-xs inline-flex items-center gap-1.5 ${triggerText}`}
         >
           <Filter size={15} strokeWidth={hasFilters ? 2.5 : 2} />
@@ -133,7 +133,7 @@ export function FilterPill({
               onClick={() => (submenu === 'date' ? setSubmenu(null) : openDateSubmenu())}
               onMouseEnter={openDateSubmenu}
               className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between transition-opacity ${
-                f.date ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                f.date ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
               }`}
             >
               <span>Date</span>
@@ -185,7 +185,7 @@ export function FilterPill({
                   onClick={() => setSubmenu(s => s === 'camera' ? null : 'camera')}
                   onMouseEnter={() => setSubmenu('camera')}
                   className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between transition-opacity ${
-                    f.cameras?.length ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                    f.cameras?.length ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
                   }`}
                 >
                   <span className="inline-flex items-center gap-1.5">
@@ -279,7 +279,7 @@ export function FilterPill({
                     key={cam}
                     onClick={() => toggleCamera(cam)}
                     className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-2 transition-opacity ${
-                      on ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                      on ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
                     }`}
                   >
                     <span>{cam}</span>
@@ -301,7 +301,7 @@ function FilterRow({ label, active, onSelect, onMouseEnter }) {
       onClick={onSelect}
       onMouseEnter={onMouseEnter}
       className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between gap-2 transition-opacity ${
-        active ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+        active ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
       }`}
     >
       <span>{label}</span>

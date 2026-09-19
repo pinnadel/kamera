@@ -2,12 +2,12 @@ import { useEffect, useState } from 'react'
 import { Folder, Images, Plus, X } from 'lucide-react'
 import { tabLabel } from '../tabs'
 
-function TabItem({ tab, isActive, isDragOver, dragHandlers, onSelect, onClose, watchingTabName }) {
+function TabItem({ tab, isActive, isFocusStop, isDragOver, dragHandlers, onSelect, onClose, watchingTabName }) {
   const ringClass = isDragOver ? 'ring-1 ring-[#5BB8D4] ring-inset' : ''
 
   const baseClass = isActive
     ? 'bg-[#1a1b1d] text-[#f9f9f9]'
-    : 'text-[#6a6b6c] hover:text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.03)]'
+    : 'text-[#8a8b8c] hover:text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.03)]'
 
   const baseTitle = tab.folderPath || 'New analysis'
   const tabTitle = tab.watchLive
@@ -18,9 +18,19 @@ function TabItem({ tab, isActive, isDragOver, dragHandlers, onSelect, onClose, w
 
   return (
     <div
+      role="tab"
+      id={`tab-${tab.id}`}
+      aria-selected={isActive}
+      tabIndex={isFocusStop ? 0 : -1}
       draggable={tab.status !== 'analyzing'}
       {...(dragHandlers || {})}
       onClick={() => onSelect(tab.id)}
+      onKeyDown={(e) => {
+        // Only the tab itself — Enter/Space on the nested close button must
+        // keep meaning "close", not "select".
+        if (e.target !== e.currentTarget) return
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(tab.id) }
+      }}
       className={`group flex items-center gap-2 px-3 py-1.5 rounded-[6px] cursor-pointer flex-shrink-0 max-w-[220px] text-[14px] font-medium transition-colors ${baseClass} ${ringClass}`}
       title={tabTitle}
     >
@@ -107,14 +117,14 @@ function SourceMenu({ onClose, onFolder, onPhotos }) {
         onClick={onFolder}
         className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#151618] transition-colors"
       >
-        <Folder size={14} className="text-[#6a6b6c]" />
+        <Folder size={14} className="text-[#8a8b8c]" />
         <span className="text-xs text-[#f0f0f0]">Folder…</span>
       </button>
       <button
         onClick={onPhotos}
         className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-[#151618] transition-colors"
       >
-        <Images size={14} className="text-[#6a6b6c]" />
+        <Images size={14} className="text-[#8a8b8c]" />
         <span className="text-xs text-[#f0f0f0]">Photos album…</span>
       </button>
     </div>
@@ -131,6 +141,25 @@ export function TabBar({ tabs, activeTabId, onSelect, onClose, onReorder, onTrai
   const closableTabs = tabs.slice(0, -1)
   const watchingTab  = tabs.find(t => t.watchLive)
   const watchingTabName = watchingTab ? tabLabel(watchingTab) : null
+
+  // Roving tabindex: one Tab stop for the whole list. The "new analysis" page
+  // is the trailing tab, so when it is the active one no closable tab is
+  // selected and the first tab takes the stop instead.
+  const focusStopId = closableTabs.some(t => t.id === activeTabId)
+    ? activeTabId
+    : closableTabs[0]?.id
+  const onTabListKeyDown = (e) => {
+    const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0
+    const edge = e.key === 'Home' ? 0 : e.key === 'End' ? closableTabs.length - 1 : null
+    if (!step && edge === null) return
+    const i = closableTabs.findIndex(t => `tab-${t.id}` === document.activeElement?.id)
+    if (i < 0) return
+    e.preventDefault()
+    const next = edge !== null
+      ? closableTabs[edge]
+      : closableTabs[(i + step + closableTabs.length) % closableTabs.length]
+    if (next) document.getElementById(`tab-${next.id}`)?.focus()
+  }
 
   const buildDragHandlers = (tab) => ({
     onDragStart: (e) => {
@@ -190,6 +219,9 @@ export function TabBar({ tabs, activeTabId, onSelect, onClose, onReorder, onTrai
 
       {/* Scrollable tab pills */}
       <div
+        role="tablist"
+        aria-label="Analyses"
+        onKeyDown={onTabListKeyDown}
         className="flex items-center gap-0.5 overflow-x-auto flex-1 min-w-0"
         style={{ scrollbarWidth: 'none' }}
       >
@@ -198,6 +230,7 @@ export function TabBar({ tabs, activeTabId, onSelect, onClose, onReorder, onTrai
             key={tab.id}
             tab={tab}
             isActive={tab.id === activeTabId}
+            isFocusStop={tab.id === focusStopId}
             isDragOver={dragOverId === tab.id && dragId && dragId !== tab.id}
             dragHandlers={buildDragHandlers(tab)}
             onSelect={onSelect}

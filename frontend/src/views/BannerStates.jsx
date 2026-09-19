@@ -136,11 +136,11 @@ export function BannerStates({ onClose }) {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-sm font-semibold text-[#f9f9f9]">PersonalModelBanner — all states</h1>
-            <p className="text-xs text-[#6a6b6c] mt-1">Press Shift+B to close · dismiss buttons are disabled here</p>
+            <p className="text-xs text-[#8a8b8c] mt-1">Press Shift+B to close · dismiss buttons are disabled here</p>
           </div>
           <button
             onClick={onClose}
-            className="text-[#6a6b6c] hover:opacity-70 transition-opacity px-2"
+            className="text-[#8a8b8c] hover:opacity-70 transition-opacity px-2"
             aria-label="Close"
           >
             <X size={18} />
@@ -150,7 +150,7 @@ export function BannerStates({ onClose }) {
         <div className="space-y-8">
           {STATES.map(({ label, modelInfo }) => (
             <div key={label}>
-              <p className="text-[11px] font-mono text-[#6a6b6c] mb-2">{label}</p>
+              <p className="text-xs font-mono text-[#8a8b8c] mb-2">{label}</p>
               <PersonalModelBanner modelInfo={modelInfo} />
             </div>
           ))}

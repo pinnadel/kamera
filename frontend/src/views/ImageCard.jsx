@@ -1,5 +1,5 @@
 import { memo, useState } from 'react'
-import { Check } from 'lucide-react'
+import { Check, CircleDot, X } from 'lucide-react'
 import { API } from '../api'
 import { HighlightedText } from '../ui/primitives'
 import { middleTruncate, needsReview } from '../ui/format'
@@ -7,20 +7,26 @@ import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // ImageCard — one tile in the grid.
 //
-// Tile-chrome contract: the 4:3 image carries no status chrome. Decision state
-// reads from the tile's colored ring (always), plus one of two mutually
+// Tile-chrome contract: the 4:3 image carries almost no status chrome. Decision
+// state reads from the tile's colored ring (always), plus one of two mutually
 // exclusive presentations of the same signal:
 //   • filenames shown → the bottom footer strip is decision-tinted (and holds
 //     the filename);
 //   • filenames hidden, All view → a right-edge decision bar (reserved on every
 //     tile so image widths stay identical; light-gray on undecided, decision-
 //     colored on decided). Suppressed in filtered decision views.
-// There is NO K/M/R chip — the color already says it. When filenames are hidden
-// the footer is gone, so the image reclaims that height and thumbnails grow.
+// There is NO K/M/R text chip. Colour alone is not enough, though: keep-green
+// and reject-coral are a red/green confusable pair at similar luminance, so on
+// the All view — the only view where decisions are mixed — a decided tile also
+// carries a small ✓ / ◐ / ✕ glyph (the same icons as the filter bar). Filtered
+// views skip it: the filter already says which decision you are looking at.
+// When filenames are hidden the footer is gone, so the image reclaims that
+// height and thumbnails grow.
 // Group tiles mirror this structure so photo and group tiles stay aligned.
 //
-// The only thing ever drawn over the image is the multi-select check badge
-// (interaction feedback, select-mode only) and the transient load shimmer.
+// Drawn over the image: the multi-select check badge (select-mode only), the
+// decision glyph above (All view, bottom-right), the hover-only mark-reviewed
+// button, and the transient load shimmer.
 //
 // Memoized: in a 741-photo batch every polling tick used to trigger a re-render
 // of all 741 cards because App.jsx's `setTabs` returned a new tabs array. With
@@ -150,6 +156,22 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
   // decision views the bar is suppressed (you're already in one decision — the
   // ring is enough), matching the "keep filtered views minimal" rule.
   const reserveBar = isAllView && !showFilename
+  // Non-colour twin of the decision colour — see the header note.
+  const GlyphIcon =
+    image.decision === 'keep'   ? Check :
+    image.decision === 'maybe'  ? CircleDot :
+    image.decision === 'reject' ? X :
+    null
+  const glyphColor =
+    image.decision === 'keep'   ? '#7DB89A' :
+    image.decision === 'maybe'  ? '#E8B84A' :
+    '#C97B7B'
+  const decisionWord =
+    image.decision === 'keep'   ? 'Keep' :
+    image.decision === 'maybe'  ? 'Maybe' :
+    image.decision === 'reject' ? 'Reject' :
+    null
+  const showGlyph = isAllView && !inGroupBorder && !!GlyphIcon
   // Undecided tiles show a light-gray bar so the slice reads as a consistent
   // element; decided tiles "light up" in their decision colour against it.
   const barColor =
@@ -196,12 +218,23 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
       <div className="bg-[#07080a] aspect-[4/3] flex items-center justify-center overflow-hidden relative">
         <img
           src={`${API}/previews/${image.id}`}
-          alt={image.filename}
+          alt={decisionWord ? `${image.filename} — ${decisionWord}` : image.filename}
           loading="lazy"
           onLoad={() => setLoaded(true)}
           onError={() => setLoaded(true)}
           className="max-h-full max-w-full object-contain"
         />
+        {/* Decision glyph — bottom-right, All view only. Redundant with the
+            ring/footer/bar colour on purpose (colour-blind safe). */}
+        {showGlyph && (
+          <span
+            className="absolute bottom-1.5 right-1.5 inline-flex items-center justify-center h-[18px] w-[18px] rounded-full bg-[rgba(7,8,10,0.72)] ring-1 ring-[rgba(255,255,255,0.14)]"
+            style={{ color: glyphColor }}
+            aria-hidden="true"
+          >
+            <GlyphIcon size={11} strokeWidth={2.75} />
+          </span>
+        )}
         {/* Multi-select check badge — top-left, select-mode only. Interaction
             feedback, not decision state, so it's allowed over the image. */}
         {isSelectMode && (

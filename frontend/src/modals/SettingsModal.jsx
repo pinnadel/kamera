@@ -22,13 +22,14 @@ import {
 } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY } from '../ui/buttons'
-import { Toggle, InfoTooltip, HoverPopover, DecisionWord } from '../ui/primitives'
+import { Toggle, InfoTooltip, HoverPopover, DecisionWord, Segmented } from '../ui/primitives'
 import { ConfirmModal } from './ConfirmModal'
 import { PersonalModelBanner } from '../views/PersonalModelBanner'
 import { ALL_METRICS, SCORE_GROUPS } from '../sortMetrics'
 import { useSort } from '../hooks/useSort'
 import { PullVisionModelButton } from '../ui/PullVisionModelButton'
 import { InstallOllamaCTA } from '../ui/InstallOllamaCTA'
+import { useDialog } from '../hooks/useDialog'
 
 // Presets — apply a named bundle of decision settings in one click.
 // "balanced" mirrors DECISION_DEFAULTS exactly. "review_heavy" widens the
@@ -255,28 +256,12 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     () => localStorage.getItem('pca.settings.advancedOpen') === 'true'
   )
   const [reloading, setReloading] = useState(false)
-  const [reloadConfirm, setReloadConfirm]   = useState(false)
-  const [clearConfirm, setClearConfirm] = useState(false)
-  const [clearChallenge, setClearChallenge] = useState(null)
-  const [clearAnswer, setClearAnswer] = useState('')
-  const [resetModelConfirm, setResetModelConfirm] = useState(false)
-  const [resetModelRunning, setResetModelRunning] = useState(false)
-  const [resetDashboardConfirm, setResetDashboardConfirm] = useState(false)
-  const [resetDashboardRunning, setResetDashboardRunning] = useState(false)
   const [discardConfirm, setDiscardConfirm] = useState(false)
   // Backup & Restore: the picked file waits here until the user chooses
   // Merge vs Replace; the ref lets us reset the input so re-picking the same
   // file re-fires onChange.
   const importFileRef = useRef(null)
   const [pendingImportFile, setPendingImportFile] = useState(null)
-
-  function openClearConfirm() {
-    const a = Math.floor(Math.random() * 9) + 1
-    const b = Math.floor(Math.random() * 9) + 1
-    setClearChallenge({ a, b, answer: String(a + b) })
-    setClearAnswer('')
-    setClearConfirm(true)
-  }
 
   async function handleSaveDecision() {
     if (!decisionValid) {
@@ -454,7 +439,21 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
   }
 
   const TAB_ACTIVE   = 'text-[#f9f9f9] border-b border-[#5BB8D4]'
-  const TAB_INACTIVE = 'text-[#6a6b6c] hover:opacity-70 border-b border-transparent transition-opacity'
+  const TAB_INACTIVE = 'text-[#8a8b8c] hover:opacity-70 border-b border-transparent transition-opacity'
+  const TABS = [
+    { key: 'model',    label: 'Model',    Icon: Brain },
+    { key: 'workflow', label: 'Workflow', Icon: Workflow },
+    { key: 'display',  label: 'Display',  Icon: Monitor },
+  ]
+  const onTabKeyDown = (e) => {
+    const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0
+    if (!step) return
+    e.preventDefault()
+    const i = TABS.findIndex(t => t.key === activeTab)
+    const next = TABS[(i + step + TABS.length) % TABS.length].key
+    setActiveTab(next)
+    document.getElementById(`settings-tab-${next}`)?.focus()
+  }
 
   // Guard against silently dropping unsaved decision changes when the user
   // clicks the backdrop or × — Display saves auto-commit so only the decision
@@ -467,91 +466,54 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     onClose()
   }
 
+  const dialogRef = useDialog(handleClose)
+
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-start justify-center pt-[5vh]" onClick={handleClose} onWheel={e => e.stopPropagation()}>
       <div
-        className="settings-modal bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+        tabIndex={-1}
+        className="focus:outline-none settings-modal bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[440px] max-w-full max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
         onClick={e => e.stopPropagation()}
       >
         {/* Upper section — darker band, matches DetailView header */}
         <div className="bg-[#161718] border-b border-[#2f3031] px-6 pt-5 pb-0 rounded-t-xl flex-shrink-0">
           {/* Header */}
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-semibold text-[#f9f9f9]">Settings</h2>
+            <h2 id="settings-title" className="text-sm font-semibold text-[#f9f9f9]">Settings</h2>
             <button onClick={handleClose} className={BTN_ICON} aria-label="Close">
               <X size={18} />
             </button>
           </div>
 
           {/* Tab bar */}
-          <div className="flex gap-5">
-            <button
-              onClick={() => setActiveTab('model')}
-              className={`inline-flex items-center gap-1.5 pb-2 text-xs font-medium transition-colors ${activeTab === 'model' ? TAB_ACTIVE : TAB_INACTIVE}`}
-            >
-              <Brain size={15} /> Model
-            </button>
-            <button
-              onClick={() => setActiveTab('workflow')}
-              className={`inline-flex items-center gap-1.5 pb-2 text-xs font-medium transition-colors ${activeTab === 'workflow' ? TAB_ACTIVE : TAB_INACTIVE}`}
-            >
-              <Workflow size={15} /> Workflow
-            </button>
-            <button
-              onClick={() => setActiveTab('display')}
-              className={`inline-flex items-center gap-1.5 pb-2 text-xs font-medium transition-colors ${activeTab === 'display' ? TAB_ACTIVE : TAB_INACTIVE}`}
-            >
-              <Monitor size={15} /> Display
-            </button>
+          <div className="flex gap-5" role="tablist" aria-label="Settings sections" onKeyDown={onTabKeyDown}>
+            {TABS.map(({ key, label, Icon }) => (
+              <button
+                key={key}
+                id={`settings-tab-${key}`}
+                role="tab"
+                aria-selected={activeTab === key}
+                aria-controls="settings-panel"
+                tabIndex={activeTab === key ? 0 : -1}
+                onClick={() => setActiveTab(key)}
+                className={`inline-flex items-center gap-1.5 pb-2 text-xs font-medium transition-colors focus:outline-none focus-visible:text-[#5BB8D4] ${activeTab === key ? TAB_ACTIVE : TAB_INACTIVE}`}
+              >
+                <Icon size={15} /> {label}
+              </button>
+            ))}
           </div>
         </div>
 
         {/* Body — scrollable middle region */}
-        <div className="px-6 pt-5 pb-6 overflow-y-auto flex-1 min-h-0">
+        <div id="settings-panel" role="tabpanel" aria-labelledby={`settings-tab-${activeTab}`} className="px-6 pt-5 pb-6 overflow-y-auto flex-1 min-h-0">
 
         {/* ── Model tab ── */}
         {activeTab === 'model' && (
           <div className="space-y-6">
-
-            {/* ── Analysis scope ───────────────────────────────────────── */}
-            <div>
-              <p className="label mb-1">Analysis scope</p>
-              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
-                When a shot was taken RAW + a processed file (JPEG, HIF, PNG,
-                TIFF), choose whether the RAW also gets scored. Skipping it
-                can dramatically speed up analysis — the processed file's
-                score is used for culling, and any Keep / Maybe / Reject
-                decision on it automatically moves its RAW companion along
-                with it.
-              </p>
-
-              <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingAnalysisMode ? 'opacity-50 pointer-events-none' : ''}`}>
-                {[
-                  { key: 'full', label: 'Full', title: 'Analyze every file, including RAW + processed pairs' },
-                  { key: 'jpeg_priority', label: 'Processed (.jpg, .hif, …)', title: 'Skip a RAW file when a same-stem processed file (.jpg/.jpeg/.hif/.png/.tif/.tiff) exists' },
-                ].map(({ key, label, title }, i) => (
-                  <button
-                    key={key}
-                    onClick={() => handleAnalysisModeChange(key)}
-                    title={title}
-                    className={`px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${analysisMode === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-
-              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
-                A RAW file with no processed sibling (RAW-only shooting) is
-                always analyzed in full, regardless of this setting — there's
-                nothing else to judge that shot by. Changing this setting
-                only affects files analyzed from now on — it never
-                retroactively scores an already-skipped RAW or clears scores
-                already stored for a fully-analyzed one. Use Clear Analysis
-                (or Clear folder) and re-analyze if you want to apply a new
-                mode to files already in your library.
-              </p>
-            </div>
 
             {/* ── Presets ───────────────────────────────────────────────── */}
             {(() => {
@@ -576,11 +538,14 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
               return (
                 <div>
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="text-xs text-[#9c9c9d]">Presets</span>
-                    {activePreset === null && (
-                      <span className="text-[10px] text-[#9c9c9d]">· Custom settings</span>
-                    )}
+                  <div className="flex items-baseline justify-between gap-3 mb-2">
+                    <div className="flex items-baseline gap-2">
+                      <p className="label">Presets</p>
+                      {activePreset === null && (
+                        <span className="text-xs text-[#9c9c9d]">· Custom settings</span>
+                      )}
+                    </div>
+                    <span className="text-xs text-[#8a8b8c]">Saved with Apply</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5">
                     {pills.map(({ key, label, Icon, desc }) => {
@@ -606,12 +571,12 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     })}
                   </div>
                   {activePreset === null ? (
-                    <p className="text-[11px] text-[#6a6b6c] mt-2 leading-relaxed">
+                    <p className="text-xs text-[#8a8b8c] mt-2 leading-relaxed">
                       Your thresholds below don't match any preset — that's fine, they're yours.
-                      Presets are just starting points; pick one to reset everything to it.
+                      A preset sets the cutoffs and instant-reject rules; burst settings are left as they are.
                     </p>
                   ) : (
-                    <p className="text-[11px] text-[#6a6b6c] mt-2 leading-relaxed">
+                    <p className="text-xs text-[#8a8b8c] mt-2 leading-relaxed">
                       A preset is selected. Adjusting any threshold below makes it custom.
                     </p>
                   )}
@@ -621,7 +586,10 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
             {/* ── Decision thresholds ───────────────────────────────────── */}
             <div>
-              <p className="label mb-1">Decision thresholds</p>
+              <div className="flex items-baseline justify-between gap-3 mb-1">
+                <p className="label">Decision thresholds</p>
+                <span className="text-xs text-[#8a8b8c]">Saved with Apply</span>
+              </div>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-5">
                 These rules control how scores translate into{' '}
                 <DecisionWord kind="keep">Keep</DecisionWord>{' / '}
@@ -644,6 +612,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 </div>
                 <input
                   type="range"
+                  aria-label="Sharpness weight"
                   min={0}
                   max={100}
                   step={5}
@@ -660,17 +629,17 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   model accuracy when it IS ready, so the user has any
                   basis for deciding whether tuning is worth it. */}
               <div className="pt-4 border-t border-[rgba(255,255,255,0.05)] mb-5">
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 mb-3">
                   <p className="text-[11px] uppercase tracking-widest text-[#9c9c9d]">Personal-model cutoffs</p>
                   {modelInfo?.ready && modelInfo?.validation?.model_accuracy != null && (
                     <span
-                      className="text-[10px] font-mono text-[#9c9c9d]"
+                      className="text-xs font-mono text-[#9c9c9d] whitespace-nowrap"
                       title={`Your trained model agrees with your decisions on ${Math.round(modelInfo.validation.model_accuracy * 100)}% of held-out test cases. Baseline (technical scoring alone) is ${Math.round((modelInfo.validation.baseline_accuracy ?? 0) * 100)}%. The bigger the gap, the more your personal-model thresholds matter relative to fallback ones.`}
                     >
                       Model accuracy{' '}
                       <span className="text-[#7B82C9]">{Math.round(modelInfo.validation.model_accuracy * 100)}%</span>
                       {modelInfo.validation.baseline_accuracy != null && (
-                        <span className="text-[#6a6b6c]"> vs baseline {Math.round(modelInfo.validation.baseline_accuracy * 100)}%</span>
+                        <span className="text-[#8a8b8c]"> vs baseline {Math.round(modelInfo.validation.baseline_accuracy * 100)}%</span>
                       )}
                     </span>
                   )}
@@ -700,7 +669,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   onChange={v => updField('maybe_threshold', v)}
                   error={decisionErrors.maybe_threshold}
                 />
-                <p className="text-xs text-[#9c9c9d] leading-relaxed mt-2">
+                <p className="text-xs text-[#9c9c9d] leading-relaxed mt-2 mb-4">
                   Active once the personal model reaches the Ready tier (≥50 samples and validated to beat the quality-threshold baseline).
                 </p>
 
@@ -910,7 +879,10 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
 
             <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
-              <p className="label mb-3">AI vision model</p>
+              <div className="flex items-baseline justify-between gap-3 mb-3">
+                <p className="label">AI vision model</p>
+                <span className="text-xs text-[#8a8b8c]">Saves instantly</span>
+              </div>
 
               <OllamaStatusPanel />
 
@@ -922,7 +894,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     When on, opening a photo in detail view automatically asks the model to explain the rating. When off, a "Generate" button appears instead. The burst pick is independent of this toggle and runs automatically when a vision model is installed.
                   </p>
                 </div>
-                <Toggle enabled={autoGenerate} onChange={onAutoGenerateChange} />
+                <Toggle enabled={autoGenerate} onChange={onAutoGenerateChange} label="Auto-generate explanation" />
               </div>
             </div>
 
@@ -977,7 +949,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                         </button>
                       </div>
                       {hint && (
-                        <p className="text-[11px] text-[#6a6b6c] leading-relaxed">{hint}</p>
+                        <p className="text-xs text-[#8a8b8c] leading-relaxed">{hint}</p>
                       )}
                     </div>
                   )
@@ -993,7 +965,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                       <GraduationCap size={16} />
                       Start training session · {undecidedCount}
                     </button>
-                    <p className="text-[11px] text-[#6a6b6c] leading-relaxed mt-1.5">
+                    <p className="text-xs text-[#8a8b8c] leading-relaxed mt-1.5">
                       Score-blind cull mode for fast taste calibration.
                     </p>
                   </div>
@@ -1031,7 +1003,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                           />
                         </div>
                       )}
-                      <p className="text-[11px] text-[#6a6b6c] leading-relaxed">
+                      <p className="text-xs text-[#8a8b8c] leading-relaxed">
                         Kept separate from the camera model on purpose — mixing iPhone and RAW
                         would teach it contradictory labels about sharpness and aperture.
                       </p>
@@ -1060,7 +1032,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     </p>
                     <div className="space-y-2">
                       <div className="flex items-start justify-between gap-3">
-                        <p className="text-[11px] text-[#9c9c9d] leading-relaxed flex-1">
+                        <p className="text-xs text-[#9c9c9d] leading-relaxed flex-1">
                           <span className="text-[#cecece]">Merge</span> — add these decisions to your current model. Photos in both update in place; your settings stay unless the backup overrides them.
                         </p>
                         <button
@@ -1077,7 +1049,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                         </button>
                       </div>
                       <div className="flex items-start justify-between gap-3">
-                        <p className="text-[11px] text-[#9c9c9d] leading-relaxed flex-1">
+                        <p className="text-xs text-[#9c9c9d] leading-relaxed flex-1">
                           <span className="text-red-400/90">Replace</span> — wipe the current taste model and decision settings, then restore this backup exactly.
                         </p>
                         <button
@@ -1134,236 +1106,105 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               </div>
             )}
 
-            <div className="rounded-lg border border-red-900/50 bg-red-950/20 p-4 space-y-4">
-              <p className="text-[11px] font-semibold uppercase tracking-widest text-red-500/70">Danger zone</p>
+            {/* Maintenance — recoverable housekeeping. Kept out of the red zone
+                so red keeps meaning "loses something you can't get back". */}
+            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)] space-y-4">
+              <p className="label">Maintenance</p>
 
-              {/* Reload AI scoring models. The personal-model retrain
-                  control lives in the model section above (it's a normal,
-                  non-destructive action now that auto-training is the
-                  default — it doesn't belong in the Danger Zone). */}
-              {reloadConfirm ? (
-                <div className="space-y-3">
+              <ConfirmAction
+                tone="neutral"
+                title="Reload AI scoring models"
+                description="Drops TOPIQ-NR, TOPIQ-IAA and SigLIP from RAM and loads them again from disk. Use it after replacing a model file, or to retry a model that failed to load and left its scores blank. Existing scores aren't recomputed."
+                actionLabel="Reload models"
+                Icon={RefreshCw}
+                confirmBody={<>
                   <p className="text-xs text-[#cecece] leading-relaxed">
-                    This drops <span className="text-[#f0f0f0]">TOPIQ-NR</span>, <span className="text-[#f0f0f0]">TOPIQ-IAA</span>, and <span className="text-[#f0f0f0]">SigLIP</span> from RAM and re-loads them from disk in the background. Existing scores in the database are not changed.
+                    This drops <span className="text-[#f0f0f0]">TOPIQ-NR</span>, <span className="text-[#f0f0f0]">TOPIQ-IAA</span> and <span className="text-[#f0f0f0]">SigLIP</span> from RAM and re-loads them in the background. Existing scores are not changed.
                   </p>
                   <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                    Loading takes ~25–30 seconds. Any analysis you start in that window will block until the models are ready again.
+                    Takes ~25–30 seconds. An analysis started in that window waits until the models are back.
                   </p>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => setReloadConfirm(false)}
-                      className={`${BTN_SECONDARY} text-xs`}
-                    >
-                      <X size={14} /> Cancel
-                    </button>
-                    <button
-                      onClick={() => { setReloadConfirm(false); handleReloadModels() }}
-                      disabled={reloading}
-                      className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                    >
-                      <RefreshCw size={15} />
-                      {reloading ? 'Reloading…' : 'Yes, reload models'}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex-1">
-                    <p className="text-xs text-[#cecece] leading-relaxed mb-1">Reload AI scoring models</p>
-                    <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                      The TOPIQ-NR, TOPIQ-IAA, and SigLIP models load once at startup and stay warm in RAM. Use this if you've manually replaced a model file on disk (pulled a new version, swapped weights) and want the running app to pick it up without restarting the backend. It also clears a stuck model: if one fails to load, it stays disabled for the rest of the session and its scores come back blank on every photo — this retries it. Existing scores aren't recomputed — only future analyses use the new weights.
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => setReloadConfirm(true)}
-                    className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors"
-                  >
-                    <RefreshCw size={15} /> Reload models
-                  </button>
-                </div>
-              )}
+                </>}
+                confirmLabel="Yes, reload models"
+                runningLabel="Reloading…"
+                running={reloading}
+                onConfirm={handleReloadModels}
+              />
 
-              {/* Clear analysis */}
-              {onClear && (
-                <>
-                  <div className="border-t border-red-900/40 pt-4" />
-                  {clearConfirm ? (
-                    <div className="space-y-3">
+              {onResetDashboard && (
+                <ConfirmAction
+                  tone="neutral"
+                  title="Reset dashboard"
+                  description="Clears the camera, lens, focal-length, aperture, ISO and shots-per-week history. It rebuilds as you analyze new photos. Your model and decisions aren't touched."
+                  actionLabel="Reset dashboard"
+                  Icon={Trash2}
+                  confirmBody={
+                    <p className="text-xs text-[#cecece] leading-relaxed">
+                      This clears the shooting history behind the Dashboard's camera, lens, film-simulation, focal-length, aperture, ISO and shots-per-week cards. The taste model and its decision history are kept.
+                    </p>
+                  }
+                  confirmLabel="Yes, reset dashboard"
+                  runningLabel="Resetting…"
+                  onConfirm={onResetDashboard}
+                />
+              )}
+            </div>
+
+            {/* Danger zone — only actions that lose data you can't rebuild by
+                clicking again. Friction scales with what is lost. */}
+            {(onClear || onResetModel) && (
+              <div className="rounded-lg border border-red-900/50 bg-red-950/20 p-4 space-y-4">
+                <p className="text-[11px] font-semibold uppercase tracking-widest text-red-500/70">Danger zone</p>
+
+                {onClear && (
+                  <ConfirmAction
+                    challenge
+                    title="Clear analysis"
+                    description="Remove every analyzed photo, decision, similarity group and cached preview from the app. Files on disk aren't touched."
+                    actionLabel="Clear analysis"
+                    Icon={Trash2}
+                    confirmBody={
                       <p className="text-xs text-[#cecece] leading-relaxed">
                         This removes every analyzed photo from the app — including your{' '}
                         <DecisionWord kind="keep">Keep</DecisionWord>{' / '}
                         <DecisionWord kind="maybe">Maybe</DecisionWord>{' / '}
                         <DecisionWord kind="reject">Reject</DecisionWord>
-                        {' '}decisions, similarity groups, and cached previews. Your RAW files on disk are not touched.
+                        {' '}decisions, similarity groups and cached previews. Your RAW files on disk are not touched.
                       </p>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs text-[#cecece] font-mono shrink-0">
-                          {clearChallenge?.a} + {clearChallenge?.b} =
-                        </span>
-                        <input
-                          type="text"
-                          inputMode="numeric"
-                          value={clearAnswer}
-                          onChange={e => setClearAnswer(e.target.value)}
-                          placeholder="?"
-                          autoFocus
-                          className="w-14 px-2 py-1 rounded bg-[#1b1c1e] border border-[rgba(255,255,255,0.08)] text-xs text-[#f9f9f9] font-mono text-center focus:outline-none focus:border-red-800/60"
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => { setClearConfirm(false); setClearAnswer('') }}
-                          className={`${BTN_SECONDARY} text-xs`}
-                        >
-                          <X size={14} /> Cancel
-                        </button>
-                        <button
-                          onClick={() => { setClearConfirm(false); setClearAnswer(''); onClear() }}
-                          disabled={clearing || clearAnswer.trim() !== clearChallenge?.answer}
-                          className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                        >
-                          <Trash2 size={15} />
-                          {clearing ? 'Clearing…' : 'Yes, clear everything'}
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1">
-                        <p className="text-xs text-[#cecece] leading-relaxed mb-1">Clear analysis</p>
-                        <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                          Remove all analyzed photos, decisions, and cached previews from the app. RAW files on disk are not touched.
-                        </p>
-                      </div>
-                      <button
-                        onClick={openClearConfirm}
-                        disabled={clearing}
-                        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        <Trash2 size={15} />
-                        {clearing ? 'Clearing…' : 'Clear analysis'}
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
+                    }
+                    confirmLabel="Yes, clear everything"
+                    runningLabel="Clearing…"
+                    running={clearing}
+                    onConfirm={onClear}
+                  />
+                )}
 
-              {/* Reset personal model — drops training samples + pairwise
-                  comparisons + the persisted .pkl. Decisions on photos are
-                  preserved. Two-step confirm, no typed challenge. */}
-              {onResetModel && (
-                <>
-                  <div className="border-t border-red-900/40 pt-4" />
-                  {resetModelConfirm ? (
-                    <div className="space-y-3">
-                      <p className="text-xs text-[#cecece] leading-relaxed">
-                        This wipes everything the personal taste model has learned: all training samples, all pairwise A/B comparisons, and the saved model file. The banner returns to 0 samples. Your{' '}
-                        <DecisionWord kind="keep">Keep</DecisionWord>{' / '}
-                        <DecisionWord kind="maybe">Maybe</DecisionWord>{' / '}
-                        <DecisionWord kind="reject">Reject</DecisionWord>
-                        {' '}decisions on photos are kept — only the learned model is reset.
-                      </p>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setResetModelConfirm(false)}
-                          disabled={resetModelRunning}
-                          className={`${BTN_SECONDARY} text-xs`}
-                        >
-                          <X size={14} /> Cancel
-                        </button>
-                        <button
-                          onClick={async () => {
-                            setResetModelRunning(true)
-                            try { await onResetModel() } finally {
-                              setResetModelRunning(false)
-                              setResetModelConfirm(false)
-                            }
-                          }}
-                          disabled={resetModelRunning}
-                          className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                        >
-                          <Trash2 size={15} />
-                          {resetModelRunning ? 'Resetting…' : 'Yes, reset model'}
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1">
-                        <p className="text-xs text-[#cecece] leading-relaxed mb-1">Reset personal taste model</p>
-                        <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                          Clear all training samples, pairwise comparisons, and the saved model. The banner restarts at 0 samples and auto-cull falls back to quality-only scoring until the model retrains. Photo decisions on disk are untouched.
+                {onResetModel && (
+                  <>
+                    <div className="border-t border-red-900/40" />
+                    <ConfirmAction
+                      challenge
+                      title="Reset personal taste model"
+                      description="Erase everything the model has learned: training samples, A/B comparisons and the saved model. Photo decisions stay, and auto-cull falls back to quality-only scoring until it retrains. Export a backup above first if you may want this back."
+                      actionLabel="Reset model"
+                      Icon={Trash2}
+                      confirmBody={
+                        <p className="text-xs text-[#cecece] leading-relaxed">
+                          This wipes all training samples, all pairwise A/B comparisons and the saved model file. The banner returns to 0 samples. Your{' '}
+                          <DecisionWord kind="keep">Keep</DecisionWord>{' / '}
+                          <DecisionWord kind="maybe">Maybe</DecisionWord>{' / '}
+                          <DecisionWord kind="reject">Reject</DecisionWord>
+                          {' '}decisions on photos are kept — only the learned model is reset.
                         </p>
-                      </div>
-                      <button
-                        onClick={() => setResetModelConfirm(true)}
-                        disabled={resetModelRunning}
-                        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        <Trash2 size={15} /> Reset model
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-
-              {/* Reset dashboard — wipes shooting_log so the Dashboard's
-                  camera / lens / focal-length / aperture / ISO / timeline
-                  cards start over. Does not touch training_samples; the
-                  personal model and its decision-history cards are
-                  preserved. Two-step confirm. */}
-              {onResetDashboard && (
-                <>
-                  <div className="border-t border-red-900/40 pt-4" />
-                  {resetDashboardConfirm ? (
-                    <div className="space-y-3">
-                      <p className="text-xs text-[#cecece] leading-relaxed">
-                        This clears the shooting history that powers the Dashboard's camera, lens, film-simulation, focal-length, aperture, ISO, and shots-per-week cards. The personal taste model and its decision-history cards are preserved — use <span className="text-[#f0f0f0]">Reset personal taste model</span> too if you also want to wipe the model.
-                      </p>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setResetDashboardConfirm(false)}
-                          disabled={resetDashboardRunning}
-                          className={`${BTN_SECONDARY} text-xs`}
-                        >
-                          <X size={14} /> Cancel
-                        </button>
-                        <button
-                          onClick={async () => {
-                            setResetDashboardRunning(true)
-                            try { await onResetDashboard() } finally {
-                              setResetDashboardRunning(false)
-                              setResetDashboardConfirm(false)
-                            }
-                          }}
-                          disabled={resetDashboardRunning}
-                          className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                        >
-                          <Trash2 size={15} />
-                          {resetDashboardRunning ? 'Resetting…' : 'Yes, reset dashboard'}
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1">
-                        <p className="text-xs text-[#cecece] leading-relaxed mb-1">Reset dashboard</p>
-                        <p className="text-xs text-[#9c9c9d] leading-relaxed">
-                          Clear the camera / lens / film-sim / focal-length / aperture / ISO histograms and the shots-per-week timeline. Does not affect the personal model or your photo decisions. shooting_log rebuilds as you analyze new photos.
-                        </p>
-                      </div>
-                      <button
-                        onClick={() => setResetDashboardConfirm(true)}
-                        disabled={resetDashboardRunning}
-                        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        <Trash2 size={15} /> Reset dashboard
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
+                      }
+                      confirmLabel="Yes, reset model"
+                      runningLabel="Resetting…"
+                      onConfirm={onResetModel}
+                    />
+                  </>
+                )}
+              </div>
+            )}
 
           </div>
         )}
@@ -1378,23 +1219,18 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
                 Scale the entire interface — text, buttons, icons, and spacing — to match your display and preference.
               </p>
-              <div className="inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden">
-                {[
+              <Segmented
+                ariaLabel="Interface size"
+                compact
+                value={uiScale}
+                onChange={onUiScaleChange}
+                options={[
                   { key: 'S', label: 'S', title: 'Compact — original size' },
                   { key: 'M', label: 'M', title: 'Medium — 15% larger (recommended)' },
                   { key: 'L', label: 'L', title: 'Large — 30% larger' },
-                ].map(({ key, label, title }, i) => (
-                  <button
-                    key={key}
-                    onClick={() => onUiScaleChange(key)}
-                    title={title}
-                    className={`px-4 py-1.5 text-xs font-medium transition-colors ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${uiScale === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <p className="text-[11px] text-[#6a6b6c] mt-2">
+                ]}
+              />
+              <p className="text-xs text-[#8a8b8c] mt-2">
                 Takes effect immediately. Saved across sessions.
               </p>
             </div>
@@ -1403,24 +1239,19 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
             {/* ── Grid filenames ── */}
             <div>
-              <p className="label mb-1">Grid filenames</p>
-              <div className="flex items-start justify-between gap-4 py-2">
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs text-[#f0f0f0]">Show filenames under thumbnails</p>
-                  <p className="text-xs text-[#9c9c9d] leading-relaxed mt-1">
-                    Displays the filename row beneath every grid tile. Turn it
-                    off for a cleaner, image-first grid — the status chips and
-                    group summary stay. Toggle anytime with{' '}
-                    <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[10px] text-[#9c9c9d]">F</kbd>.
-                  </p>
-                </div>
-                <div className="pt-0.5">
-                  <Toggle
-                    enabled={showFilenames}
-                    onChange={() => onToggleFilenames?.()}
-                  />
-                </div>
+              <div className="flex items-center justify-between gap-4 mb-1">
+                <p className="label">Grid filenames</p>
+                <Toggle
+                  label="Show filenames under thumbnails"
+                  enabled={showFilenames}
+                  onChange={() => onToggleFilenames?.()}
+                />
               </div>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed">
+                Show the filename under each tile. Off gives a cleaner, image-first
+                grid — status chips stay. Toggle anytime with{' '}
+                <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[11px] text-[#9c9c9d]">F</kbd>
+              </p>
             </div>
 
             <div className="border-t border-[rgba(255,255,255,0.05)]" />
@@ -1446,13 +1277,14 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 </div>
                 <div className={`pt-0.5 ${savingDisplay ? 'opacity-50 pointer-events-none' : ''}`}>
                   <Toggle
+                    label="Prefer camera JPEG / HIF preview"
                     enabled={preferSidecar}
                     onChange={handleSidecarToggle}
                   />
                 </div>
               </div>
 
-              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mt-3">
                 Cached previews are regenerated the first time each photo is
                 viewed after the toggle changes — there’s a brief delay on the
                 next grid scroll.
@@ -1469,24 +1301,19 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 rendered for a single RAW tile, it doesn’t hide anything.
               </p>
 
-              <div className={`inline-flex rounded-lg border border-[rgba(255,255,255,0.10)] overflow-hidden ${savingRawJpegMode ? 'opacity-50 pointer-events-none' : ''}`}>
-                {[
+              <Segmented
+                ariaLabel="RAW+JPEG grid tiles"
+                value={rawJpegMode}
+                onChange={handleRawJpegModeChange}
+                busy={savingRawJpegMode}
+                options={[
                   { key: 'raw', label: 'RAW only', title: 'Show only the RAW file (RAF, NEF, 3FR, DNG, ARW, CR2, CR3)' },
                   { key: 'processed', label: 'Processed only', title: 'Show only the compressed JPEG/HIF file' },
                   { key: 'both', label: 'Both', title: 'Show every analyzed file as its own tile (default)' },
-                ].map(({ key, label, title }, i) => (
-                  <button
-                    key={key}
-                    onClick={() => handleRawJpegModeChange(key)}
-                    title={title}
-                    className={`px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${i > 0 ? 'border-l border-[rgba(255,255,255,0.10)]' : ''} ${rawJpegMode === key ? 'bg-[#1a1b1d] text-[#f0f0f0]' : 'text-[#9c9c9d] hover:opacity-70'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
+                ]}
+              />
 
-              <p className="text-[11px] text-[#9c9c9d] leading-relaxed mt-3">
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mt-3">
                 A photo with no companion (RAW-only or JPEG-only import)
                 always shows regardless of this setting. When set to RAW
                 only or Processed only, a K/M/R decision on the visible file
@@ -1537,6 +1364,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                             <div key={metric.id} className="flex items-center justify-between gap-4 py-1">
                               <p className="text-xs text-[#f0f0f0]">{metric.label}</p>
                               <Toggle
+                                label={metric.label}
                                 enabled={visibleMetrics.includes(metric.id)}
                                 onChange={() => toggleMetric(metric.id)}
                               />
@@ -1567,6 +1395,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   </div>
                   <div className="pt-0.5">
                     <Toggle
+                      label="Show banner above the grid"
                       enabled={!bannerDismissed}
                       onChange={(next) => onSetBannerDismissed(!next)}
                     />
@@ -1609,9 +1438,16 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     stay where they are. HIF previews follow the file into
                     the Trash automatically.
                   </p>
+                  <p className="text-xs text-[#9c9c9d] mt-2">
+                    Rejects go to:{' '}
+                    <span className="font-mono text-[#cecece]">
+                      {rejectToTrash ? 'system Trash' : '_Rejects/ in each source folder'}
+                    </span>
+                  </p>
                 </div>
                 <div className={`pt-0.5 ${savingTrash ? 'opacity-50 pointer-events-none' : ''}`}>
                   <Toggle
+                    label="Send rejected photos to system Trash"
                     enabled={rejectToTrash}
                     onChange={handleRejectTrashToggle}
                   />
@@ -1620,25 +1456,52 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
             </div>
 
             <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+              <div className="flex items-baseline justify-between gap-3 mb-1">
+                <p className="label">Analysis scope</p>
+                <span className="text-xs text-[#8a8b8c]">Saves instantly</span>
+              </div>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
+                When a shot exists as a RAW plus a processed file (JPEG, HIF, PNG, TIFF),
+                choose whether the RAW is scored too. Skipping it speeds analysis up a lot —
+                decisions on the processed file still move its RAW along with it.
+              </p>
+              <Segmented
+                ariaLabel="Analysis scope"
+                value={analysisMode}
+                onChange={handleAnalysisModeChange}
+                busy={savingAnalysisMode}
+                options={[
+                  { key: 'full', label: 'Full', title: 'Analyze every file, including RAW + processed pairs' },
+                  { key: 'jpeg_priority', label: 'Processed (.jpg, .hif, …)', title: 'Skip a RAW file when a same-stem processed file (.jpg/.jpeg/.hif/.png/.tif/.tiff) exists' },
+                ]}
+              />
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mt-3">
+                Applies to files analyzed from now on — existing scores aren't changed.
+                RAW-only shots are always analyzed.{' '}
+                <InfoTooltip>
+                  A RAW with no processed sibling is always analyzed in full — there's nothing else to judge that shot by. Changing this never retroactively scores an already-skipped RAW, nor clears scores stored for a fully-analyzed one. To apply a new mode to files already in your library, use Clear analysis (or Clear folder) and re-analyze.
+                </InfoTooltip>
+              </p>
+            </div>
+
+            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
               <p className="label mb-1">Advance cursor</p>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
                 Where the focus jumps after each K / M / R. Match it to how you scan the grid.
               </p>
-              <div className="flex items-center justify-end">
-                <button
-                  onClick={() => onAdvanceDirChange?.(advanceDir === 'forward' ? 'backward' : 'forward')}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-[#cecece] border border-[rgba(255,255,255,0.10)] bg-[#0d0e10] hover:opacity-70 transition-opacity whitespace-nowrap"
-                  aria-label={`Advance cursor: ${advanceDir === 'forward' ? 'to the right' : 'to the left'}`}
-                >
-                  {advanceDir === 'forward'
-                    ? <><ArrowRight size={13} /> to the right</>
-                    : <><ArrowLeft size={13} /> to the left</>}
-                </button>
-              </div>
+              <Segmented
+                ariaLabel="Advance cursor direction"
+                value={advanceDir}
+                onChange={(k) => onAdvanceDirChange?.(k)}
+                options={[
+                  { key: 'backward', label: <><ArrowLeft size={13} /> To the left</> },
+                  { key: 'forward',  label: <>To the right <ArrowRight size={13} /></> },
+                ]}
+              />
             </div>
 
             <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
-              <p className="label mb-3">Grouping</p>
+              <p className="label mb-1">Grouping</p>
               <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
                 Controls how similar-photo bursts are formed. Most users won't need to touch this — manually moving photos in and out of groups is usually the right answer. Changes take effect immediately and re-cluster the whole library.
               </p>
@@ -1650,6 +1513,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 </div>
                 <input
                   type="range"
+                  aria-label="Similarity threshold"
                   min="0.80"
                   max="0.99"
                   step="0.01"
@@ -1657,7 +1521,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   onChange={e => setGroupThreshold?.(parseFloat(e.target.value))}
                   className="w-full accent-[#5BB8D4]"
                 />
-                <p className="text-[10px] text-[#777] mt-1 leading-tight">
+                <p className="text-xs text-[#8a8b8c] mt-1 leading-tight">
                   Higher = stricter grouping. Lower = more photos per burst. Also
                   controls how auto-cull decides which frames are redundant.
                 </p>
@@ -1672,6 +1536,8 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 </div>
                 <input
                   type="range"
+                  aria-label="Time gap"
+                  aria-valuetext={formatTimeGap(groupTimeGapSeconds)}
                   min="0"
                   max={TIME_GAP_STEPS.length - 1}
                   step="1"
@@ -1679,10 +1545,10 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                   onChange={e => setGroupTimeGapSeconds?.(TIME_GAP_STEPS[parseInt(e.target.value, 10)])}
                   className="w-full accent-[#5BB8D4]"
                 />
-                <p className="text-[10px] text-[#777] mt-1 leading-tight">
+                <p className="text-xs text-[#8a8b8c] mt-1 leading-tight">
                   Max pause between shots in the same burst. Longer pauses start a new burst. Ranges from 1 second to 5 minutes, with the finest steps at the short end.
                 </p>
-                <p className="text-[10px] text-[#6a6b6c] mt-1 leading-tight italic">
+                <p className="text-xs text-[#8a8b8c] mt-1 leading-tight italic">
                   Affects grouped review (Bursts / GroupLoupe) only — not auto-cull. Auto-cull groups by visual similarity, so it uses the Similarity slider above, not this one.
                 </p>
               </div>
@@ -1776,7 +1642,7 @@ function OllamaStatusPanel() {
     s === 'no_models' || (s === 'ready' && status?.vision_capable === false)
   )
 
-  let dotColor = '#6a6b6c'
+  let dotColor = '#8a8b8c'
   let label    = 'Checking…'
   if (!loading) {
     if (error)                      { dotColor = '#C97B7B'; label = 'Backend unreachable' }
@@ -1882,7 +1748,7 @@ function OllamaStatusPanel() {
         <button
           onClick={refresh}
           disabled={loading}
-          className="inline-flex items-center gap-1 text-[11px] text-[#9c9c9d] hover:text-[#cecece] transition-colors underline disabled:opacity-50 shrink-0"
+          className="inline-flex items-center gap-1 text-xs text-[#9c9c9d] hover:text-[#cecece] transition-colors underline disabled:opacity-50 shrink-0"
         >
           <RefreshCw size={13} />
           {loading ? 'Refreshing…' : 'Refresh'}
@@ -1902,7 +1768,7 @@ function OllamaStatusPanel() {
         // and wants to reclaim 1.6 GB. Each row is independently removable
         // because we don't know which extras the user wants gone vs. kept.
         <div className="pt-1 space-y-1">
-          <div className="text-[10px] uppercase tracking-wider text-[#6a6b6c]">
+          <div className="text-[10px] uppercase tracking-wider text-[#8a8b8c]">
             Other installed models
           </div>
           {unusedModels.map(name => (
@@ -1911,7 +1777,7 @@ function OllamaStatusPanel() {
               <button
                 onClick={() => removeModel(name)}
                 disabled={deleting === name}
-                className="inline-flex items-center gap-1 text-[11px] text-[#9c9c9d] hover:text-[#C97B7B] transition-colors underline disabled:opacity-50 shrink-0"
+                className="inline-flex items-center gap-1 text-xs text-[#9c9c9d] hover:text-[#C97B7B] transition-colors underline disabled:opacity-50 shrink-0"
                 title={`Remove ${name} from Ollama to free disk space`}
               >
                 {deleting === name ? 'Removing…' : 'Remove'}
@@ -1955,6 +1821,7 @@ function NumberRow({ label, tooltip, value, min, max, step = 1, onChange, indent
         </span>
         <input
           type="number"
+          aria-label={label}
           value={draft}
           min={min}
           max={max}
@@ -1967,21 +1834,106 @@ function NumberRow({ label, tooltip, value, min, max, step = 1, onChange, indent
         />
       </div>
       {error && (
-        <p className="text-[11px] text-[#C97B7B] mb-2 ml-0">{error}</p>
+        <p className="text-xs text-[#C97B7B] mb-2 ml-0">{error}</p>
       )}
       {!error && <div className="mb-1" />}
     </div>
   )
 }
 
-function ToggleRow({ label, tooltip, enabled, onChange }) {
+function ToggleRow({ label, tooltip, enabled, onChange, indent = false }) {
   return (
-    <div className="flex items-center gap-3 mb-2">
+    <div className={`flex items-center gap-3 mb-2 ${indent ? 'pl-5' : ''}`}>
       <span className="text-xs text-[#cecece] flex-1 inline-flex items-center gap-1.5">
         {label}
         <InfoTooltip>{tooltip}</InfoTooltip>
       </span>
-      <Toggle enabled={enabled} onChange={onChange} />
+      <Toggle enabled={enabled} onChange={onChange} label={label} />
+    </div>
+  )
+}
+
+const DANGER_BTN = 'flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-red-800/60 text-red-400/80 hover:bg-red-900/40 hover:text-red-300 hover:border-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed'
+
+// ConfirmAction — a settings row whose button expands into an inline
+// confirmation. tone="danger" is red; tone="neutral" is for recoverable
+// housekeeping. `challenge` adds a typed sum before the confirm button
+// unlocks, for actions that lose data that can't be rebuilt.
+function ConfirmAction({ title, description, actionLabel, Icon, confirmBody, confirmLabel, runningLabel, running = false, onConfirm, tone = 'danger', challenge = false }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [sum, setSum] = useState(null)
+  const [answer, setAnswer] = useState('')
+  const working = busy || running
+  const btn = tone === 'danger' ? DANGER_BTN : `${BTN_SECONDARY} text-xs flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed`
+
+  const begin = () => {
+    if (challenge) {
+      const a = Math.floor(Math.random() * 9) + 1
+      const b = Math.floor(Math.random() * 9) + 1
+      setSum({ a, b, answer: String(a + b) })
+      setAnswer('')
+    }
+    setOpen(true)
+  }
+  const cancel = () => { setOpen(false); setAnswer('') }
+  const confirm = async () => {
+    setBusy(true)
+    try { await onConfirm() } finally {
+      setBusy(false)
+      setOpen(false)
+      setAnswer('')
+    }
+  }
+
+  if (open) {
+    return (
+      <div className="space-y-3">
+        {confirmBody}
+        {challenge && sum && (
+          <div className="flex items-center gap-2">
+            <label htmlFor={`confirm-${title}`} className="text-xs text-[#cecece] font-mono shrink-0">
+              {sum.a} + {sum.b} =
+            </label>
+            <input
+              id={`confirm-${title}`}
+              type="text"
+              inputMode="numeric"
+              value={answer}
+              onChange={e => setAnswer(e.target.value)}
+              placeholder="?"
+              autoFocus
+              className="w-14 px-2 py-1 rounded bg-[#1b1c1e] border border-[rgba(255,255,255,0.08)] text-xs text-[#f9f9f9] font-mono text-center focus:outline-none focus:border-red-800/60"
+            />
+          </div>
+        )}
+        <div className="flex gap-2">
+          <button onClick={cancel} disabled={working} className={`${BTN_SECONDARY} text-xs`}>
+            <X size={14} /> Cancel
+          </button>
+          <button
+            onClick={confirm}
+            disabled={working || (challenge && answer.trim() !== sum?.answer)}
+            className={btn}
+          >
+            <Icon size={15} />
+            {working ? runningLabel : confirmLabel}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <div className="flex-1">
+        <p className="text-xs text-[#cecece] leading-relaxed mb-1">{title}</p>
+        <p className="text-xs text-[#9c9c9d] leading-relaxed">{description}</p>
+      </div>
+      <button onClick={begin} disabled={working} className={btn}>
+        <Icon size={15} />
+        {working ? runningLabel : actionLabel}
+      </button>
     </div>
   )
 }

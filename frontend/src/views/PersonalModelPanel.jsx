@@ -4,7 +4,7 @@ import { Brain } from 'lucide-react'
 // validation accuracy, and a Train/Retrain button.
 
 const STATUS_STYLES = {
-  untrained:       { bg: 'bg-[#1b1c1e]',                       text: 'text-[#6a6b6c]', label: 'Not trained' },
+  untrained:       { bg: 'bg-[#1b1c1e]',                       text: 'text-[#8a8b8c]', label: 'Not trained' },
   learning:        { bg: 'bg-[rgba(232,184,74,0.12)]',          text: 'text-[#E8B84A]', label: 'Learning'    },
   ready:           { bg: 'bg-[rgba(91,184,212,0.12)]',          text: 'text-[#5BB8D4]', label: 'Ready'       },
   underperforming: { bg: 'bg-[rgba(201,123,123,0.12)]',         text: 'text-[#C97B7B]', label: 'Under review' },
@@ -54,7 +54,7 @@ export function PersonalModelPanel({ modelInfo, onTrain, training }) {
   const showValidation = ready && validation && validation.model_accuracy != null
 
   return (
-    <div className="mb-4 flex flex-col gap-2 text-xs text-[#6a6b6c]">
+    <div className="mb-4 flex flex-col gap-2 text-xs text-[#8a8b8c]">
 
       {/* Row 1: heading + status pill + train button */}
       <div className="flex items-center gap-2 flex-wrap">
@@ -69,7 +69,7 @@ export function PersonalModelPanel({ modelInfo, onTrain, training }) {
         {ready && (
           <>
             <span className="text-[#7B82C9]">trained on {training_size} decisions</span>
-            {topNames && <span className="text-[#6a6b6c]">top signals: {topNames}</span>}
+            {topNames && <span className="text-[#8a8b8c]">top signals: {topNames}</span>}
             {trained_at && <span className="text-[#9c9c9d]">{trained_at.slice(0, 10)}</span>}
           </>
         )}
@@ -77,7 +77,7 @@ export function PersonalModelPanel({ modelInfo, onTrain, training }) {
         {/* Progress toward first train (untrained / learning before 20 decisions) */}
         {!ready && (
           <>
-            <span className={hasEnough ? 'text-[#7DB89A]' : 'text-[#6a6b6c]'}>
+            <span className={hasEnough ? 'text-[#7DB89A]' : 'text-[#8a8b8c]'}>
               {decided_count}/{min_decisions} decisions
             </span>
             <div className="w-24 bg-[#1b1c1e] rounded-full h-1">
@@ -96,7 +96,7 @@ export function PersonalModelPanel({ modelInfo, onTrain, training }) {
           className={`ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded text-xs transition-opacity ${
             hasEnough && !training
               ? 'border border-[rgba(232,184,74,0.50)] text-[#f9f9f9] bg-transparent hover:opacity-70'
-              : 'text-[#6a6b6c] bg-[#101111] cursor-default'
+              : 'text-[#8a8b8c] bg-[#101111] cursor-default'
           }`}
         >
           <Brain size={16} />

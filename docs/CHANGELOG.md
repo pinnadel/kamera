@@ -4,6 +4,32 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## Whole-app critique pass (2026-09-19)
+
+A full-app review found three things worth fixing straight away.
+
+- **Decision state no longer rides on colour alone.** Decided tiles on the All view carry a small ✓ / ◐ / ✕ glyph (bottom-right) and the tile's `alt` text names the decision. The top filter bar's inactive Keeps / Maybes / Rejects labels were drawn at 50% alpha (≈2.3–3.3:1) on the app's primary navigation; the label is now readable grey and the decision colour moved to the icon and count.
+- **Contrast token.** ~100 uses of `#6a6b6c` as *readable* text (≈3.5:1) became `#8a8b8c` (≈5.5:1). `#6a6b6c` stays as the disabled-only token.
+- **Shell.** Settings button was labelled "Model settings" (it has Model / Workflow / Display) → "Settings"; the bottom funnel is "Filter photos" so it stops sharing a name with the top decision filter. Tab bar is a real tablist (roving tabindex, arrow / Home / End, Enter / Space) — its tabs were click-only `div`s. New `hooks/useDialog.js` gives every modal Escape-to-close, a Tab trap, and focus restore, with a **stack so only the topmost dialog answers Escape** (a confirm over Settings closes alone). Applied to Settings, Confirm (alertdialog), Conflict (forced choice: no Escape), Auto-cull, Photos reconcile / album picker, Shortcuts and Move-into-group. It swallows Escape in the capture phase, so the grid's own Esc handlers no longer also fire behind an open dialog.
+- **Text floor.** ~76 lines of readable prose (hints, descriptions, footnotes, status text) moved from 9–11px to 12px (`text-xs`); filenames from 10px to 11px. Left small on purpose: keycaps, chips and badges, uppercase tracking labels, chart/score-bar numerics, and the 30px tile-footer labels (a fixed two-line box — 12px would clip the filename).
+- **Control placement: no move.** The top-edge = status/actions, bottom-pill = view rule was already the design; the real problem was two controls both called "Filter". The rule is now written down in DESIGN.md §4.1, and the Dashboard header toggle exposes `aria-pressed`.
+- **No group-tile glyph needed.** An undecided group tile holds only undecided photos, and a decided one appears only in the Maybe / Reject filtered views, where its footer already names the decision.
+
+---
+
+## Settings critique pass (2026-09-19)
+
+Review of the Settings modal found three save models living in one tab with nothing to tell them apart, and a Danger zone that mixed recoverable and irreversible actions.
+
+- **Save behaviour is now labelled.** Presets + Decision thresholds carry "Saved with Apply" (the sticky footer owns only these); Analysis scope and AI vision carry "Saves instantly". The old claim that Analysis scope shared the Apply state was wrong — it always saved on click — so it moved to **Workflow**, and its copy shrank from ~170 words to two sentences plus a tooltip.
+- **Danger zone split by reversibility.** *Reload models* and *Reset dashboard* (recoverable) moved to a neutral **Maintenance** block. *Reset taste model* — which erases the durable corpus that Clear Analysis deliberately keeps — now needs the same typed-sum challenge as *Clear analysis*. Four copy-pasted confirm blocks became one `ConfirmAction` component.
+- **`Segmented` control** for every enumerated choice; *Advance cursor* was a lone flip-button and now matches. *Reject destination* states where rejects go right now.
+- **Bug:** `ToggleRow` never accepted `indent`, so "Only when ALL faces are closed" rendered flush with its parent.
+- **Accessibility:** `Toggle` takes a `label` (was an unnamed switch) and has a focus ring; `InfoTooltip` was `aria-hidden` yet focusable — now `role="button"`; the modal is a `role="dialog"` with Escape-to-close; tabs are a real tablist with arrow-key navigation; number inputs and sliders are named; `#6a6b6c` / `#777` hint text (3.5–4.2:1) → `#8a8b8c` (≈5.5:1) within Settings.
+- Not done: presets still don't cover the burst fields (copy now says so rather than implying they do); critical explanations for the burst-dedupe rules remain tooltip-only.
+
+---
+
 ## Resuming a Photos album, which had never actually worked (2026-09-19, late)
 
 An interrupted 1868-photo album analysis could not be picked back up. The

@@ -552,8 +552,8 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
           onToggleCollapsed={onToggleFilmstripCollapsed}
           onStartResize={onStartStripResize}
           toolbarLabel={<>
-            <span className="text-[10px] uppercase tracking-widest text-[#6a6b6c]">In group</span>
-            <span className="text-[11px] text-[#9c9c9d]">{groupContext.size} photos</span>
+            <span className="text-[10px] uppercase tracking-widest text-[#8a8b8c]">In group</span>
+            <span className="text-xs text-[#9c9c9d]">{groupContext.size} photos</span>
           </>}
           toolbarControls={<div ref={toolbarSlotRef} className="contents" />}
           className="absolute left-0 bottom-0 z-10 bg-[#101111] border-t border-[rgba(255,255,255,0.06)]"
@@ -672,7 +672,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
           <div className="flex items-center gap-2 pr-8">
             {gridFilmstrip?.groupFocused && groupForBatch ? (
               <div className="min-w-0 flex-1">
-                <div className="text-[10px] uppercase tracking-widest text-[#6a6b6c] mb-0.5">
+                <div className="text-[10px] uppercase tracking-widest text-[#8a8b8c] mb-0.5">
                   Group of {groupForBatch.size} photos
                 </div>
                 <div className="flex items-center gap-1.5 min-w-0">
@@ -707,7 +707,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
               actions hit POST /bulk-decision via the parent. */}
           {gridFilmstrip?.groupFocused ? (
             <div className="space-y-2">
-              <div className="text-[11px] text-[#9c9c9d] leading-relaxed">
+              <div className="text-xs text-[#9c9c9d] leading-relaxed">
                 {/* Only claim an AI judgement once one actually exists —
                     mirrors the "AI pick" chip above. Pre-ranking, this is
                     honestly a score-based guess, not an AI decision yet. */}
@@ -886,7 +886,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
                 {explainStatus?.vision_capable === false && (
                   <div className="mb-2 flex items-start gap-2 px-2.5 py-1.5 rounded-md bg-[rgba(232,184,74,0.08)] border border-[rgba(232,184,74,0.20)]">
                     <span className="w-1.5 h-1.5 rounded-full bg-[#E8B84A] shrink-0 mt-1" />
-                    <span className="text-[11px] text-[#cecece] leading-relaxed">
+                    <span className="text-xs text-[#cecece] leading-relaxed">
                       Generated from scores + EXIF only — the connected
                       model (<span className="font-mono text-[#E8B84A]">{explainStatus.model}</span>) can't see images. Pull{' '}
                       <span className="font-mono text-[#E8B84A]">qwen2.5vl:7b</span> for vision-aware explanations
@@ -1518,7 +1518,7 @@ function HistogramSection({ imageId, showShadows, showHighlights, onToggleShadow
 
               {/* Per-channel breakdown — only shown when a toggle is active. */}
               {(showShadows || showHighlights) && (
-                <div className="text-[11px] text-[#9c9c9d] font-mono space-y-0.5 pt-1">
+                <div className="text-xs text-[#9c9c9d] font-mono space-y-0.5 pt-1">
                   {showShadows && (
                     <div className="flex justify-between">
                       <span>Shadows clipped (R/G/B)</span>
@@ -1587,7 +1587,7 @@ function HistogramCanvas({ data, showShadows, showHighlights }) {
 
       {/* Subtle 0 / 255 axis labels, only shown when a clipping band is on. */}
       {(showShadows || showHighlights) && (
-        <div className="flex justify-between text-[9px] text-[#6a6b6c] font-mono mt-0.5 px-0.5">
+        <div className="flex justify-between text-[9px] text-[#8a8b8c] font-mono mt-0.5 px-0.5">
           <span>0</span>
           <span>255</span>
         </div>
@@ -1851,7 +1851,7 @@ function ContentSignalsSection({ image }) {
           <span className="flex items-center gap-1.5">
             <span className="text-[#f9f9f9] capitalize">{image.scene}</span>
             {image.scene_confidence != null && (
-              <span className="text-[#6a6b6c] text-[10px] font-mono tabular-nums">
+              <span className="text-[#8a8b8c] text-[10px] font-mono tabular-nums">
                 {Math.round(image.scene_confidence * 100)}%
               </span>
             )}
@@ -2266,12 +2266,12 @@ function LearnedSignals({ modelInfo }) {
       </div>
       <div className="space-y-1">
         {segments.map(s => (
-          <div key={s.key} className="flex items-center gap-2 text-[11px]">
+          <div key={s.key} className="flex items-center gap-2 text-xs">
             <span className={`w-2 h-2 rounded-[1px] flex-shrink-0 ${s.color}`} />
-            <span className={`flex-1 truncate ${s.muted ? 'text-[#6a6b6c]' : 'text-[#9c9c9d]'}`} title={s.desc ? `${s.name} — ${s.desc}` : s.name}>
+            <span className={`flex-1 truncate ${s.muted ? 'text-[#8a8b8c]' : 'text-[#9c9c9d]'}`} title={s.desc ? `${s.name} — ${s.desc}` : s.name}>
               {s.name}
             </span>
-            <span className={`font-mono ${s.muted ? 'text-[#6a6b6c]' : 'text-[#cecece]'}`}>{s.pct.toFixed(0)}%</span>
+            <span className={`font-mono ${s.muted ? 'text-[#8a8b8c]' : 'text-[#cecece]'}`}>{s.pct.toFixed(0)}%</span>
           </div>
         ))}
       </div>

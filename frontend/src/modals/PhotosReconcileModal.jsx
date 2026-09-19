@@ -3,6 +3,7 @@ import { AlertTriangle, Check, RefreshCw, X } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_PRIMARY, BTN_PRIMARY_DANGER, BTN_SECONDARY } from '../ui/buttons'
 import { DecisionWord } from '../ui/primitives'
+import { useDialog } from '../hooks/useDialog'
 
 // PhotosReconcileModal — show what disagrees between KaMeRa and Photos, and
 // let the user pick a direction per kind of disagreement.
@@ -90,7 +91,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
         <span className="text-sm text-[#f0f0f0] font-medium">{copy.title}</span>
         <span className="text-xs font-mono text-[#8a8a8a] tabular-nums shrink-0">{entries.length}</span>
       </div>
-      <p className="text-[11px] text-[#9c9c9d] leading-relaxed mb-2.5">{copy.body}</p>
+      <p className="text-xs text-[#9c9c9d] leading-relaxed mb-2.5">{copy.body}</p>
 
       <div className="flex flex-wrap items-center gap-1.5 mb-2">
         {choices.map(action => {
@@ -115,7 +116,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
           )
         })}
       </div>
-      <p className="text-[11px] text-[#6a6b6c] mb-2">{copy.actions[chosen]?.hint}</p>
+      <p className="text-xs text-[#8a8b8c] mb-2">{copy.actions[chosen]?.hint}</p>
 
       {/* Analysis reads the original file. An evicted one leaves only a
           768×1024 derivative, and scoring that would put a meaningless
@@ -123,7 +124,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
           again unless the user downloads them first. Better to say so than
           to let the run quietly come back having done less than it said. */}
       {undownloaded > 0 && chosen === 'analyze' && (
-        <p className="text-[11px] text-[#E8B84A] leading-relaxed mb-2">
+        <p className="text-xs text-[#E8B84A] leading-relaxed mb-2">
           {undownloaded === entries.length
             ? `All ${undownloaded} are still in iCloud.`
             : `${undownloaded} of these are still in iCloud.`}{' '}
@@ -136,7 +137,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
         {preview.map(e => (
           /* not_analyzed entries have no row yet, so image_id is null for
              every one of them — the uuid is what makes them distinct. */
-          <li key={e.image_id ?? e.photos_uuid} className="flex items-center gap-2 text-[11px] text-[#8a8a8a]">
+          <li key={e.image_id ?? e.photos_uuid} className="flex items-center gap-2 text-xs text-[#8a8a8a]">
             <span className="font-mono truncate">{e.filename}</span>
             {e.has_original === false && (
               <span className="text-[#E8B84A] shrink-0" title="The original is in iCloud, not on this Mac — analysis cannot read it">
@@ -144,7 +145,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
               </span>
             )}
             {e.decision && <DecisionWord kind={e.decision}>{e.decision}</DecisionWord>}
-            {e.keyword && <span className="text-[#6a6b6c]">· {e.keyword}</span>}
+            {e.keyword && <span className="text-[#8a8b8c]">· {e.keyword}</span>}
             {e.ambiguous && (
               <span className="text-[#E8B84A]" title="Carries more than one KaMeRa keyword">
                 · ambiguous
@@ -154,7 +155,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
         ))}
         {entries.length > preview.length && (
           <li>
-            <button onClick={() => setShowAll(true)} className="text-[11px] text-[#5BB8D4] hover:opacity-70">
+            <button onClick={() => setShowAll(true)} className="text-xs text-[#5BB8D4] hover:opacity-70">
               Show {entries.length - preview.length} more
             </button>
           </li>
@@ -247,17 +248,18 @@ export function PhotosReconcileModal({ sourceFolder, onClose, onComplete, onToas
     .filter(([, action]) => DESTRUCTIVE.has(action))
     .reduce((n, [name]) => n + classes[name].length, 0)
 
+  const dialogRef = useDialog(onClose)
   return (
     <div className="fixed inset-0 z-50 bg-[rgba(7,8,10,0.80)] flex items-center justify-center p-6" onClick={onClose}>
-      <div
-        className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[34rem] max-h-[85vh] flex flex-col shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Compare with Photos" tabIndex={-1}
+        className="focus:outline-none bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl w-[34rem] max-h-[85vh] flex flex-col shadow-[0_0_0_2px_rgba(0,0,0,0.5),0_0_14px_rgba(255,255,255,0.10)]"
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-6 pt-6 pb-4">
           <div>
             <h2 className="text-[#f9f9f9] font-semibold text-base">Compare with Photos</h2>
             {diff && (
-              <p className="text-[11px] text-[#6a6b6c] mt-0.5">
+              <p className="text-xs text-[#8a8b8c] mt-0.5">
                 {diff.album_name} · {diff.library_name}
               </p>
             )}
@@ -273,7 +275,7 @@ export function PhotosReconcileModal({ sourceFolder, onClose, onComplete, onToas
               <p className="text-[#9c9c9d] text-sm">Reading the library catalogue…</p>
               {/* Honesty about the wait: this re-parses the whole catalogue on
                   purpose, because a cached read would report yesterday's drift. */}
-              <p className="text-[11px] text-[#6a6b6c] mt-1">
+              <p className="text-xs text-[#8a8b8c] mt-1">
                 Re-read in full so hand-made edits in Photos show up. Takes a moment on a large library
               </p>
             </div>
@@ -292,7 +294,7 @@ export function PhotosReconcileModal({ sourceFolder, onClose, onComplete, onToas
             <div className="text-center py-10">
               <Check size={22} className="text-[#7DB89A] mx-auto mb-2" />
               <p className="text-sm text-[#f0f0f0]">Everything agrees</p>
-              <p className="text-[11px] text-[#6a6b6c] mt-1">
+              <p className="text-xs text-[#8a8b8c] mt-1">
                 {diff.checked} photo{diff.checked === 1 ? '' : 's'} checked, {diff.in_sync} in sync
               </p>
             </div>
@@ -319,7 +321,7 @@ export function PhotosReconcileModal({ sourceFolder, onClose, onComplete, onToas
           )}
 
           {!loading && diff && diff.unmanaged_keyword > 0 && (
-            <p className="text-[11px] text-[#6a6b6c] mb-3 leading-relaxed">
+            <p className="text-xs text-[#8a8b8c] mb-3 leading-relaxed">
               {diff.unmanaged_keyword} photo{diff.unmanaged_keyword === 1 ? '' : 's'} in this album
               carry a KaMeRa keyword but were never analysed here. Nothing to reconcile — analyse the
               album again to bring them in
@@ -329,7 +331,7 @@ export function PhotosReconcileModal({ sourceFolder, onClose, onComplete, onToas
 
         <div className="px-6 py-4 mt-auto border-t border-[rgba(255,255,255,0.07)]">
           {removing > 0 && (
-            <p className="flex items-center gap-1.5 text-[11px] text-[#C97B7B] mb-2.5">
+            <p className="flex items-center gap-1.5 text-xs text-[#C97B7B] mb-2.5">
               <AlertTriangle size={12} />
               {removing} row{removing === 1 ? '' : 's'} will be removed from KaMeRa. Your photos are not touched
             </p>

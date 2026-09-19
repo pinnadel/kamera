@@ -92,7 +92,7 @@ export function TabFoldersForm({ sourceFolder, onToast, autoLoad = true }) {
     return <p className="text-xs text-[#C97B7B]">Couldn't load folders — {error}</p>
   }
   if (loading && !data) {
-    return <p className="text-xs text-[#6a6b6c]">Loading…</p>
+    return <p className="text-xs text-[#8a8b8c]">Loading…</p>
   }
   if (!data) return null
 
@@ -133,7 +133,7 @@ export function TabFoldersForm({ sourceFolder, onToast, autoLoad = true }) {
         <div className="mt-2 text-right">
           <button
             onClick={resetAll}
-            className="inline-flex items-center gap-1 text-[11px] text-[#9c9c9d] hover:text-[#cecece] transition-colors"
+            className="inline-flex items-center gap-1 text-xs text-[#9c9c9d] hover:text-[#cecece] transition-colors"
             title="Reset every custom folder back to the default subfolder"
           >
             <RotateCcw size={13} /> Reset all to default

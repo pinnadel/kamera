@@ -104,12 +104,12 @@ export function TrainingModeView({ queue, currentIdx, onDecide, onExit, modelInf
             Training mode · {primaryDone} / {primaryTotal} decided
           </span>
           {modelInfo?.model_status === 'ready' && (
-            <p className="text-[10px] text-[#5BB8D4] mt-0.5">
+            <p className="text-xs text-[#5BB8D4] mt-0.5">
               Active learning — most uncertain photos first
             </p>
           )}
           {reshowCount > 0 && (
-            <p className="text-[10px] text-[#9c9c9d] mt-0.5">
+            <p className="text-xs text-[#9c9c9d] mt-0.5">
               +{reshowCount} re-shown for consistency check
             </p>
           )}
@@ -132,11 +132,11 @@ export function TrainingModeView({ queue, currentIdx, onDecide, onExit, modelInf
           )}
           <button
             onClick={() => setPaused(p => !p)}
-            className="inline-flex items-center gap-1.5 text-xs text-[#6a6b6c] hover:opacity-70 transition-opacity"
+            className="inline-flex items-center gap-1.5 text-xs text-[#8a8b8c] hover:opacity-70 transition-opacity"
           >
             {paused ? <><Play size={14} /> Resume</> : <><Pause size={14} /> Pause</>}
           </button>
-          <button onClick={handleExit} className="inline-flex items-center gap-1.5 text-xs text-[#6a6b6c] hover:opacity-70 transition-opacity">
+          <button onClick={handleExit} className="inline-flex items-center gap-1.5 text-xs text-[#8a8b8c] hover:opacity-70 transition-opacity">
             <LogOut size={14} /> Exit training
           </button>
         </div>
@@ -155,7 +155,7 @@ export function TrainingModeView({ queue, currentIdx, onDecide, onExit, modelInf
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="bg-[#101111] border border-[rgba(255,255,255,0.10)] rounded-xl px-6 py-4 text-center shadow-2xl">
                 <p className="text-sm text-[#f9f9f9] font-medium">Paused</p>
-                <p className="text-xs text-[#6a6b6c] mt-1">Press Esc or Resume to continue</p>
+                <p className="text-xs text-[#8a8b8c] mt-1">Press Esc or Resume to continue</p>
               </div>
             </div>
           )}
@@ -184,7 +184,7 @@ export function TrainingModeView({ queue, currentIdx, onDecide, onExit, modelInf
           </div>
           <div className="mt-auto">
             <PersonalModelPanel modelInfo={modelInfo} onTrain={onTrain} training={training} />
-            <p className="text-xs text-[#6a6b6c] italic">Scores hidden — pure gut call</p>
+            <p className="text-xs text-[#8a8b8c] italic">Scores hidden — pure gut call</p>
           </div>
         </div>
       </div>
@@ -255,7 +255,7 @@ export function TrainingModeView({ queue, currentIdx, onDecide, onExit, modelInf
               </p>
             </div>
             <div className="flex items-center justify-between">
-              <p className="text-[11px] text-[#6a6b6c]">
+              <p className="text-xs text-[#8a8b8c]">
                 K = <DecisionWord kind="keep">Keep</DecisionWord>
                 {' · '}M = <DecisionWord kind="maybe">Maybe</DecisionWord>
                 {' · '}R = <DecisionWord kind="reject">Reject</DecisionWord>

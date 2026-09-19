@@ -3111,6 +3111,7 @@ export default function App() {
           <div className="flex items-center gap-0.5 flex-shrink-0">
             <button
               onClick={() => setActiveView(activeView === 'dashboard' ? 'grid' : 'dashboard')}
+              aria-pressed={activeView === 'dashboard'}
               className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-opacity border whitespace-nowrap ${
                 activeView === 'dashboard'
                   ? 'bg-[#1a1b1d] text-[#f0f0f0] border-[#2a2b2d]'
@@ -3123,8 +3124,8 @@ export default function App() {
             <button
               onClick={() => setSettingsOpen(true)}
               className={BTN_ICON}
-              title="Model settings"
-              aria-label="Model settings"
+              title="Settings"
+              aria-label="Settings"
             >
               <SettingsIcon size={18} />
             </button>
@@ -3225,7 +3226,7 @@ export default function App() {
                   style={{ width: `${Math.round((liveAnalyzed / Math.max(1, liveAnalyzed + liveLeft)) * 100)}%` }}
                 />
               </div>
-              <p className="text-[10px] text-[#9c9c9d]">
+              <p className="text-xs text-[#9c9c9d]">
                 New photos are analyzed as they arrive — this folder is being watched live.
               </p>
             </div>
@@ -3262,7 +3263,7 @@ export default function App() {
                   style={{ width: `${progress.pct}%` }}
                 />
               </div>
-              <p className="text-[10px] text-[#9c9c9d]">
+              <p className="text-xs text-[#9c9c9d]">
                 {stopping
                   ? 'Stopping after the current photo finishes decoding…'
                   : 'Do not close this window while analysis is running.'}
@@ -3317,7 +3318,7 @@ export default function App() {
                 </span>
                 <button
                   onClick={() => setResultDismissed(true)}
-                  className="text-[#6a6b6c] hover:opacity-70 transition-opacity"
+                  className="text-[#8a8b8c] hover:opacity-70 transition-opacity"
                   aria-label="Dismiss"
                 >
                   <X size={16} />
@@ -3333,7 +3334,7 @@ export default function App() {
                       <span className="text-[#9c9c9d]">already analyzed</span>
                     </p>
                   ))}
-                  <p className="text-[10px] text-[#9c9c9d] pt-1">
+                  <p className="text-xs text-[#9c9c9d] pt-1">
                     Use "Clear analysis" in Settings to re-run these.
                   </p>
                 </div>
@@ -3359,7 +3360,7 @@ export default function App() {
                       const { path } = await r.json()
                       window.open(`file://${path}`)
                     }}
-                    className="text-[10px] text-[#9c9c9d] hover:opacity-70 underline inline-block pt-1"
+                    className="text-xs text-[#9c9c9d] hover:opacity-70 underline inline-block pt-1"
                   >open full log →</a>
                 </div>
               )}
@@ -3377,7 +3378,7 @@ export default function App() {
       {images.length > 0 && (
         <div className="px-4 py-2 flex items-center gap-3 border-t border-[#1a1b1d]">
           {/* Segmented filter */}
-          <div className="flex items-center bg-[#0d0e0f] rounded-lg p-0.5 border border-[rgba(255,255,255,0.04)] gap-px">
+          <div role="group" aria-label="Show by decision" className="flex items-center bg-[#0d0e0f] rounded-lg p-0.5 border border-[rgba(255,255,255,0.04)] gap-px">
             {[
               { key: null,        label: 'All',       count: decisionCounts.all,       color: null,      Icon: Layers },
               { key: 'undecided', label: 'Undecided', count: decisionCounts.undecided, color: null,      Icon: Circle },
@@ -3389,17 +3390,21 @@ export default function App() {
                 key={key ?? 'all'}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => setDecisionFilter(prev => prev === key ? null : key)}
+                aria-pressed={decisionFilter === key}
                 className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[14px] font-medium transition-colors whitespace-nowrap ${
                   decisionFilter === key ? 'bg-[#1b1c1e]' : 'hover:bg-[rgba(255,255,255,0.03)]'
                 }`}
-                style={{ color: decisionFilter === key ? (color ?? '#f9f9f9') : (color ? `${color}80` : '#6a6b6c') }}
+                style={{ color: decisionFilter === key ? (color ?? '#f9f9f9') : '#9c9c9d' }}
               >
-                <Icon size={15} strokeWidth={2} />
+                {/* Inactive: the label stays at readable grey and the decision
+                    colour moves to the icon + count — a 50%-alpha label was
+                    ~2.3–3.3:1, and these are the app's primary navigation. */}
+                <Icon size={15} strokeWidth={2} style={color ? { color } : undefined} />
                 {label}
                 {count > 0 && (
                   <span
                     className="font-mono text-[14px]"
-                    style={{ color: decisionFilter === key ? (color ?? '#f9f9f9') : (color ? `${color}B3` : '#9c9c9d') }}
+                    style={{ color: decisionFilter === key ? (color ?? '#f9f9f9') : (color ?? '#9c9c9d') }}
                   >
                     {count}
                   </span>
@@ -3414,7 +3419,7 @@ export default function App() {
                 <span className="text-xs text-[#cecece] font-semibold tabular-nums mr-1">
                   {gridMultiSelect.size} selected
                 </span>
-                <span className="text-[11px] text-[#6a6b6c] mr-1 hidden lg:inline">
+                <span className="text-xs text-[#8a8b8c] mr-1 hidden lg:inline">
                   K / M / R to decide · Shift+click range · Esc to exit
                 </span>
                 {(() => {
@@ -3508,7 +3513,7 @@ export default function App() {
             <span className="text-[#9c9c9d]/70">
               {decisionCounts.undecided} {decisionCounts.undecided === 1 ? 'photo' : 'photos'} undecided
             </span>
-            <span className="text-[#6a6b6c] flex items-center gap-1.5">
+            <span className="text-[#8a8b8c] flex items-center gap-1.5">
               Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">M</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to decide{isPhotosTab(activeTab) ? '' : ', or let the AI sort them'}
             </span>
             {/* Auto cull runs on the personal model, which trains on the camera
@@ -3531,7 +3536,7 @@ export default function App() {
             <span className="text-[#7DB89A]/70">
               {needsReviewIds.length} auto-culled {needsReviewIds.length === 1 ? 'photo' : 'photos'} awaiting review
             </span>
-            <span className="text-[#6a6b6c]">
+            <span className="text-[#8a8b8c]">
               Reviewed photos release to Provenance for archiving
             </span>
             {bulkConfirm === 'mark-all-reviewed' ? (
@@ -3562,7 +3567,7 @@ export default function App() {
             <span className="text-[#E8B84A]/70">
               {decisionCounts.maybe} {decisionCounts.maybe === 1 ? 'photo' : 'photos'} in maybe
             </span>
-            <span className="text-[#6a6b6c] flex items-center gap-1.5">
+            <span className="text-[#8a8b8c] flex items-center gap-1.5">
               Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> to promote to <DecisionWord kind="keep">Keep</DecisionWord>, <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to <DecisionWord kind="reject">Reject</DecisionWord>
             </span>
             {bulkConfirm === 'reject-maybes' ? (
@@ -3679,7 +3684,7 @@ export default function App() {
               <span className="w-2 h-2 rounded-full bg-[#5BB8D4] animate-pulse inline-block" />
               Watching for new photos…
             </div>
-            <p className="text-xs text-[#6a6b6c] font-mono break-all">{activeTab.folderPath}</p>
+            <p className="text-xs text-[#8a8b8c] font-mono break-all">{activeTab.folderPath}</p>
             <p className="text-xs text-[#cecece] leading-relaxed pt-2">
               New photos in this folder will be analyzed automatically and appear here.
             </p>
@@ -3716,7 +3721,7 @@ export default function App() {
               modelLine = remaining > 0 ? (
                 <>
                   <span className="text-[#cecece] font-mono">{decided}</span>
-                  <span className="text-[#6a6b6c]"> / {minNeeded}</span>{' '}
+                  <span className="text-[#8a8b8c]"> / {minNeeded}</span>{' '}
                   decisions made — <span className="text-[#cecece]">{remaining} more</span> until you can train a personal model.
                 </>
               ) : (
@@ -3807,13 +3812,13 @@ export default function App() {
                         <DecisionWord kind="reject" className="text-[13px]">Reject</DecisionWord>
                       </div>
                     </div>
-                      <p className="mt-3.5 pt-3 border-t border-[rgba(255,255,255,0.04)] flex items-center justify-center gap-1.5 text-[12px] text-[#6a6b6c] leading-relaxed">
+                      <p className="mt-3.5 pt-3 border-t border-[rgba(255,255,255,0.04)] flex items-center justify-center gap-1.5 text-[12px] text-[#8a8b8c] leading-relaxed">
                       <Info size={12} className="flex-shrink-0" aria-hidden="true" />
                       <span>
                         Decisions immediately move files into{' '}
-                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Keeps</span>{' '}/{' '}
-                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Maybes</span>{' '}/{' '}
-                        <span className="text-[#9c9c9d] font-mono text-[11px]">_Rejects</span>.
+                        <span className="text-[#9c9c9d] font-mono text-xs">_Keeps</span>{' '}/{' '}
+                        <span className="text-[#9c9c9d] font-mono text-xs">_Maybes</span>{' '}/{' '}
+                        <span className="text-[#9c9c9d] font-mono text-xs">_Rejects</span>.
                       </span>
                       </p>
                     </div>
@@ -3844,7 +3849,7 @@ export default function App() {
                       <p className="text-[12px] text-[#cecece] leading-relaxed">
                         Auto-open folder picker
                       </p>
-                      <p className="text-[11px] text-[#6a6b6c] leading-relaxed">
+                      <p className="text-xs text-[#8a8b8c] leading-relaxed">
                         When on, clicking <span className="text-[#cecece] font-medium">+</span> in the header opens the folder picker immediately.
                       </p>
                     </div>
@@ -4437,7 +4442,7 @@ export default function App() {
                     {/* Inline confirmation when switching the active watcher. */}
                     {watchSwitchConfirm && watchingElsewhere && !activeTab.watchLive && (
                       <div className="mt-3 p-2.5 rounded-md bg-[rgba(91,184,212,0.08)] border border-[rgba(91,184,212,0.25)] space-y-2">
-                        <p className="text-[11px] text-[#cecece] leading-snug">
+                        <p className="text-xs text-[#cecece] leading-snug">
                           Watch live is on <span className="font-mono text-[#5BB8D4]">"{tabLabel(watchingTab)}"</span>. Switch to this folder?
                         </p>
                         <div className="flex gap-1.5">
@@ -4525,7 +4530,7 @@ export default function App() {
                           identity model existed have NULL face_embedding and
                           can't appear in People mode until reprocessed. */}
                       {groupMode === 'people' && peoplePendingReanalysis > 0 && (
-                        <p className="text-[11px] text-[#E8B84A] leading-relaxed mt-3">
+                        <p className="text-xs text-[#E8B84A] leading-relaxed mt-3">
                           {peoplePendingReanalysis} photo{peoplePendingReanalysis === 1 ? '' : 's'} with faces need re-analysis to appear here. Run analysis again on this folder to enable People mode for them.
                         </p>
                       )}

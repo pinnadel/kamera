@@ -104,7 +104,7 @@ export function ViewPill({
                   key={id}
                   onClick={() => onSelectLayout(id)}
                   className={`w-full text-left px-3 py-1.5 text-xs transition-opacity inline-flex items-center gap-2 ${
-                    layout === id ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                    layout === id ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
                   }`}
                 >
                   <Icon size={15} />
@@ -130,7 +130,7 @@ export function ViewPill({
                     key={opt.label}
                     onClick={() => onSelectSize(layout, opt.value)}
                     className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between ${
-                      isActive ? 'text-[#f9f9f9]' : 'text-[#6a6b6c] hover:opacity-70'
+                      isActive ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
                     }`}
                   >
                     <span>{opt.label}</span>
