@@ -37,7 +37,8 @@ const CARET_W       = 18
 const CARET_H       = 9
 const RADIUS        = 10
 const PAD           = 10   // panel inner padding
-const BAR_BLOCK     = 13   // position bar + its top margin
+const BAR_H         = 15   // position bar: active segment height (was 5)
+const BAR_BLOCK     = BAR_H + 8   // position bar + its top margin
 const ACTION_BLOCK  = 30   // action row + its top margin
 
 // The panel is sized to FILL whichever side of the tile has more room — the
@@ -87,23 +88,10 @@ function uiScaleZoom() {
   return Number.isFinite(z) && z > 0 ? z : 1
 }
 
-// Room the floating bottom toolbar takes off the viewport. It is `fixed` over
-// the grid, so the fold is not where the panel's room actually ends — without
-// this the action row lands underneath it, which is exactly the row you reach
-// for. Measured rather than hard-coded: the bar's height changes with what it
-// is hosting, and it disappears entirely inside DetailView.
-function bottomReserved(zoom) {
-  const el = document.querySelector('[data-bottom-bar]')
-  if (!el) return 0
-  const r = el.getBoundingClientRect()
-  if (r.height <= 0) return 0
-  return Math.max(0, (window.innerHeight - r.top) / zoom)
-}
-
 // place — centre the panel on the tile, keep it fully on screen, prefer
 // hanging below. Same below-else-flip-above rule as ui/primitives.jsx's
 // placePopover, but centred rather than left-aligned, and it aims a caret.
-function place(rect, zoom, bottomInset = 0) {
+function place(rect, zoom) {
   // Viewport expressed in fixed space (see uiScaleZoom).
   const vw = window.innerWidth  / zoom
   const vh = window.innerHeight / zoom
@@ -115,8 +103,9 @@ function place(rect, zoom, bottomInset = 0) {
   const width0  = rect.width  / zoom
 
   // Vertical: the largest image each side could seat without crossing a fold.
-  const chrome = PAD * 2 + BAR_BLOCK + ACTION_BLOCK
-  const roomBelow = vh - bottomInset - bottom0 - GAP - MARGIN - chrome
+  // + 4: the panel's and the image box's 1px borders, which sit outside imageHeight.
+  const chrome = PAD * 2 + BAR_BLOCK + ACTION_BLOCK + 4
+  const roomBelow = vh - bottom0 - GAP - MARGIN - chrome
   const roomAbove = top0 - GAP - MARGIN - chrome
 
   // Whichever side has more room wins outright — no preference for below.
@@ -145,7 +134,7 @@ function place(rect, zoom, bottomInset = 0) {
   // both sides, and a panel that's slightly detached from its tile is a much
   // better failure than one bleeding off the fold.
   const panelHeight = imageHeight + chrome
-  const maxTop = Math.max(MARGIN, vh - bottomInset - MARGIN - panelHeight)
+  const maxTop = Math.max(MARGIN, vh - MARGIN - panelHeight)
   const top    = Math.min(Math.max(MARGIN, bottom0 + GAP), maxTop)
   const bottom = Math.min(Math.max(MARGIN, vh - top0 + GAP), Math.max(MARGIN, vh - MARGIN - panelHeight))
 
@@ -277,7 +266,7 @@ export function GroupScrubPreview({
   if (!open || !active) return null
 
   const zoom = uiScaleZoom()
-  const p = place(anchorRect, zoom, bottomReserved(zoom))
+  const p = place(anchorRect, zoom)
   const activeTone = DECISION[active.decision]
   const borderColor = activeTone ? activeTone.color : HAIRLINE
 
@@ -411,7 +400,7 @@ export function GroupScrubPreview({
           alignItems: 'flex-end',
           gap: 2,
           marginTop: 8,
-          height: 5,
+          height: BAR_H,
           cursor: 'pointer',
         }}
       >
@@ -431,8 +420,8 @@ export function GroupScrubPreview({
               style={{
                 position: 'relative',
                 flex: 1,
-                height: on || isAiPick ? 5 : 3,
-                borderRadius: 2,
+                height: on || isAiPick ? BAR_H : BAR_H * 3 / 5,
+                borderRadius: 4,
                 backgroundColor: tone ? tone.color : UNDECIDED_COLOR,
                 opacity: on || isAiPick ? 1 : 0.35,
               }}

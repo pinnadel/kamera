@@ -31,10 +31,13 @@ import { API } from '../api'
 // hover dwell it replaced (180ms), so it doesn't read as slower.
 const CLICK_ARM_MS = 220
 
-// Cap on waiting for the smooth scroll to settle before measuring. `scrollend`
-// fires first where it is supported; this is the fallback that keeps the panel
-// from never opening where it isn't (older WebKit, and the PWA shim).
-const SCROLL_SETTLE_MS = 420
+// Cap on waiting for the smooth scroll to settle before measuring. The scroll
+// is judged finished when the tile's top has held still for SCROLL_STABLE_FRAMES
+// frames; this cap only keeps the panel from never opening if it never does.
+// (A fixed 420ms timer was too short for a long scroll: the panel was placed
+// against a rect that was still moving, so it landed detached from its tile.)
+const SCROLL_SETTLE_MS = 1500
+const SCROLL_STABLE_FRAMES = 4
 
 // Scrolling closes the panel — it detaches from its anchor. That rule has to
 // ignore OUR OWN opening scroll, including the momentum tail that lands after
@@ -202,23 +205,32 @@ export function useGroupScrub({ suspended = false, topInset } = {}) {
     el.style.scrollMarginTop = `${inset}px`
     el.scrollIntoView({ block: 'start', behavior: 'smooth' })
 
-    // Measure once the scroll has actually landed. Whichever of the two
-    // signals arrives first wins; the other is torn down.
+    // Measure once the scroll has actually landed: the tile's top has stopped
+    // moving. Polled per frame rather than trusting `scrollend`, which fires
+    // early on some engines and not at all on others.
     let done = false
-    let fallback = null
+    let last = null
+    let stable = 0
+    const started = performance.now()
     const finish = () => {
       if (done) return
       done = true
-      clearTimeout(fallback)
-      window.removeEventListener('scrollend', finish)
+      if (elRef.current !== el) return   // closed or retargeted while scrolling
       // Push the guard out again: momentum and the smooth-scroll tail keep
       // firing scroll events for a moment after the panel is on screen, and
       // those must not be read as the user scrolling away from it.
       scrollGuardRef.current = performance.now() + SCROLL_GUARD_MS
       open()
     }
-    fallback = setTimeout(finish, SCROLL_SETTLE_MS)
-    window.addEventListener('scrollend', finish, { once: true })
+    const tick = () => {
+      if (done) return
+      const top = el.getBoundingClientRect().top
+      stable = last !== null && Math.abs(top - last) < 0.5 ? stable + 1 : 0
+      last = top
+      if (stable >= SCROLL_STABLE_FRAMES || performance.now() - started > SCROLL_SETTLE_MS) finish()
+      else requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
   }, [measure, prefetch])
 
   // Click on a group tile. Selecting the tile is App's business and happens
