@@ -562,19 +562,23 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
           renderThumb={(img, idx) => {
             const isFocused = img.id === image.id
             const isHero    = img.id === groupContext.best_image_id
+            // The score-based hero gets the existing plain outline; only an
+            // actual vision-LLM rank-1 (groupContext.best_is_ai_pick — see
+            // backend/routers/model.py::_annotate_prerank_state) earns the
+            // rainbow "AI" stroke, same cue as the group-scrub position bar.
+            const isAiHero  = isHero && groupContext.best_is_ai_pick
             const ring = isFocused
               ? SELECTION_RING
-              : isHero
+              : isHero && !isAiHero
                 ? 'ring-1 ring-[rgba(255,255,255,0.20)]'
                 : 'ring-1 ring-[rgba(255,255,255,0.06)] hover:ring-[rgba(255,255,255,0.20)]'
-            return (
+            const thumb = (
               <button
-                key={img.id}
                 type="button"
                 data-filmstrip-idx={idx}
                 onClick={() => onPickGroupMember?.(img.id)}
                 className={`relative flex-shrink-0 w-20 rounded-md overflow-hidden bg-[#161718] cursor-pointer transition-all ${ring} ${img.decision === 'reject' && !isFocused ? 'opacity-[0.45]' : ''}`}
-                title={img.filename}
+                title={isAiHero ? `${img.filename} — AI's pick for this group` : img.filename}
               >
                 <div className="bg-[#07080a] h-14 flex items-center justify-center overflow-hidden">
                   <img
@@ -588,6 +592,17 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
                   {img.decision && <DecisionBadge decision={img.decision} />}
                 </div>
               </button>
+            )
+            // ai-border-sm paints its stroke via a ::before outset -1px
+            // beyond the element's own box — the button's overflow-hidden
+            // (needed to clip the preview image) would cut that off, so the
+            // stroke goes on a non-clipping wrapper instead. `contents`
+            // keeps the non-AI-hero case a no-op in layout.
+            if (!isAiHero) return <div key={img.id} className="contents">{thumb}</div>
+            return (
+              <div key={img.id} className="relative flex-shrink-0 ai-border-sm rounded-md">
+                {thumb}
+              </div>
             )
           }}
         />
@@ -660,8 +675,25 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
                 <div className="text-[10px] uppercase tracking-widest text-[#6a6b6c] mb-0.5">
                   Group of {groupForBatch.size} photos
                 </div>
-                <div className="text-[13px] text-[#f0f0f0] truncate" title={image.filename}>
-                  Best: {image.filename}
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="text-[13px] text-[#f0f0f0] truncate" title={image.filename}>
+                    Best: {image.filename}
+                  </span>
+                  {/* Same rainbow cue as the group-scrub position bar and
+                      GroupLoupe's ranking chip — only when this "Best" is an
+                      actual vision-LLM rank-1 (backend/routers/model.py::
+                      _annotate_prerank_state), never for the score-based
+                      fallback pick a still-unranked burst is showing. */}
+                  {groupForBatch.best_is_ai_pick && (
+                    <span
+                      className="relative ai-border-sm inline-block rounded flex-shrink-0"
+                      title="This is the AI's pick, not just the top score"
+                    >
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-[#07080a]">
+                        <span className="ai-text-rainbow text-[10px] font-semibold">AI pick</span>
+                      </span>
+                    </span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -676,8 +708,13 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
           {gridFilmstrip?.groupFocused ? (
             <div className="space-y-2">
               <div className="text-[11px] text-[#9c9c9d] leading-relaxed">
-                Showing the AI&rsquo;s best of {groupForBatch?.size ?? 0} photos.
-                Decide the whole group below, or{' '}
+                {/* Only claim an AI judgement once one actually exists —
+                    mirrors the "AI pick" chip above. Pre-ranking, this is
+                    honestly a score-based guess, not an AI decision yet. */}
+                {groupForBatch?.best_is_ai_pick
+                  ? <>Showing the AI&rsquo;s best of {groupForBatch?.size ?? 0} photos.</>
+                  : <>Showing the top-scoring of {groupForBatch?.size ?? 0} photos — the AI hasn&rsquo;t ranked this burst yet.</>}
+                {' '}Decide the whole group below, or{' '}
                 <button
                   type="button"
                   onClick={() => groupForBatch && gridFilmstrip.onOpenGroup(groupForBatch)}

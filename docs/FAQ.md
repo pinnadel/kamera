@@ -731,6 +731,40 @@ best · Reject rest" toolbar button — the hotkey just skips the mouse. See
 [frontend/src/views/GroupLoupe.jsx](../frontend/src/views/GroupLoupe.jsx)
 `runBatch`, `rankById`.
 
+### Can I see the AI's pick without opening GroupLoupe?
+
+Yes, since 2026-09-19 — the LLM rank-1 isn't a loupe-only fact any more. Once
+the background prerank worker actually ranks a burst (`prerank_state ==
+"ready"`), `backend/routers/model.py`'s `_annotate_prerank_state` promotes
+that rank-1 photo's id and reason onto the group's `best_image_id`/
+`best_reason` server-side — the same fields every surface in the app already
+reads to answer "which one's the best of this group." A manually-pinned hero
+(the settings-table override) still wins over the AI, and a burst that hasn't
+been ranked yet keeps showing its score-based guess exactly as before, just
+without any of the markers below (`best_is_ai_pick` stays `false`).
+
+Where it shows up:
+
+- **Grid tile** — the group tile's "Best: <filename>" footer already read
+  `best_image_id`, so it now names the AI's pick, not just the score winner,
+  the moment ranking finishes — no extra chrome needed.
+- **Group-scrub peek panel** (click a group tile) — the position bar's
+  per-frame segment for the AI's pick gets the app's rainbow `.ai-border-sm`
+  stroke, the same cue GroupLoupe's "ranking in progress" chip uses. No
+  stroke on any segment means the burst hasn't been AI-ranked yet.
+- **DetailView** — opened via a group tile (grid-filmstrip mode), the "Best:
+  <filename>" line grows a small rainbow "AI pick" chip; opened from inside
+  GroupLoupe/the peek panel, the group filmstrip's hero thumbnail gets the
+  rainbow ring instead of the plain white outline. GroupLoupe additionally
+  hands DetailView its own live `effectiveHeroId` rather than the group's
+  possibly one-poll-stale `best_image_id`, so a rank that resolved seconds
+  ago (before the next `/similarity-groups` poll) still shows correctly.
+
+See `_promote_ai_pick` in
+[backend/routers/model.py](../backend/routers/model.py),
+[frontend/src/ui/GroupScrubPreview.jsx](../frontend/src/ui/GroupScrubPreview.jsx),
+[frontend/src/views/DetailView.jsx](../frontend/src/views/DetailView.jsx).
+
 ### How does AI burst ranking work?
 
 When you open a similarity group, the app sends up to 12 preview JPEGs in one

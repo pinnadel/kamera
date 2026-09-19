@@ -984,7 +984,17 @@ export default function App() {
             counts[other.decision] += 1
           }
         }
-        summary.set(img.id, { groupId: group.best_image_id, counts, members: group.images })
+        summary.set(img.id, {
+          groupId: group.best_image_id,
+          // Whether groupId is an actual vision-LLM rank-1 pick or just the
+          // score-based fallback hero — see backend/routers/model.py's
+          // _annotate_prerank_state. Consumers (the group-scrub peek panel,
+          // DetailView) use this to gate the AI-pick marker so an unranked
+          // burst's score guess never wears the "AI decided this" chrome.
+          bestIsAiPick: !!group.best_is_ai_pick,
+          counts,
+          members: group.images,
+        })
       }
     }
     return summary
@@ -1245,12 +1255,26 @@ export default function App() {
   // If the focused group leaves the visible list (filter change, group
   // dissolves after re-clustering, etc.), drop the group cursor so the user
   // isn't stuck pointing at nothing.
+  //
+  // selectedGroupId IS a best_image_id snapshot, not a stable group key —
+  // same caveat useGroups.js's loupeGroup carries. A group's best_image_id
+  // can change server-side with no filter/re-clustering involved at all: the
+  // prerank worker finishing a rank while this tile is selected flips the
+  // hero from the score-based guess to the LLM's rank-1 (see
+  // backend/routers/model.py::_annotate_prerank_state). The exact match
+  // below would then miss and wrongly conclude the group dissolved — so
+  // fall back to finding it by membership (the old hero is still one of its
+  // undecided members, just no longer "best") before clearing the cursor.
   useEffect(() => {
     if (selectedGroupId == null) return
-    const stillVisible = displayGridItems.some(item =>
+    const exact = displayGridItems.some(item =>
       item.type === 'group' && item.group.best_image_id === selectedGroupId
     )
-    if (!stillVisible) setSelectedGroupId(null)
+    if (exact) return
+    const byMember = displayGridItems.find(item =>
+      item.type === 'group' && item.group.images.some(img => img.id === selectedGroupId)
+    )
+    setSelectedGroupId(byMember ? byMember.group.best_image_id : null)
   }, [displayGridItems, selectedGroupId, setSelectedGroupId])
 
   // Same idea for a focused DecidedGroupTile — e.g. the last visible member
@@ -1903,7 +1927,7 @@ export default function App() {
     if (scrubDetailGroupId == null) return null
     const summary = partnerSummaryByImageId.get(scrubDetailGroupId)
     if (!summary) return null
-    return { best_image_id: scrubDetailGroupId, images: summary.members }
+    return { best_image_id: scrubDetailGroupId, images: summary.members, best_is_ai_pick: summary.bestIsAiPick }
   }, [scrubDetailGroupId, partnerSummaryByImageId])
 
   // Open DetailView on the frame the hover-scrub panel is showing (Space /
@@ -2541,11 +2565,13 @@ export default function App() {
           on the spot instead of leaving the opening snapshot on screen. */}
       {groupScrubPreview && (() => {
         const anchorId = groupScrubPreview.members[0]?.id
-        const live = anchorId != null ? partnerSummaryByImageId.get(anchorId)?.members : null
+        const liveSummary = anchorId != null ? partnerSummaryByImageId.get(anchorId) : null
         return (
           <GroupScrubPreview
             {...groupScrubPreview}
-            members={live || groupScrubPreview.members}
+            members={liveSummary?.members || groupScrubPreview.members}
+            bestImageId={liveSummary?.groupId}
+            bestIsAiPick={liveSummary?.bestIsAiPick}
             onDecide={(imageId, decision) => bulkDecide([imageId], decision)}
             onSwap={swapDecisions}
             onUndo={undoImage}

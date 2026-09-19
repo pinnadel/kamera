@@ -47,11 +47,18 @@ _PRERANK_MIN_GROUP_SIZE = 3
 
 
 def _annotate_prerank_state(groups: list[dict], conn) -> None:
-    """In-place: add a `prerank_state` field to each group dict.
+    """In-place: add a `prerank_state` field to each group dict, and promote
+    the LLM's rank-1 pick over the score-based `best_image_id`/`best_reason`
+    wherever a ranking is actually available.
 
     States:
       "ready"            → a successfully-ranked burst_rankings row exists.
                            Opening the loupe will be instant (cache hit).
+                           `best_image_id`/`best_reason` now reflect the
+                           vision model's rank-1, and `best_is_ai_pick` is
+                           True — this is the one case where the group's
+                           "best" is an actual AI judgement, not a score
+                           heuristic guessing at one.
       "near_duplicates"  → AI dedup determined the frames are visually
                            near-identical (cosine ≥ 0.97) and no per-photo
                            rank was meaningful. Loupe shows score-based pick;
@@ -64,9 +71,17 @@ def _annotate_prerank_state(groups: list[dict], conn) -> None:
       "not_applicable"   → group is too small to be pre-ranked; the loupe
                            shows the score-based pick directly.
 
+    In every state except "ready", `best_is_ai_pick` stays False and
+    `best_image_id`/`best_reason` keep whatever the caller already computed
+    (the score-based pick) — callers must set that default plus a
+    `_user_override` flag (popped here) on every group before calling this,
+    so a manually-pinned hero (Settings → hero override) is never displaced
+    by an AI pick the user didn't ask for.
+
     Implementation: one IN-clause query against burst_rankings to find every
-    cached hash AND outcome, plus a single snapshot() call to read the
-    worker's current job hash. O(1) DB roundtrip regardless of group count.
+    cached hash, outcome AND rankings payload, plus a single snapshot() call
+    to read the worker's current job hash. O(1) DB roundtrip regardless of
+    group count.
     """
     from phase2_quality.burst_ranker import _members_hash
     from phase2_quality.prerank import snapshot as _prerank_snapshot
@@ -81,27 +96,55 @@ def _annotate_prerank_state(groups: list[dict], conn) -> None:
         h for h, g in zip(hashes, groups)
         if len(g["images"]) >= _PRERANK_MIN_GROUP_SIZE
     ]
-    outcome_by_hash: dict[str, str] = {}
+    row_by_hash: dict[str, dict] = {}
     if eligible_hashes:
         placeholders = ",".join("?" * len(eligible_hashes))
         rows = conn.execute(
-            f"SELECT members_hash, outcome FROM burst_rankings WHERE members_hash IN ({placeholders})",
+            f"SELECT members_hash, outcome, rankings_json FROM burst_rankings WHERE members_hash IN ({placeholders})",
             eligible_hashes,
         ).fetchall()
-        outcome_by_hash = {r["members_hash"]: r["outcome"] for r in rows}
+        row_by_hash = {r["members_hash"]: r for r in rows}
 
     current_hash = _prerank_snapshot().get("current_job_hash")
 
     for h, g in zip(hashes, groups):
+        manual_override = g.pop("_user_override", False)
         if len(g["images"]) < _PRERANK_MIN_GROUP_SIZE:
             g["prerank_state"] = "not_applicable"
-        elif h in outcome_by_hash:
-            outcome = outcome_by_hash[h]
-            g["prerank_state"] = "near_duplicates" if outcome == "near_duplicates" else "ready"
+        elif h in row_by_hash:
+            row = row_by_hash[h]
+            if row["outcome"] == "near_duplicates":
+                g["prerank_state"] = "near_duplicates"
+            else:
+                g["prerank_state"] = "ready"
+                if not manual_override:
+                    _promote_ai_pick(g, row["rankings_json"])
         elif h == current_hash:
             g["prerank_state"] = "in_progress"
         else:
             g["prerank_state"] = "pending"
+
+
+def _promote_ai_pick(group: dict, rankings_json: str | None) -> None:
+    """In-place: overwrite `best_image_id`/`best_reason` with the vision
+    model's rank-1 pick from a cached 'ranked' burst_rankings row, and set
+    `best_is_ai_pick = True`. Leaves the score-based pick untouched (and
+    `best_is_ai_pick` False) if the payload is unreadable or its rank-1 id
+    isn't actually a member of this group — both defensive only; a 'ranked'
+    row is always produced from this group's own members."""
+    try:
+        rankings = json.loads(rankings_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return
+    top = next((r for r in rankings if r.get("rank") == 1), None)
+    if not top:
+        return
+    valid_ids = {img["id"] for img in group["images"]}
+    if top.get("image_id") not in valid_ids:
+        return
+    group["best_image_id"] = top["image_id"]
+    group["best_reason"] = top.get("reason") or group["best_reason"]
+    group["best_is_ai_pick"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -683,11 +726,15 @@ def similarity_groups(threshold: float = 0.90, time_gap_seconds: float = 60.0):
             "images": images,
             "best_image_id": best_id,
             "best_reason": best_reason,
+            "best_is_ai_pick": False,
+            "_user_override": user_override_used,
             "size": len(images),
         })
 
     # Tag each group with its prerank state so the grid can show "pending /
     # in_progress / ready / not_applicable" markers without a second poll.
+    # Also promotes best_image_id/best_reason to the LLM's rank-1 pick
+    # wherever prerank_state comes back "ready" (see _annotate_prerank_state).
     # Done inside a short-lived connection — the heavy SQL above has already
     # closed its `with get_db()` block, so this needs its own.
     with get_db() as conn:
@@ -789,6 +836,8 @@ def face_groups(threshold: float = 0.50, time_gap_seconds: float | None = None):
             "images": images,
             "best_image_id": best_id,
             "best_reason": best_reason,
+            "best_is_ai_pick": False,
+            "_user_override": False,
             "size": len(images),
         })
 

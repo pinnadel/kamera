@@ -4,6 +4,62 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## The AI pick stopped being a GroupLoupe secret (2026-09-19, later still)
+
+Philipp's actual complaint: the grid shows an "AI is ranking" pulse while a
+burst is being ranked, and then — nothing. No way to tell which photo won
+without double-clicking into GroupLoupe. True, and worse than it sounds:
+`/similarity-groups` and `/face-groups` computed `best_image_id` purely from
+`overall_score`, full stop. The vision-LLM's actual rank-1 pick only ever
+existed as a client-side value inside GroupLoupe (`effectiveHeroId`), built
+from a `/rank-burst` call that fires on loupe-open. Everywhere else in the
+app — the grid tile's "Best: filename" footer, the group-scrub peek panel,
+DetailView's group banner — was silently showing the *score* pick and
+implying (DetailView's copy said "Showing the AI's best…" outright) that it
+was the AI's.
+
+Fixed at the source instead of patching each surface: `_annotate_prerank_state`
+(`backend/routers/model.py`) — which already queries `burst_rankings` per
+group to compute `prerank_state` — now also reads `rankings_json` on a
+`"ready"` hit and promotes the LLM's rank-1 onto `best_image_id`/
+`best_reason`, tagging the group `best_is_ai_pick: true`. A manual hero
+override (Settings' per-group pin) still wins over the AI, tracked via a
+`_user_override` flag threaded through from both group-building loops and
+popped before the group dict goes out over the API. Every consumer of
+`best_image_id` — GroupTile's footer, the rail, DetailView, the peek panel —
+inherited the fix for free; only three places needed new chrome to actually
+*say* "this one's AI-confirmed":
+
+- The group-scrub peek panel's position bar wears the app's rainbow
+  `.ai-border-sm` stroke on the AI's segment — reusing the exact cue
+  GroupLoupe's "ranking in progress" chip already uses, per Philipp's ask,
+  rather than inventing new chrome.
+- DetailView grew a small rainbow "AI pick" chip next to "Best: filename"
+  (grid-filmstrip mode) and a rainbow ring on the group filmstrip's hero
+  thumb (loupe/scrub mode) — replacing the plain white outline only when the
+  pick is real, and rewording "Showing the AI's best of N photos" to "Showing
+  the top-scoring of N" when it isn't.
+- GroupLoupe now hands DetailView its own live `effectiveHeroId`/
+  `effectiveHeroReason` instead of the raw `group` prop when opening it (O,
+  Space, Enter, thumb double-click) — the loupe's own `/rank-burst` result
+  can be fresher than the last `/similarity-groups` poll, and DetailView
+  would otherwise flash the stale pick for one poll cycle.
+
+One regression caught before it shipped: `best_image_id` doubling as a
+group's "identity" for UI state (`selectedGroupId` in App.jsx) assumed it was
+stable. It isn't — `useGroups.js`'s `loupeGroup` already knew this and falls
+back to a membership search, but the grid's own "did my selected group leave
+the visible list" cleanup effect didn't, and would have silently deselected
+a tile the instant its background ranking finished. Gave it the same
+membership fallback.
+
+See `_promote_ai_pick` in
+[backend/routers/model.py](../backend/routers/model.py), and
+[tests/test_similarity_groups_prerank_state.py](../../tests/test_similarity_groups_prerank_state.py)
+for the promotion/override/fallback cases.
+
+---
+
 ## Smart Albums are selectable (2026-09-19, later still)
 
 The album picker now lists user-created Smart Albums alongside regular ones. Getting there needed one finding first.

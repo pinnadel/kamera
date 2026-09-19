@@ -28,6 +28,34 @@ def _g(ids: list[int]) -> dict:
     return {"images": [{"id": i} for i in ids], "size": len(ids)}
 
 
+def _g_scored(ids: list[int], score_hero: int, user_override: bool = False) -> dict:
+    """Build a group dict with the full set of fields the real endpoint
+    loop sets before calling _annotate_prerank_state — i.e. what a caller
+    must provide for the AI-pick promotion path to have something to
+    compare against / override."""
+    return {
+        "images": [{"id": i} for i in ids],
+        "size": len(ids),
+        "best_image_id": score_hero,
+        "best_reason": "Sharpest frame",
+        "best_is_ai_pick": False,
+        "_user_override": user_override,
+    }
+
+
+def _seed_ranked(conn, member_ids: list[int], rankings: list[dict]) -> str:
+    """Like _seed_burst_rankings, but with a real rankings payload so the
+    AI-pick promotion path has something to read."""
+    h = _members_hash(member_ids)
+    conn.execute(
+        "INSERT INTO burst_rankings (members_hash, member_ids, rankings_json, model) "
+        "VALUES (?, ?, ?, ?)",
+        (h, json.dumps(sorted(member_ids)), json.dumps(rankings), "stub"),
+    )
+    conn.commit()
+    return h
+
+
 def _seed_burst_rankings(conn, member_ids: list[int]) -> str:
     """Insert a row whose members_hash matches `member_ids` so the
     annotator treats it as 'ready' (cache hit). Returns the hash."""
@@ -198,4 +226,77 @@ def test_mixed_outcomes_resolved_independently(tmp_db):
     _annotate_prerank_state(groups, conn)
     states = [g["prerank_state"] for g in groups]
     assert states == ["ready", "near_duplicates", "pending"]
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# AI-pick promotion — a 'ready' group's best_image_id/best_reason get
+# overwritten by the vision model's rank-1, unless a manual hero override
+# is in play. See _promote_ai_pick.
+# ---------------------------------------------------------------------------
+
+
+def test_ready_group_promotes_llm_rank1_over_score_hero(tmp_db):
+    """The score-based hero (100) loses to the LLM's rank-1 (101) once a
+    'ranked' cache row exists — best_is_ai_pick flips to True and
+    best_reason picks up the model's own reason text."""
+    conn = _open_conn(tmp_db)
+    _seed_ranked(conn, [100, 101, 102], [
+        {"image_id": 101, "rank": 1, "reason": "Eyes open, best composition"},
+        {"image_id": 100, "rank": 2, "reason": "Slightly soft focus"},
+        {"image_id": 102, "rank": 3, "reason": "Subject looking away"},
+    ])
+    groups = [_g_scored([100, 101, 102], score_hero=100)]
+    _annotate_prerank_state(groups, conn)
+    g = groups[0]
+    assert g["prerank_state"] == "ready"
+    assert g["best_image_id"] == 101
+    assert g["best_reason"] == "Eyes open, best composition"
+    assert g["best_is_ai_pick"] is True
+    conn.close()
+
+
+def test_manual_override_beats_llm_rank1(tmp_db):
+    """A user-pinned hero (Settings → hero override) always wins — the
+    AI's rank-1 never displaces a decision the human already made."""
+    conn = _open_conn(tmp_db)
+    _seed_ranked(conn, [200, 201, 202], [
+        {"image_id": 201, "rank": 1, "reason": "Best of the burst"},
+    ])
+    groups = [_g_scored([200, 201, 202], score_hero=200, user_override=True)]
+    _annotate_prerank_state(groups, conn)
+    g = groups[0]
+    assert g["prerank_state"] == "ready"
+    assert g["best_image_id"] == 200          # unchanged — the manual pin
+    assert g["best_is_ai_pick"] is False
+    conn.close()
+
+
+def test_ready_with_empty_rankings_keeps_score_hero(tmp_db):
+    """A 'ready' row with no rank-1 entry (e.g. the [] stub the other
+    tests in this file seed) leaves the score-based pick untouched and
+    best_is_ai_pick False — no crash, no false promotion."""
+    conn = _open_conn(tmp_db)
+    _seed_burst_rankings(conn, [300, 301, 302])  # rankings_json = "[]"
+    groups = [_g_scored([300, 301, 302], score_hero=300)]
+    _annotate_prerank_state(groups, conn)
+    g = groups[0]
+    assert g["prerank_state"] == "ready"
+    assert g["best_image_id"] == 300
+    assert g["best_is_ai_pick"] is False
+    conn.close()
+
+
+def test_pending_group_keeps_score_hero_and_no_leftover_keys(tmp_db):
+    """A 'pending' group (no cache row) keeps its score-based pick, and
+    the internal `_user_override` bookkeeping key never leaks into the
+    group dict that would otherwise ship straight out over the API."""
+    conn = _open_conn(tmp_db)
+    groups = [_g_scored([400, 401, 402], score_hero=400)]
+    _annotate_prerank_state(groups, conn)
+    g = groups[0]
+    assert g["prerank_state"] == "pending"
+    assert g["best_image_id"] == 400
+    assert g["best_is_ai_pick"] is False
+    assert "_user_override" not in g
     conn.close()

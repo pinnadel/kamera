@@ -390,6 +390,17 @@ export function GroupLoupe({
   const effectiveHeroId     = llmHero?.id      ?? group?.best_image_id ?? null
   const effectiveHeroReason = llmHero?.reason  ?? group?.best_reason   ?? null
 
+  // What DetailView gets handed when opened from in here (O key, thumb
+  // double-click, filmstrip double-click). The server's `group` prop can be
+  // one poll behind: this loupe may have JUST resolved a fresh /rank-burst
+  // result that /similarity-groups hasn't picked up yet, so DetailView must
+  // see llmHero, not the possibly-stale group.best_image_id, or its "AI
+  // pick" chrome would flash the wrong photo until the next poll.
+  const groupForDetail = useMemo(() => {
+    if (!group || !llmHero) return group
+    return { ...group, best_image_id: effectiveHeroId, best_reason: effectiveHeroReason, best_is_ai_pick: true }
+  }, [group, llmHero, effectiveHeroId, effectiveHeroReason])
+
   // Pre-filter awareness. When the backend trimmed a burst >12 down to its
   // top-12 candidates (see backend/group_scoring.top_n_candidates), the
   // burst-rank response includes `evaluated_ids` (the ids the LLM actually
@@ -634,16 +645,16 @@ export function GroupLoupe({
 
   useHotkeys('enter', () => {
     if (!group || !focusedImage) return
-    onOpenDetail?.(focusedImage.id, group)
-  }, { enabled: !!group }, [group, focusedImage, onOpenDetail])
+    onOpenDetail?.(focusedImage.id, groupForDetail)
+  }, { enabled: !!group }, [group, groupForDetail, focusedImage, onOpenDetail])
 
   // Space mirrors Enter so muscle memory from grid view (Space → DetailView)
   // works the same way inside the loupe.
   useHotkeys('space', (e) => {
     if (!group || !focusedImage) return
     e.preventDefault()
-    onOpenDetail?.(focusedImage.id, group)
-  }, { enabled: !!group }, [group, focusedImage, onOpenDetail])
+    onOpenDetail?.(focusedImage.id, groupForDetail)
+  }, { enabled: !!group }, [group, groupForDetail, focusedImage, onOpenDetail])
 
   useHotkeys('escape', () => {
     if (pickTargetMode) { setPickTargetMode(false); return }
@@ -1176,7 +1187,7 @@ export function GroupLoupe({
             onTileDoubleClick={(img) => {
               if (loupeSelect.isSelectMode) return
               setFocusedId(img.id)
-              onOpenDetail?.(img.id, group)
+              onOpenDetail?.(img.id, groupForDetail)
             }}
             onTileMouseDown={handlePanMouseDown}
             onWheel={handlePanWheel}

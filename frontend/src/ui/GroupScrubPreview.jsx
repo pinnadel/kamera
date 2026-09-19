@@ -208,6 +208,12 @@ function ActionButton({ tint, active, disabled, title, onClick, children }) {
 export function GroupScrubPreview({
   anchorRect, members, index, onDecide, onSwap,
   onScrubTo, onStep, onClose, onUndo, onOpenDetail,
+  // Which member is the group's pick, and whether that pick is an actual
+  // vision-LLM ranking (backend/routers/model.py::_annotate_prerank_state)
+  // rather than the score-based fallback. Only the former earns the
+  // position bar's rainbow marker below — an unranked burst's best-guess
+  // hero shouldn't wear the "AI decided this" chrome.
+  bestImageId = null, bestIsAiPick = false,
 }) {
   // Everything below the hooks may bail out, but the hooks themselves can't —
   // so the open/active resolution happens first and the guards come after.
@@ -387,7 +393,13 @@ export function GroupScrubPreview({
 
       {/* Position bar — one segment per member, tinted by that member's own
           decision. Doubles as a map of how the whole burst was culled: three
-          coral and one amber says at a glance that the moment survived. */}
+          coral and one amber says at a glance that the moment survived. The
+          AI's rank-1 pick (when the burst has actually been vision-ranked —
+          bestIsAiPick) additionally wears the app's rainbow "AI" stroke
+          (.ai-border-sm, same cue as GroupLoupe's ranking-in-progress chip),
+          so which frame the AI picked reads at a glance without opening the
+          loupe. An unranked/score-based best gets no marker here — the peek
+          panel otherwise carries no "AI decided this" claim it can't back. */}
       <div
         ref={barRef}
         onMouseMove={scrubFromBar}
@@ -410,15 +422,19 @@ export function GroupScrubPreview({
         {members.map((m, i) => {
           const tone = DECISION[m.decision]
           const on = i === idx
+          const isAiPick = bestIsAiPick && m.id === bestImageId
           return (
             <div
               key={m.id}
+              className={isAiPick ? 'ai-border-sm' : undefined}
+              title={isAiPick ? "AI's pick for this burst" : undefined}
               style={{
+                position: 'relative',
                 flex: 1,
-                height: on ? 5 : 3,
+                height: on || isAiPick ? 5 : 3,
                 borderRadius: 2,
                 backgroundColor: tone ? tone.color : UNDECIDED_COLOR,
-                opacity: on ? 1 : 0.35,
+                opacity: on || isAiPick ? 1 : 0.35,
               }}
             />
           )
