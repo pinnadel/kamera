@@ -49,7 +49,7 @@ def _model_not_ready():
     on a module-level singleton in backend.state; patching it here keeps every
     test below in pure-function territory."""
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "untrained"},
     ):
         yield
@@ -369,7 +369,7 @@ def test_blurry_frame_rule_fires_before_threshold():
 def test_personal_model_keep():
     row = _row(personal_score=85, overall_score=40)  # overall low — model must win
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ):
         assert _compute_auto_decision(row, _t()) == ("keep", "personal_keep")
@@ -378,7 +378,7 @@ def test_personal_model_keep():
 def test_personal_model_maybe():
     row = _row(personal_score=65, overall_score=40)
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ):
         assert _compute_auto_decision(row, _t()) == ("maybe", "personal_maybe")
@@ -387,7 +387,7 @@ def test_personal_model_maybe():
 def test_personal_model_reject():
     row = _row(personal_score=20, overall_score=90)  # overall high — model still wins
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ):
         assert _compute_auto_decision(row, _t()) == ("reject", "personal_reject")
@@ -399,7 +399,7 @@ def test_personal_model_instant_reject_wins_over_personal_score():
         face_detected=True, face_count=1, eyes_open=0, personal_score=95,
     )
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ):
         assert _compute_auto_decision(row, _t(reject_closed_eyes=True)) == (
@@ -421,10 +421,10 @@ def test_uncertain_boundary_routes_to_maybe():
     row = _row(overall_score=40)
     t = _t(auto_cull_uncertain_to_maybe=True, uncertainty_threshold=8.0)
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ), patch(
-        "backend.routers.decisions._personal_model.predict_with_uncertainty",
+        "backend.state._personal_model.predict_with_uncertainty",
         return_value=(65.0, 8.0),
     ):
         assert _compute_auto_decision(row, t) == ("maybe", "uncertain")
@@ -437,10 +437,10 @@ def test_uncertain_disabled_skips_routing():
     # When the toggle is off, the new code path consults predict_personal_score
     # (not predict_with_uncertainty), so we mock that one for this test.
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ), patch(
-        "backend.routers.decisions._personal_model.predict_personal_score",
+        "backend.state._personal_model.predict_personal_score",
         return_value=65.0,
     ):
         # 65 is between maybe_threshold (60) and keep_threshold (80) → personal_maybe
@@ -452,10 +452,10 @@ def test_uncertain_below_threshold_uses_hard_decision():
     row = _row(overall_score=40)
     t = _t(auto_cull_uncertain_to_maybe=True, uncertainty_threshold=8.0)
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ), patch(
-        "backend.routers.decisions._personal_model.predict_with_uncertainty",
+        "backend.state._personal_model.predict_with_uncertainty",
         return_value=(65.0, 4.0),   # confident
     ):
         # 65 is between thresholds → personal_maybe (hard)
@@ -471,10 +471,10 @@ def test_uncertain_does_not_override_instant_reject():
         reject_closed_eyes=True,
     )
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ), patch(
-        "backend.routers.decisions._personal_model.predict_with_uncertainty",
+        "backend.state._personal_model.predict_with_uncertainty",
         return_value=(65.0, 8.0),
     ):
         assert _compute_auto_decision(row, t) == ("reject", "closed_eyes")
@@ -486,10 +486,10 @@ def test_uncertain_routes_near_keep_threshold_too():
     t = _t(auto_cull_uncertain_to_maybe=True, uncertainty_threshold=8.0)
     # 78 is within 8 of keep_threshold=80 → route to maybe.
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ), patch(
-        "backend.routers.decisions._personal_model.predict_with_uncertainty",
+        "backend.state._personal_model.predict_with_uncertainty",
         return_value=(78.0, 8.0),
     ):
         assert _compute_auto_decision(row, t) == ("maybe", "uncertain")
@@ -502,10 +502,10 @@ def test_uncertain_far_from_boundary_passes_through():
     # 95 is well above keep_threshold=80 and far from any boundary;
     # std=10 ≥ threshold but |95-80|=15 > 10 → keep wins.
     with patch(
-        "backend.routers.decisions._personal_model.info",
+        "backend.state._personal_model.info",
         return_value={"model_status": "ready"},
     ), patch(
-        "backend.routers.decisions._personal_model.predict_with_uncertainty",
+        "backend.state._personal_model.predict_with_uncertainty",
         return_value=(95.0, 10.0),
     ):
         assert _compute_auto_decision(row, t) == ("keep", "personal_keep")

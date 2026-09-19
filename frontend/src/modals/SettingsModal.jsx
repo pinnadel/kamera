@@ -160,7 +160,7 @@ function formatTimeGap(seconds) {
   return `${m}:${String(s).padStart(2, '0')} minutes`
 }
 
-export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, onTrain, training, onExportModel, onImportModel, importingModel, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
+export function SettingsModal({ settings, onSave, onClose, onToast, onClear, clearing, onResetModel, onResetDashboard, autoGenerate, onAutoGenerateChange, modelInfo, photosModelInfo, onTrain, training, onExportModel, onImportModel, importingModel, onStartTraining, undecidedCount, bannerDismissed, onSetBannerDismissed, uiScale, onUiScaleChange, showFilenames, onToggleFilenames, advanceDir, onAdvanceDirChange,
   // Grouping sliders (Model tab). Live-updating — change triggers an
   // immediate /similarity-groups refetch via useGroups in the parent.
   // They aren't part of the Apply/draft flow because they aren't
@@ -963,7 +963,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                           Force an immediate retrain if you can't wait.
                         </p>
                         <button
-                          onClick={onTrain}
+                          onClick={() => onTrain('folder')}
                           disabled={!canRetrain}
                           title={hint || 'Retrain on all current samples'}
                           className={`flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity ${
@@ -998,6 +998,46 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     </p>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* Apple Photos model — a second model over its own corpus.
+                iPhone shots score on a different distribution than camera RAW
+                (computational sharpening compresses exactly the spread the
+                camera model learns from), so they train separately and this
+                one predicts an absolute score instead of adjusting the
+                quality score. It needs a larger corpus before it says
+                anything useful, which is why its floor is higher. */}
+            {photosModelInfo && (
+              <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+                <p className="label mb-3">Apple Photos model</p>
+                {(() => {
+                  const have = photosModelInfo.decided_count ?? 0
+                  const need = photosModelInfo.min_decisions ?? 150
+                  const ready = photosModelInfo.model_status === 'ready'
+                  const pct = Math.min(100, Math.round((have / Math.max(need, 1)) * 100))
+                  return (
+                    <div className="space-y-2">
+                      <p className="text-xs text-[#9c9c9d] leading-relaxed">
+                        {ready
+                          ? `Trained on ${photosModelInfo.training_size} Photos decisions. Auto-cull is available on Photos tabs.`
+                          : `Learning from your Photos decisions — ${have} of ${need}. Auto-cull on Photos tabs switches on once it can beat the quality thresholds.`}
+                      </p>
+                      {!ready && (
+                        <div className="h-1 rounded-full bg-[rgba(255,255,255,0.06)] overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-[#5BB8D4] transition-all"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                      )}
+                      <p className="text-[11px] text-[#6a6b6c] leading-relaxed">
+                        Kept separate from the camera model on purpose — mixing iPhone and RAW
+                        would teach it contradictory labels about sharpness and aperture.
+                      </p>
+                    </div>
+                  )
+                })()}
               </div>
             )}
 

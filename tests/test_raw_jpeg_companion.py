@@ -80,7 +80,8 @@ def patched(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     # personal_score annotation touches a real model singleton — keep it inert.
     # `ready` is a read-only property derived from `_pipeline is not None`.
-    monkeypatch.setattr(images_mod._personal_model, "_pipeline", None, raising=False)
+    for _corpus in ("folder", "photos"):
+        monkeypatch.setattr(images_mod.model_for(_corpus), "_pipeline", None, raising=False)
 
     return tmp_db
 

@@ -105,13 +105,61 @@ because it is wrong in both directions there; `not_in_album` is the right predic
 
 ---
 
-## 2. Auto-cull and a Photos model (Phase B)
+## 2. Auto-cull and a Photos model (Phase B) — SHIPPED 2026-09-19
 
-**Where it stands.** The corpus split shipped; the second *model* did not.
-`training_samples.corpus` separates `folder` (2971) from `photos` (7).
-`auto_trainer` filters to `folder`, Photos rows get `personal_score = null`, and
-auto-cull is off on Photos tabs. Nothing about that is a stub — it is the honest
-state of a model that has never seen an iPhone photo.
+**Where it stands.** Built as the strict superset described below, with two
+changes the measurements forced (see *What measuring changed* at the end of this
+section). The corpus still has to fill up — 7 samples against a floor of 150 —
+so the model is wired but silent. That is the intended state, not a stub.
+
+**What shipped:**
+
+- `PersonalModel(corpus)` with per-corpus pickle, training floor and scoring mode.
+- `state._personal_models` + `model_for(source_type)`; `_personal_model` kept as
+  the folder alias so no existing call site changed meaning.
+- `auto_trainer` is corpus-aware throughout, including per-corpus in-flight flags
+  (a shared `_running` bool would have let a folder train swallow a photos trigger)
+  and a corpus filter on the pairwise synthetics.
+- `GET /images` groups rows by `source_type` and scores each group with its own
+  model instead of short-circuiting Photos to `None`.
+- `/model-info?corpus=`, `/train-model?corpus=`, `/reset-personal-model?corpus=`.
+- Corpus-scoped decision thresholds via `<corpus>:<key>` with fallback.
+- Settings → Model shows the Photos model's progress toward its floor.
+- `tests/test_photos_model_corpus.py` — 19 tests over the seam.
+
+**What measuring changed.** Two of the assumptions in the original sketch did not
+survive contact with the data:
+
+1. *The feature-vector caveat was right but incomplete.* `focal_length_mm` holds
+   5% of the camera corpus's spread (an iPhone has ~4 lens positions) and
+   `aperture` 15% — and the two are perfectly collinear, since each iPhone lens
+   has a fixed aperture. `scene_is_night` has zero variance (Night Mode). But the
+   bigger problem was not the features, it was the *base score*.
+2. *`overall_score` cannot rank iPhone photos at all.* Median 93.1, p75 98.6,
+   half the corpus inside a 6-point band. So Photos scores in "absolute" mode and
+   ignores the base entirely, rather than offsetting it. Chasing this turned up a
+   finding about the shipped camera model too — see the *Personal score
+   construction* row in CLAUDE.md.
+
+**The folder model was flipped too**, same session, once the sweep showed it
+measured better (0.741 vs 0.713). That required `folder:keep_threshold` /
+`folder:maybe_threshold` to be seeded from the fit before the next restart —
+absolute scores against the old 70/45 cutoffs would have been badly wrong. Live
+values: 39.65 / 35.56, a narrow band because the corpus is 72% reject and only
+2.9% maybe. Chasing the flip surfaced a fourth copy of the scoring formula
+hardcoded inside `_bootstrap_validate`, which stands behind the readiness gate —
+see the *Validator must use the live formula* row in CLAUDE.md.
+
+**Still open:**
+
+- Re-derive the Photos cutoffs from real decisions once the corpus fills, rather
+  than from whatever the first qualifying fit produces.
+- `uncertainty_threshold` is effectively inert: at 8.0 it fires on 0.1% of the
+  folder corpus (ensemble std is median 2.44, p90 4.55). It was inert before the
+  flip too — absolute mode doubled the std scale, so this is not a regression —
+  but the "Uncertain → Maybe" routing has never really run. Retuning it would
+  start producing Maybes, which may not be wanted at all.
+- The validator's baseline/model cutoff asymmetry (see CLAUDE.md).
 
 **Why the thresholds mislead.** `MIN_DECISIONS = 30` is the floor for *training at
 all*, and the readiness gate is 50. Neither is the point where a model becomes
@@ -126,8 +174,7 @@ learned from — near-everything is sharp and well exposed — so the useful sig
 be composition and expression, which sort filters already surface. **Cull a few real
 sessions and see whether you miss it** before committing to Phase B.
 
-**If it is worth it**, Phase B is designed as a strict superset — nothing shipped
-gets undone:
+**The original design sketch** (kept for the record — this is what was built):
 
 - `personal_model.py::_MODEL_PATH` becomes a constructor arg: `PersonalModel(corpus="folder")` keeps today's path exactly, `corpus="photos"` gets `data/models/personal_model_photos.pkl`.
 - `backend/state.py` gains `_personal_models: dict[str, PersonalModel]`, keeping `_personal_model` as an alias so all ~15 call sites still compile.
@@ -136,11 +183,23 @@ gets undone:
 - `/model-info?corpus=photos`; banner and Settings gain a corpus toggle.
 - Auto-cull's `supports_auto_cull` flag flips, and the `AND i.source_type = 'folder'` filters in `run_auto_cull` / `auto_cull_preview` become corpus-aware.
 
-**Feature-vector caveat.** 31 features assume a camera: `focal_length_mm`,
-`aperture`, `iso`, `shutter_speed`. An iPhone reports a handful of discrete focal
-lengths and a fixed aperture, so those columns are near-constant and the GBR will
-ignore them. Not a bug, but worth measuring before concluding the model "does not
-work" — check feature importances on the Photos corpus first.
+**Feature-vector caveat** (measured 2026-09-19 — Photos rows vs. the 2971 frozen
+folder vectors, standard deviation as % of the camera corpus's):
+
+| feature | photos sd vs camera | note |
+|---|---|---|
+| `focal_length_mm` | 5% | ~4 discrete lens positions (2.7 / 6.8 / 9.0 / 16.9mm) |
+| `aperture` | 15% | fixed per lens → perfectly collinear with focal |
+| `face_sharpness_score` | 26% | compressed |
+| `scene_is_night` | 0% | Night Mode erases the category |
+| `smile_score` | **127%** | *more* spread than the camera corpus |
+| SigLIP content axes | ~100% | transfer cleanly |
+
+The Photos corpus is a **people** corpus: `face_present` 0.54 → 0.68,
+`scene_is_portrait` 0.35 → 0.65. Expect importance mass to move off camera
+physics and onto expression and content. Unrelated but found on the way:
+`shake_detected` is constant 0 across all 507 images *and* all 2971 training
+samples — a dead feature everywhere, not just here.
 
 ---
 

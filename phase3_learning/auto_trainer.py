@@ -4,7 +4,8 @@ Background auto-training for the personal model.
 Each K/M/R decision calls `maybe_train_async()`. The trigger checks two
 gates against the durable `training_samples` table:
 
-  1. Floor gate    — at least MIN_DECISIONS samples exist (skip until then).
+  1. Floor gate    — at least the corpus's own floor of samples exists
+                     (min_decisions_for(corpus); skip until then).
   2. Freshness gate — at least RETRAIN_DELTA new samples since last fit
                       (skip if we just trained and barely anything changed).
 
@@ -32,7 +33,7 @@ import numpy as np
 
 from backend.database import get_db
 from phase3_learning.feature_extractor import features_from_json
-from phase3_learning.personal_model import MIN_DECISIONS
+from phase3_learning.personal_model import min_decisions_for
 
 if TYPE_CHECKING:
     from phase3_learning.personal_model import PersonalModel
@@ -46,34 +47,34 @@ logger = logging.getLogger(__name__)
 # while the user is still culling).
 RETRAIN_DELTA: int = 10
 
-# Module-level state. Wrapped in a lock so concurrent decision posts don't
-# race the freshness check.
+# Module-level state, keyed by corpus. Wrapped in a lock so concurrent
+# decision posts don't race the freshness check. The in-flight flag must be
+# per-corpus: folder and photos are independent models, and a shared flag
+# would let a folder train silently swallow a photos trigger.
 _lock = threading.Lock()
-_running = False
-_last_auto_train_at: datetime | None = None
+_running: dict[str, bool] = {}
+_last_auto_train_at: dict[str, datetime] = {}
 
 
-def status_snapshot() -> dict:
+def status_snapshot(corpus: str = "folder") -> dict:
     """JSON-serialisable peek at auto-train state for /model-info."""
+    last = _last_auto_train_at.get(corpus)
     return {
-        "auto_running":         bool(_running),
-        "last_auto_train_at":   _last_auto_train_at.isoformat(timespec="seconds")
-                                 if _last_auto_train_at else None,
+        "auto_running":         bool(_running.get(corpus)),
+        "last_auto_train_at":   last.isoformat(timespec="seconds") if last else None,
         "retrain_delta":        RETRAIN_DELTA,
     }
 
 
-# The only corpus this trainer consumes. Photos-album decisions are stored
-# with corpus='photos' and are deliberately excluded: iPhone HEIC and camera
-# RAW score on different sharpness/aperture/iso distributions, so one GBR over
-# both would learn contradictory labels. A second model over the 'photos'
-# corpus is deferred until that corpus is large enough to be worth training
-# (MIN_DECISIONS=30) — see docs/PLAN-photos-source.md.
+# Each corpus trains its own model. iPhone HEIC and camera RAW score on
+# different sharpness/aperture/iso distributions, so one GBR over both would
+# learn contradictory labels — see docs/PLAN-photos-source.md. A corpus name
+# doubles as the `images.source_type` it draws from.
 _CORPUS = "folder"
 
 
-def _count_samples() -> int:
-    """Size of the corpus this model trains on — folder decisions only.
+def _count_samples(corpus: str = _CORPUS) -> int:
+    """Size of the corpus a model trains on.
 
     Must use the same WHERE clause as _load_corpus(): if it counted every
     corpus, a run of Photos decisions would move the freshness gate and
@@ -81,12 +82,16 @@ def _count_samples() -> int:
     """
     with get_db() as conn:
         return conn.execute(
-            f"SELECT COUNT(*) FROM training_samples WHERE corpus = '{_CORPUS}'"
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = ?", (corpus,)
         ).fetchone()[0]
 
 
-def _pairwise_synthetic_samples() -> tuple[np.ndarray, list[str], list[float | None], list[str | None]]:
+def _pairwise_synthetic_samples(corpus: str = _CORPUS) -> tuple[np.ndarray, list[str], list[float | None], list[str | None]]:
     """Build synthetic training samples from pairwise A/B comparisons.
+
+    Scoped to `corpus` via images.source_type — the pairwise_comparisons table
+    is global, so without the filter camera A/B pairs would leak into the
+    Photos corpus and undo the very split this module exists to maintain.
 
     Each comparison generates two soft labels:
       winner → fractional "keep"  label (+0.7, weight 0.4)
@@ -135,8 +140,8 @@ def _pairwise_synthetic_samples() -> tuple[np.ndarray, list[str], list[float | N
     with get_db() as conn:
         placeholders = ",".join("?" * len(all_ids))
         img_rows = conn.execute(
-            f"SELECT * FROM images WHERE id IN ({placeholders})",
-            list(all_ids),
+            f"SELECT * FROM images WHERE id IN ({placeholders}) AND source_type = ?",
+            list(all_ids) + [corpus],
         ).fetchall()
 
     from phase3_learning.feature_extractor import extract
@@ -163,7 +168,7 @@ def _pairwise_synthetic_samples() -> tuple[np.ndarray, list[str], list[float | N
     return np.vstack(vecs), decisions_out, scores_out, dates_out
 
 
-def _load_corpus() -> tuple[np.ndarray, list[str], list[float | None], list[str | None], list[float]] | None:
+def _load_corpus(corpus: str = _CORPUS) -> tuple[np.ndarray, list[str], list[float | None], list[str | None], list[float]] | None:
     """Read every training_samples row and rebuild the feature matrix.
 
     Also augments with synthetic samples from pairwise A/B comparisons
@@ -178,9 +183,9 @@ def _load_corpus() -> tuple[np.ndarray, list[str], list[float | None], list[str 
     with get_db() as conn:
         rows = conn.execute(
             "SELECT decision, features_json, overall_score, decided_at "
-            f"FROM training_samples WHERE corpus = '{_CORPUS}'"
+            "FROM training_samples WHERE corpus = ?", (corpus,)
         ).fetchall()
-    if len(rows) < MIN_DECISIONS:
+    if len(rows) < min_decisions_for(corpus):
         return None
     feature_vectors = np.vstack([features_from_json(r["features_json"]) for r in rows])
     decisions       = [r["decision"]      for r in rows]
@@ -189,7 +194,7 @@ def _load_corpus() -> tuple[np.ndarray, list[str], list[float | None], list[str 
     base_weights    = [1.0] * len(rows)
 
     # Augment with pairwise synthetic samples at 0.4× weight.
-    p_vecs, p_decisions, p_scores, p_dates = _pairwise_synthetic_samples()
+    p_vecs, p_decisions, p_scores, p_dates = _pairwise_synthetic_samples(corpus)
     if p_vecs.shape[0] > 0:
         n_feats = feature_vectors.shape[1]
         if p_vecs.shape[1] < n_feats:
@@ -206,19 +211,39 @@ def _load_corpus() -> tuple[np.ndarray, list[str], list[float | None], list[str 
     return feature_vectors, decisions, overall_scores, decided_at, base_weights
 
 
+def _calibrate_cutoffs(model: "PersonalModel", meta: dict) -> None:
+    """Seed an absolute-mode corpus's decision cutoffs from its own fit.
+
+    Only writes keys that do not exist yet. A corpus scored in "absolute" mode
+    has no human-meaningful score unit, so its first trained model is the only
+    thing that can say where "keep" starts — but once the user has tuned the
+    value, a later retrain must not silently move it back.
+    """
+    cutoffs = meta.get("suggested_cutoffs") or {}
+    if not cutoffs:
+        return
+    from backend.database import get_setting, set_setting
+    for key, value in cutoffs.items():
+        scoped = f"{model.corpus}:{key}"
+        if get_setting(scoped) is None:
+            set_setting(scoped, str(value))
+            logger.info("Calibrated %s = %s from the %s fit", scoped, value, model.corpus)
+
+
 def _train_worker(model: "PersonalModel") -> None:
     """Run inside the daemon thread. Trains, saves, updates state, releases lock."""
-    global _running, _last_auto_train_at
+    name = model.corpus
     try:
-        corpus = _load_corpus()
-        if corpus is None:
-            logger.info("Auto-train skipped — corpus below MIN_DECISIONS")
+        loaded = _load_corpus(name)
+        if loaded is None:
+            logger.info("Auto-train skipped — %s corpus below its floor of %d",
+                        name, min_decisions_for(name))
             return
-        X, decisions, overall_scores, decided_at, base_weights = corpus
+        X, decisions, overall_scores, decided_at, base_weights = loaded
         prior_size = model.training_size if model.ready else 0
         logger.info(
-            "Auto-train starting on %d samples (prior fit: %d)",
-            X.shape[0], prior_size,
+            "Auto-train starting on %d %s samples (prior fit: %d)",
+            X.shape[0], name, prior_size,
         )
         if X.shape[0] < prior_size:
             logger.warning(
@@ -227,18 +252,20 @@ def _train_worker(model: "PersonalModel") -> None:
                 "refuse the overwrite; investigate the corpus before forcing.",
                 X.shape[0], prior_size,
             )
-        model.train_from_samples(X, decisions, overall_scores, decided_at=decided_at,
-                                 base_weights=base_weights)
+        meta = model.train_from_samples(X, decisions, overall_scores, decided_at=decided_at,
+                                        base_weights=base_weights)
         model.save()
-        _last_auto_train_at = datetime.now()
-        logger.info("Auto-train complete at %s", _last_auto_train_at.isoformat(timespec="seconds"))
+        _calibrate_cutoffs(model, meta)
+        _last_auto_train_at[name] = datetime.now()
+        logger.info("Auto-train complete (%s) at %s",
+                    name, _last_auto_train_at[name].isoformat(timespec="seconds"))
     except Exception:
         # Never let a background failure crash the server. The user will
         # just keep using thresholds until the next trigger succeeds.
-        logger.exception("Auto-train failed")
+        logger.exception("Auto-train failed (%s)", name)
     finally:
         with _lock:
-            _running = False
+            _running[name] = False
 
 
 def maybe_train_async(model: "PersonalModel") -> bool:
@@ -251,21 +278,21 @@ def maybe_train_async(model: "PersonalModel") -> bool:
     Trigger logic:
       • If a train is already in flight, return False. The next call after
         it finishes will see the additional samples and decide for itself.
-      • If sample_count < MIN_DECISIONS, return False (still in "untrained"
-        phase, the banner shows N / 30 progress).
+      • If sample_count is below the corpus floor, return False (still in
+        "untrained" phase, the banner shows N / floor progress).
       • If model has never been trained AND we just crossed the floor → train.
       • If model has been trained AND samples - training_size >= RETRAIN_DELTA
         → train.
       • Otherwise no-op.
     """
-    global _running
+    name = model.corpus
 
     with _lock:
-        if _running:
+        if _running.get(name):
             return False
 
-        sample_count = _count_samples()
-        if sample_count < MIN_DECISIONS:
+        sample_count = _count_samples(name)
+        if sample_count < min_decisions_for(name):
             return False
 
         prior_size = model.training_size if model.ready else 0
@@ -277,13 +304,13 @@ def maybe_train_async(model: "PersonalModel") -> bool:
         if prior_size > 0 and delta < RETRAIN_DELTA:
             return False
 
-        _running = True
+        _running[name] = True
 
     thread = threading.Thread(
         target=_train_worker,
         args=(model,),
         daemon=True,
-        name="personal-model-auto-train",
+        name=f"personal-model-auto-train-{name}",
     )
     thread.start()
     return True
@@ -297,20 +324,22 @@ def force_train_sync(model: "PersonalModel") -> dict:
     lock: if an auto-train is mid-flight, this raises so the user knows
     to wait a few seconds.
     """
+    name = model.corpus
     with _lock:
-        if _running:
+        if _running.get(name):
             raise RuntimeError("Auto-train already in progress — try again in a moment.")
 
-    corpus = _load_corpus()
-    if corpus is None:
+    loaded = _load_corpus(name)
+    if loaded is None:
         raise ValueError(
-            f"Need at least {MIN_DECISIONS} decisions to train (current corpus is smaller)."
+            f"Need at least {min_decisions_for(name)} {name} decisions to train "
+            f"(current corpus is smaller)."
         )
-    X, decisions, overall_scores, decided_at, base_weights = corpus
+    X, decisions, overall_scores, decided_at, base_weights = loaded
     meta = model.train_from_samples(X, decisions, overall_scores, decided_at=decided_at,
                                     base_weights=base_weights)
     model.save()
+    _calibrate_cutoffs(model, meta)
 
-    global _last_auto_train_at
-    _last_auto_train_at = datetime.now()
+    _last_auto_train_at[name] = datetime.now()
     return meta

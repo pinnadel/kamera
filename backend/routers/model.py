@@ -13,7 +13,7 @@ from backend.constants import shot_at_to_unix as _shot_at_to_unix
 from backend.database import get_db, set_setting
 from backend.group_scoring import compute_best_reason
 from backend.routers.settings import tunable_setting_keys
-from backend.state import _personal_model
+from backend.state import _personal_model, _personal_models, clear_all_caches, model_for
 from phase2_quality.model_status import snapshot as _model_status_snapshot
 from phase3_learning.auto_trainer import (
     force_train_sync,
@@ -215,9 +215,12 @@ class SetManualGroupRequest(BaseModel):
 
 
 @router.get("/model-info")
-def personal_model_info():
+def personal_model_info(corpus: str = "folder"):
     """
     Return the current personal model status and decision-count progress.
+
+    `corpus` selects which model to report on ('folder' | 'photos'); each
+    trains on its own slice of training_samples and has its own pickle.
 
     Fields:
       ready              — True once trained at least once
@@ -241,21 +244,21 @@ def personal_model_info():
     """
     with get_db() as conn:
         decided_count = conn.execute(
-            "SELECT COUNT(*) FROM training_samples WHERE corpus = 'folder'"
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = ?", (corpus,)
         ).fetchone()[0]
         photos_sample_count = conn.execute(
             "SELECT COUNT(*) FROM training_samples WHERE corpus = 'photos'"
         ).fetchone()[0]
-    info = _personal_model.info()
+    info = model_for(corpus).info()
     info["decided_count"] = decided_count
     info["photos_sample_count"] = photos_sample_count
-    info.update(_auto_train_snapshot())
+    info.update(_auto_train_snapshot(corpus))
     info["pending_samples"] = max(0, decided_count - (info.get("training_size") or 0))
     return info
 
 
 @router.post("/train-model")
-def train_personal_model():
+def train_personal_model(corpus: str = "folder"):
     """
     Manual override: force an immediate retrain from the durable
     training_samples corpus. Used by Settings → "Retrain now" — the user
@@ -266,7 +269,7 @@ def train_personal_model():
     is currently running (race avoidance — caller can retry in a moment).
     """
     try:
-        meta = force_train_sync(_personal_model)
+        meta = force_train_sync(model_for(corpus))
         return {"status": "trained", **meta}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -277,7 +280,7 @@ def train_personal_model():
 
 
 @router.post("/reset-personal-model")
-def reset_personal_model():
+def reset_personal_model(corpus: str = "folder"):
     """
     Destructive: clear all personal-model training progress.
 
@@ -294,12 +297,19 @@ def reset_personal_model():
             # Scoped to the corpus this model actually trains on. Resetting the
             # camera model must not discard the Photos corpus being collected
             # for a future second model.
-            cur = conn.execute("DELETE FROM training_samples WHERE corpus = 'folder'")
+            cur = conn.execute("DELETE FROM training_samples WHERE corpus = ?", (corpus,))
             samples_removed = cur.rowcount
             cur = conn.execute("DELETE FROM pairwise_comparisons")
             pairwise_removed = cur.rowcount
+            # An absolute-mode corpus derives its cutoffs from its own fit, so
+            # they are model state, not user settings — a reset must drop them
+            # or the next model inherits the old one's score scale.
+            conn.execute(
+                "DELETE FROM settings WHERE key IN (?, ?)",
+                (f"{corpus}:keep_threshold", f"{corpus}:maybe_threshold"),
+            )
             conn.commit()
-        _personal_model.reset()
+        model_for(corpus).reset()
         logger.info(
             "Personal model reset: %d training_samples + %d pairwise_comparisons removed",
             samples_removed, pairwise_removed,
@@ -548,18 +558,23 @@ async def import_taste_model(request: Request, mode: str = "merge"):
         raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
 
     # ── Rebuild the derived pickle from the restored corpus ──────────────────
-    _personal_model.clear_cache()
+    clear_all_caches()
     # Replace can shrink the corpus below the on-disk fit; save()'s shrink guard
     # would then silently refuse the overwrite and leave a stale pickle. reset()
     # deletes the pickle first so the (possibly smaller) new fit persists cleanly.
+    # Every corpus is reset: a replace rewrites training_samples wholesale, so a
+    # pickle left behind for another corpus would be fit on deleted rows.
     if mode == "replace":
-        _personal_model.reset()
+        for _model in _personal_models.values():
+            _model.reset()
 
     retrained = False
     retrain_deferred = False
     retrain_skipped_reason = None
     with get_db() as conn:
-        corpus_size = conn.execute("SELECT COUNT(*) FROM training_samples").fetchone()[0]
+        corpus_size = conn.execute(
+            "SELECT COUNT(*) FROM training_samples WHERE corpus = 'folder'"
+        ).fetchone()[0]
 
     if corpus_size < MIN_DECISIONS:
         retrain_skipped_reason = "below_min_decisions"

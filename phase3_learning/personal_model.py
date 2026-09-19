@@ -1,6 +1,9 @@
 """
-PersonalModel: learns the user's keep/reject/maybe preferences as a
-signed delta applied on top of the base overall_score.
+PersonalModel: learns the user's keep/reject/maybe preferences.
+
+One instance per training corpus ('folder' = camera, 'photos' = Apple
+Photos); each has its own pickle, training floor and scoring mode. Pick one
+with backend.state.model_for(source_type).
 
 Decision → training label mapping:
     keep   → +1.0  (user would add score)
@@ -18,12 +21,17 @@ highlight_clip_pct, shadow_clip_pct, shake_detected, face_present
 (computed binary — never NaN), face_detected, face_count,
 face_sharpness_score, eyes_open, eye_openness_ratio, face_size_ratio,
 focal_length_mm, aperture, iso.
-overall_score is excluded from the feature vector (it is a linear combo
-of sharpness + exposure already present) but is still used as the delta
-base in the prediction formula.
+overall_score is excluded from the feature vector — it is a linear combo of
+sharpness + exposure already present.
 
-Predicted delta is multiplied by DELTA_SCALE before adding to overall_score:
-    personal_score = clamp(overall_score + delta × 25, 0, 100)
+Two scoring modes map the GBR's raw prediction to a personal_score (see
+_SCORING for the measurements behind the choice):
+    "absolute" — clamp(50 + raw × 50, 0, 100)             both corpora today
+    "offset"   — clamp(overall_score + raw × 25, 0, 100)  legacy fallback
+
+An absolute score carries no quality-percentage meaning, so its decision
+cutoffs are derived from the fit's own label proportions rather than set by
+hand — see suggested_cutoffs and auto_trainer._calibrate_cutoffs.
 
 GBR hyperparameters are conservative (shallow trees, low learning rate,
 200 estimators) to avoid overfitting on small datasets (20–200 decisions).
@@ -37,7 +45,7 @@ import logging
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
@@ -60,7 +68,52 @@ logger = logging.getLogger(__name__)
 # beats_baseline verdict. See docs/PROJECT_WIKI.md "model trust tiers".
 MIN_DECISIONS: int  = 30      # refuse to train below this — too little signal
 DELTA_SCALE: float  = 25.0    # max ± adjustment in score points
-_MODEL_PATH = Path(__file__).parent.parent / "data" / "models" / "personal_model.pkl"
+
+_MODELS_DIR = Path(__file__).parent.parent / "data" / "models"
+_MODEL_PATH = _MODELS_DIR / "personal_model.pkl"
+
+# Per-corpus training floor. 'photos' sits far above 'folder' because an
+# iPhone's computational pipeline compresses the variance the GBR learns from:
+# measured 2026-09-19, half the Photos rows score >= 95 sharpness and the
+# overall_score median is 93.1, so a fit at 30 samples is noise in a model's
+# clothing. See docs/PLAN-photos-next.md §2.
+_MIN_DECISIONS: dict[str, int] = {"folder": MIN_DECISIONS, "photos": 150}
+
+# How a corpus turns the GBR's raw prediction into a personal_score.
+#   "offset"   — clamp(overall_score + raw*DELTA_SCALE, 0, 100)
+#   "absolute" — clamp(50 + raw*50, 0, 100); overall_score is not consulted
+#
+# Both corpora score "absolute" as of 2026-09-19. Measured with a bootstrap
+# sweep over blend weights on the real 2971-sample folder corpus, cutoffs
+# re-derived per split from train-set quantiles so no variant was judged on
+# another's scale:
+#
+#   overall_score alone        0.703 accuracy / 0.280 Spearman
+#   offset (base + raw*25)     0.713 / 0.341     <- what shipped until now
+#   absolute (pure GBR)        0.741 / 0.413
+#
+# No blend beat pure GBR at any weight, on any base — an iqa/aesthetic base was
+# worse still, because both are already GBR *inputs*. That is the same
+# double-count feature_extractor.py's header guards against by excluding
+# overall_score from the vector; the offset formula reintroduced it one layer
+# down, at the output. For Photos the base is additionally saturated (median
+# 93.1, half the corpus inside a 6-point band).
+#
+# "offset" is kept as the fallback for unregistered corpus names so an old
+# pickle or a future corpus cannot silently land in a score space whose
+# cutoffs were never calibrated.
+_SCORING: dict[str, str] = {"folder": "absolute", "photos": "absolute"}
+
+
+def model_path_for(corpus: str) -> Path:
+    """Pickle path for a corpus. 'folder' keeps the original filename."""
+    if corpus == "folder":
+        return _MODEL_PATH
+    return _MODELS_DIR / f"personal_model_{corpus}.pkl"
+
+
+def min_decisions_for(corpus: str) -> int:
+    return _MIN_DECISIONS.get(corpus, MIN_DECISIONS)
 
 # Uncertainty ensemble: N sub-sampled GBR pipelines whose prediction spread
 # proxies per-photo uncertainty for the Auto-cull "Uncertain → Maybe" routing.
@@ -85,6 +138,9 @@ def _bootstrap_validate(
     y: np.ndarray,
     rows: list[dict],
     n_iter: int = 10,
+    *,
+    to_score: Callable[[float, Optional[float]], Optional[float]] | None = None,
+    derive_cutoffs: bool = False,
 ) -> dict:
     """
     Bootstrap validation: estimate model ordinal accuracy vs. threshold baseline.
@@ -103,7 +159,26 @@ def _bootstrap_validate(
         baseline_accuracy — mean accuracy of simple overall_score threshold
         beats_baseline   — True if margin >= _VAL_MIN_MARGIN
         margin           — model_accuracy − baseline_accuracy
+
+    `to_score` MUST be the same mapping the model uses in production — this
+    function used to hardcode the offset formula, which meant that after a
+    corpus switched to "absolute" scoring the readiness gate was validating a
+    formula the model no longer used.
+
+    Caveat on the comparison: the baseline keeps the fixed 70/50 cutoffs on
+    overall_score, while `derive_cutoffs` gives the model per-split calibrated
+    ones. That favours the model. Measured fairly (both calibrated) the folder
+    model's edge over a well-tuned threshold rule is ~4pp, not the ~20pp this
+    reports. Left as-is deliberately: changing it would move the readiness gate
+    and silently switch auto-cull back to thresholds.
     """
+    if to_score is None:
+        def to_score(raw: float, base: Optional[float]) -> Optional[float]:
+            if base is None:
+                return None
+            delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
+            return float(np.clip(base + delta, 0.0, 100.0))
+
     rng = np.random.default_rng(42)
     n = len(X)
     model_accs: list[float] = []
@@ -134,6 +209,27 @@ def _bootstrap_validate(
         val_pipeline.fit(X[train_idx], y[train_idx])
 
         raw_preds = val_pipeline.predict(X[test_idx])
+
+        def _score(raw: float, idx: int) -> float:
+            base = float(rows[idx].get("overall_score") or 0.0)
+            return float(to_score(float(raw), base) or 0.0)
+
+        # An "absolute" score has no fixed unit, so _VAL_KEEP_CUTOFF would be
+        # judging it on a scale it never lived on (the folder corpus's absolute
+        # scores have a median near 19, not 70). Derive this split's cutoffs
+        # from the TRAIN labels instead, the same way suggested_cutoffs does.
+        if derive_cutoffs:
+            train_scores = np.array(
+                [_score(r, i) for r, i in zip(val_pipeline.predict(X[train_idx]), train_idx)]
+            )
+            ty = y[train_idx]
+            p_reject = float((ty == -1.0).mean())
+            p_maybe = float((ty == 0.0).mean())
+            maybe_cut = float(np.quantile(train_scores, p_reject))
+            keep_cut = float(np.quantile(train_scores, min(1.0, p_reject + p_maybe)))
+        else:
+            keep_cut, maybe_cut = _VAL_KEEP_CUTOFF, _VAL_MAYBE_CUTOFF
+
         model_correct = 0
         baseline_correct = 0
 
@@ -142,13 +238,10 @@ def _bootstrap_validate(
             row = rows[idx]
             overall = float(row.get("overall_score") or 0.0)
 
-            # Model decision: delta → personal_score → label
-            raw = float(raw_preds[j])
-            delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-            personal_score = float(np.clip(overall + delta, 0.0, 100.0))
-            if personal_score >= _VAL_KEEP_CUTOFF:
+            personal_score = _score(raw_preds[j], idx)
+            if personal_score >= keep_cut:
                 model_pred = 1.0
-            elif personal_score >= _VAL_MAYBE_CUTOFF:
+            elif personal_score >= maybe_cut:
                 model_pred = 0.0
             else:
                 model_pred = -1.0
@@ -241,7 +334,11 @@ class PersonalModel:
     then act on the pipeline within the same locked section.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, corpus: str = "folder") -> None:
+        self.corpus = corpus
+        self._path = model_path_for(corpus)
+        self._min_decisions = min_decisions_for(corpus)
+        self._scoring = _SCORING.get(corpus, "offset")
         self._lock = threading.RLock()
         self._pipeline: Optional[Pipeline] = None
         self._meta: dict = {}
@@ -298,9 +395,9 @@ class PersonalModel:
         Returns a metadata dict (training_size, trained_at, feature_importances).
         Raises ValueError when fewer than MIN_DECISIONS samples are provided.
         """
-        if len(rows) < MIN_DECISIONS:
+        if len(rows) < self._min_decisions:
             raise ValueError(
-                f"Need at least {MIN_DECISIONS} decisions to train "
+                f"Need at least {self._min_decisions} decisions to train "
                 f"(currently have {len(rows)}). Keep culling!"
             )
         if len(rows) != len(decisions):
@@ -329,7 +426,9 @@ class PersonalModel:
 
         # Bootstrap validation: compare model vs. simple threshold baseline.
         # Runs 10 lightweight 80/20 splits (~0.5 s on 25 samples).
-        validation = _bootstrap_validate(pipeline, X, y, rows, n_iter=10)
+        validation = _bootstrap_validate(
+            pipeline, X, y, rows, n_iter=10,
+            to_score=self._to_score, derive_cutoffs=self._scoring == "absolute")
         logger.info(
             "Personal model validation — model: %.3f  baseline: %.3f  beats: %s",
             validation["model_accuracy"],
@@ -377,9 +476,9 @@ class PersonalModel:
         overall_scores   — parallel list of base scores (used by the
                            bootstrap validator's threshold baseline)
         """
-        if feature_vectors.shape[0] < MIN_DECISIONS:
+        if feature_vectors.shape[0] < self._min_decisions:
             raise ValueError(
-                f"Need at least {MIN_DECISIONS} decisions to train "
+                f"Need at least {self._min_decisions} decisions to train "
                 f"(currently have {feature_vectors.shape[0]}). Keep culling!"
             )
         if feature_vectors.shape[0] != len(decisions):
@@ -450,7 +549,29 @@ class PersonalModel:
         # Build minimal "rows" stand-ins so _bootstrap_validate can read
         # overall_score (the only field it needs from the row dicts).
         synthetic_rows = [{"overall_score": s if s is not None else 0.0} for s in overall_scores]
-        validation = _bootstrap_validate(pipeline, X, y, synthetic_rows, n_iter=10)
+        validation = _bootstrap_validate(
+            pipeline, X, y, synthetic_rows, n_iter=10,
+            to_score=self._to_score, derive_cutoffs=self._scoring == "absolute")
+
+        # In "absolute" mode the score is whatever the GBR emits — it carries no
+        # human-meaningful unit, so a hand-set cutoff like "keep >= 70" means
+        # nothing. Derive the pair that reproduces this corpus's own label
+        # proportions instead. Offset corpora are left alone: their scores are
+        # in quality-percentage space and their cutoffs are user-tuned.
+        suggested_cutoffs: dict[str, float] = {}
+        if self._scoring == "absolute":
+            # Placeholder base: absolute mode ignores the value, but _to_score
+            # rejects None outright as "this photo was never analyzed".
+            in_sample = np.array(
+                [self._to_score(float(r), 0.0) for r in pipeline.predict(X)], dtype=float
+            )
+            p_reject = float((y == -1.0).mean())
+            p_maybe = float((y == 0.0).mean())
+            suggested_cutoffs = {
+                "maybe_threshold": round(float(np.quantile(in_sample, p_reject)), 2),
+                "keep_threshold": round(
+                    float(np.quantile(in_sample, min(1.0, p_reject + p_maybe))), 2),
+            }
         logger.info(
             "Personal model validation — model: %.3f  baseline: %.3f  beats: %s",
             validation["model_accuracy"],
@@ -467,6 +588,7 @@ class PersonalModel:
                 "feature_importances":    importances,
                 "validation":             validation,
                 "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                "suggested_cutoffs":      suggested_cutoffs,
             }
             self._cache.clear()
             meta_copy = dict(self._meta)
@@ -478,6 +600,21 @@ class PersonalModel:
 
     # ── Predict ──────────────────────────────────────────────────────────────
 
+    def _to_score(self, raw: float, base: Optional[float]) -> Optional[float]:
+        """Map one raw GBR prediction into the 0–100 personal-score space.
+
+        A missing base returns None in BOTH modes. Absolute mode ignores the
+        value, but `overall_score is None` means the photo has not been
+        analyzed — its feature vector is all-NaN and the imputer would happily
+        turn that into a confident-looking middling score.
+        """
+        if base is None:
+            return None
+        if self._scoring == "absolute":
+            return float(np.clip(50.0 + raw * 50.0, 0.0, 100.0))
+        delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
+        return float(np.clip(base + delta, 0.0, 100.0))
+
     def predict_personal_score(self, row: dict) -> Optional[float]:
         """Single-row prediction. Returns None if model isn't ready."""
         base = row.get("overall_score")
@@ -487,8 +624,7 @@ class PersonalModel:
             if self._pipeline is None:
                 return None
             raw = float(self._pipeline.predict(extract(row).reshape(1, -1))[0])
-        delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-        return float(np.clip(base + delta, 0.0, 100.0))
+        return self._to_score(raw, base)
 
     def predict_batch(self, rows: list[dict]) -> list[Optional[float]]:
         """
@@ -522,12 +658,7 @@ class PersonalModel:
                 X       = extract_batch(miss_rows)        # (M, len(_COLUMNS))
                 raw_arr = self._pipeline.predict(X)       # (M,)
                 for i, row, raw in zip(miss_indices, miss_rows, raw_arr):
-                    base = row.get("overall_score")
-                    if base is None:
-                        score = None
-                    else:
-                        delta = float(np.clip(float(raw) * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-                        score = float(np.clip(base + delta, 0.0, 100.0))
+                    score = self._to_score(float(raw), row.get("overall_score"))
                     results[i] = score
                     image_id = row.get("id")
                     if image_id is not None:
@@ -555,8 +686,9 @@ class PersonalModel:
             raw = float(self._pipeline.predict(feats)[0])
             ensemble = list(self._uncertainty_ensemble)
 
-        delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-        score = float(np.clip(base + delta, 0.0, 100.0))
+        score = self._to_score(raw, base)
+        if score is None:
+            return None
 
         if not ensemble:
             return (score, 0.0)
@@ -569,9 +701,7 @@ class PersonalModel:
         # for a new list right after we release the lock.
         member_scores: list[float] = []
         for member in ensemble:
-            raw_m = float(member.predict(feats)[0])
-            delta_m = float(np.clip(raw_m * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-            member_scores.append(float(np.clip(base + delta_m, 0.0, 100.0)))
+            member_scores.append(self._to_score(float(member.predict(feats)[0]), base))
         std = float(np.std(member_scores))
         return (score, std)
 
@@ -601,20 +731,16 @@ class PersonalModel:
         results: list[Optional[tuple[float, float]]] = [None] * len(rows)
         for i, row in enumerate(rows):
             base = row.get("overall_score")
-            if base is None:
+            score = self._to_score(float(raw_arr[i]), base)
+            if score is None:
                 results[i] = None
                 continue
-            raw = float(raw_arr[i])
-            delta = float(np.clip(raw * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-            score = float(np.clip(base + delta, 0.0, 100.0))
             if ensemble_raw is None:
                 results[i] = (score, 0.0)
                 continue
             member_scores: list[float] = []
             for e in range(ensemble_raw.shape[0]):
-                raw_m = float(ensemble_raw[e, i])
-                delta_m = float(np.clip(raw_m * DELTA_SCALE, -DELTA_SCALE, DELTA_SCALE))
-                member_scores.append(float(np.clip(base + delta_m, 0.0, 100.0)))
+                member_scores.append(self._to_score(float(ensemble_raw[e, i]), base))
             results[i] = (score, float(np.std(member_scores)))
         return results
 
@@ -636,7 +762,7 @@ class PersonalModel:
         with self._lock:
             self._cache.clear()
 
-    def reset(self, path: Path = _MODEL_PATH) -> None:
+    def reset(self, path: Path | None = None) -> None:
         """Wipe all learned state in-place and delete the on-disk pickle.
 
         After this the model behaves like a fresh PersonalModel(): `ready`
@@ -644,6 +770,7 @@ class PersonalModel:
         Call after the training_samples table has been cleared so the next
         auto-train pass starts from zero.
         """
+        path = path or self._path
         with self._lock:
             self._pipeline = None
             self._meta = {}
@@ -656,7 +783,7 @@ class PersonalModel:
 
     # ── Persist ──────────────────────────────────────────────────────────────
 
-    def save(self, path: Path = _MODEL_PATH, *, allow_shrink: bool = False) -> None:
+    def save(self, path: Path | None = None, *, allow_shrink: bool = False) -> None:
         """Persist the fitted pipeline atomically.
 
         Writes to a sibling `<name>.tmp` and then `os.replace()`s into place.
@@ -676,6 +803,7 @@ class PersonalModel:
         `reset()` (deletes the pickle directly) and never routes through here;
         the rare intentional case can still pass allow_shrink=True.
         """
+        path = path or self._path
         with self._lock:
             pipeline, meta, ensemble = self._pipeline, self._meta, self._uncertainty_ensemble
             training_size = meta.get("training_size", 0)
@@ -710,7 +838,7 @@ class PersonalModel:
         _os.replace(tmp, path)
         logger.info("Personal model saved → %s (%d samples)", path, training_size)
 
-    def load(self, path: Path = _MODEL_PATH) -> bool:
+    def load(self, path: Path | None = None) -> bool:
         """Load a previously saved model. Returns True on success, False if file
         missing or schema-incompatible.
 
@@ -721,6 +849,7 @@ class PersonalModel:
         the stale model — `_personal_model.ready` stays False, the user sees
         the "Train" button, and one click rebuilds the model on the new schema.
         """
+        path = path or self._path
         if not path.exists():
             return False
         try:
@@ -777,8 +906,10 @@ class PersonalModel:
         if not self.ready:
             return {
                 "ready":          False,
+                "corpus":         self.corpus,
+                "scoring":        self._scoring,
                 "training_size":  0,
-                "min_decisions":  MIN_DECISIONS,
+                "min_decisions":  self._min_decisions,
                 "model_status":   "untrained",
                 "beats_baseline": False,
                 "validation":     {},
@@ -802,9 +933,11 @@ class PersonalModel:
 
         return {
             "ready":          True,
+            "corpus":         self.corpus,
+            "scoring":        self._scoring,
             "training_size":  self.training_size,
             "trained_at":     self.trained_at,
-            "min_decisions":  MIN_DECISIONS,
+            "min_decisions":  self._min_decisions,
             "model_status":   model_status,
             "beats_baseline": self.beats_baseline,
             "validation":     self.validation_info,

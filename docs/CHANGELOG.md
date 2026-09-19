@@ -4,6 +4,94 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## A second taste model, and a base score that could not rank (2026-09-19, evening)
+
+Started as a status question — does culling in Photos already train anything? —
+and the answer was no: decisions land in `training_samples` with
+`corpus='photos'`, `auto_trainer` filters to `folder`, nothing consumes them.
+So: build the second model. The build is the boring half; the measurements
+changed the design twice.
+
+**What the Photos corpus actually looks like.** 449 analyzed Photos rows against
+the 2971 frozen folder vectors. `overall_score` on iPhone photos has a **median
+of 93.1**, p25 of 64.7, p75 of 98.6 — half the corpus inside a six-point band.
+One layer down: 50% of rows score `sharpness_score >= 95` and 26% fall below 50,
+with almost nothing between. On RAW, sharpness is a gradient; through Deep
+Fusion it is a binary — focus locked or it did not. A `keep_threshold` tuned to
+pass 25% would have to sit at 98.6, which is slicing noise, not quality. So the
+Photos model scores in a new **"absolute" mode** — `clamp(50 + raw*50)`,
+`overall_score` never consulted — while folder keeps the shipped offset.
+
+**The finding that was not about Photos.** Philipp asked whether a *blend* of
+absolute and an iqa/aesthetic base would be better, and whether it would help
+the camera model too. Bootstrap sweep on the real folder corpus, cutoffs
+re-derived per split from train-set quantiles (otherwise you measure cutoff
+mismatch, not score quality), Spearman as a cutoff-free check:
+
+| variant (folder, 2971 samples) | accuracy | Spearman |
+|---|---|---|
+| `overall_score` alone | 0.703 | 0.280 |
+| **shipped** `base + raw*25` | 0.713 | 0.341 |
+| pure GBR absolute | **0.741** | **0.413** |
+
+No blend beat pure GBR, on any base, at any weight — and an iqa/aesthetic base
+was worse than `overall_score` everywhere (`aesthetic` alone: Spearman 0.024,
+i.e. random ordering). The reason was already written in the codebase:
+`feature_extractor.py` excludes `overall_score` from the vector *specifically*
+to stop the GBR double-weighting the technical axis — and then
+`predict_personal_score` adds that same `overall_score` back at the output. The
+invariant is defended in the input layer and broken in the output layer.
+
+**So the camera model was flipped as well.** That is not a free switch: absolute
+scores are not in quality-percentage space, so `keep_threshold = 70` becomes
+meaningless (folder's absolute scores have a median near 19). The flip and the
+cutoff re-derivation had to land together — `folder:keep_threshold` / `:maybe_`
+seeded from the fit's own label proportions, live at 39.65 / 35.56. The band is
+narrow because the corpus is 72% reject and 2.9% maybe.
+
+**A fourth copy of the formula.** `_bootstrap_validate` hardcoded
+`overall + raw*25`. It stands behind `beats_baseline` → `model_status ==
+"ready"` → whether auto-cull consults the model at all, so after the flip the
+readiness gate was validating a formula the model no longer used. The tell was
+that accuracy stayed at exactly 0.646 instead of moving; with the validator
+fixed it reports 0.740, matching the independent sweep's 0.741. It now takes the
+model's own `to_score` and, in absolute mode, derives cutoffs per split. Its
+baseline/model cutoff asymmetry is documented and deliberately left alone —
+making it fair would drop the margin below the 5pp gate and silently switch
+auto-cull back to thresholds.
+
+**Also:** thresholds are now corpus-scoped (`<corpus>:<key>`, falling back to the
+bare key — no migration, `settings` is key→value). Absolute-mode corpora
+self-calibrate their cutoffs from the fit's own label proportions, writing only
+keys that do not exist yet so a user edit always wins. Photos' training floor is
+150, not 30. Auto-cull on a Photos tab is no longer a flat 400 — it is gated on
+that corpus's model reaching the ready tier, since the fallback quality
+thresholds would stamp Keep on ~70% of an iPhone library.
+
+Near-misses caught by building rather than reading: `auto_trainer._running` was
+a single bool, so a folder train would have silently swallowed every Photos
+trigger; `pairwise_comparisons` has no `corpus` column, so only a join on
+`images.source_type` keeps camera A/B pairs out of the Photos fit; and dropping
+the `overall_score is None` guard in absolute mode would have put a confident
+score on every unanalyzed photo (the base is unused there, but its absence is
+how the app knows a photo has not been looked at).
+
+One bug shipped and was caught only by hitting the route over HTTP: inserting
+two helper functions above `def auto_cull_preview` put them *between* the
+`@router.get("/auto-cull/preview")` decorator and its function, so the route
+quietly rebound to the helper and answered `200 "photos"`. Every one of the 597
+unit tests still passed — nothing in the suite read the route table. There is
+now a test that does.
+
+Unrelated, found on the way: `shake_detected` is constant 0 across all 507
+images *and* all 2971 training samples — dead feature, everywhere. And
+`uncertainty_threshold = 8.0` fires on 0.1% of the corpus, so "Uncertain →
+Maybe" has effectively never run.
+
+`tests/test_photos_model_corpus.py` (20 tests) covers the seam; full suite 598.
+
+---
+
 ## The AI pick stopped being a GroupLoupe secret (2026-09-19, later still)
 
 Philipp's actual complaint: the grid shows an "AI is ranking" pulse while a

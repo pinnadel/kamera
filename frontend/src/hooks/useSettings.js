@@ -1,7 +1,11 @@
 // Settings and personal-model state for App.jsx.
 //
-// Owns: settings, modelInfo, trainingModel, autoGenerate.
+// Owns: settings, modelInfo, photosModelInfo, trainingModel, autoGenerate.
 // Exposes: loadSettings, loadModelInfo, trainModel.
+//
+// There is one model per training corpus. `modelInfo` is the camera (folder)
+// model that every existing view reads; `photosModelInfo` is the Apple Photos
+// one, which scores on its own scale and has a higher training floor.
 
 import { useState, useEffect, useCallback } from 'react'
 import { API } from '../api'
@@ -9,6 +13,7 @@ import { API } from '../api'
 export function useSettings({ addToast, loadImages }) {
   const [settings, setSettings]           = useState(null)
   const [modelInfo, setModelInfo]         = useState(null)
+  const [photosModelInfo, setPhotosModelInfo] = useState(null)
   const [trainingModel, setTrainingModel] = useState(false)
   const [importingModel, setImportingModel] = useState(false)
   const [autoGenerate, setAutoGenerate]   = useState(
@@ -31,20 +36,29 @@ export function useSettings({ addToast, loadImages }) {
       .then(r => r.json())
       .then(setModelInfo)
       .catch(() => {})
+    fetch(`${API}/model-info?corpus=photos`)
+      .then(r => r.json())
+      .then(setPhotosModelInfo)
+      .catch(() => {})
   }, [])
 
   useEffect(() => { loadModelInfo() }, [loadModelInfo])
 
   // ── trainModel ────────────────────────────────────────────────────────────
-  const trainModel = useCallback(async () => {
+  // `corpus` is normalised because the Settings button wires this straight to
+  // onClick, which would otherwise hand us a PointerEvent as the corpus name.
+  const trainModel = useCallback(async (corpus) => {
+    const target = typeof corpus === 'string' ? corpus : 'folder'
     setTrainingModel(true)
     try {
-      const res = await fetch(`${API}/train-model`, { method: 'POST' })
+      const res = await fetch(`${API}/train-model?corpus=${target}`, { method: 'POST' })
       const data = await res.json()
       await loadModelInfo()
       await loadImages()
       if (res.ok) {
         addToast({ type: 'success', message: `Model trained on ${data.training_size} decisions` })
+      } else {
+        addToast({ type: 'error', message: data.detail || 'Training failed' })
       }
     } finally {
       setTrainingModel(false)
@@ -119,6 +133,7 @@ export function useSettings({ addToast, loadImages }) {
     loadSettings,
     modelInfo,
     setModelInfo,
+    photosModelInfo,
     loadModelInfo,
     trainModel,
     trainingModel,

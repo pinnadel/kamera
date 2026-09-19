@@ -74,7 +74,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from backend.database import create_tables
-from backend.state import _personal_model, watcher
+from backend.state import _personal_models, watcher
 from backend.routers.analysis import _backfill_histograms, _warm_models
 from phase2_quality.llm_explainer import ensure_daemon_running, shutdown_daemon
 from backend.routers import (
@@ -100,7 +100,8 @@ from backend.routers import (
 async def lifespan(app: FastAPI):
     """Initialize the database, load the personal model, and clean up on shutdown."""
     create_tables()
-    _personal_model.load()   # no-op if personal_model.pkl doesn't exist yet
+    for _model in _personal_models.values():
+        _model.load()        # no-op when that corpus has no pickle yet
     _warm_models()           # load ML models in background; ready before first Analyze click
     _backfill_histograms()   # fill histogram_json for pre-existing rows; ~50ms/photo, non-blocking
     ensure_daemon_running()  # start ollama serve if installed but not yet running

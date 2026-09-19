@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from backend.database import get_db
 from phase3_learning.auto_trainer import maybe_train_async
-from backend.state import _personal_model
+from backend.state import model_for
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,13 @@ def record_pairwise(request: PairwiseRequest):
             """,
             (request.winner_id, request.loser_id, request.source_folder),
         )
+        winner = conn.execute(
+            "SELECT source_type FROM images WHERE id = ?", (request.winner_id,)
+        ).fetchone()
 
-    maybe_train_async(_personal_model)
+    # A comparison feeds the model of the corpus its photos came from — the
+    # pairwise table itself is global.
+    maybe_train_async(model_for((winner["source_type"] if winner else None) or "folder"))
     return {"status": "ok", "winner_id": request.winner_id, "loser_id": request.loser_id}
 
 

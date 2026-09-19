@@ -61,8 +61,8 @@ def _patch_db(monkeypatch: pytest.MonkeyPatch, tmp_db: Path) -> Iterator[None]:
     # Also reset the module-level lock state between tests to keep things
     # deterministic — the auto-train thread is daemonised and we never
     # await it, so successive tests could otherwise observe stale state.
-    auto_trainer._running = False
-    auto_trainer._last_auto_train_at = None
+    auto_trainer._running = {}
+    auto_trainer._last_auto_train_at = {}
     yield
 
 
@@ -112,7 +112,7 @@ def _wait_for_quiet(timeout: float = 5.0) -> None:
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not auto_trainer._running:
+        if not any(auto_trainer._running.values()):
             return
         time.sleep(0.05)
     pytest.fail(f"Auto-train did not finish within {timeout}s")

@@ -66,7 +66,8 @@ def patched(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(folder_sink_mod, "move_photo",
                         lambda current, dest: str(current))
     monkeypatch.setattr(decisions_mod, "maybe_train_async", lambda *_a, **_k: None)
-    monkeypatch.setattr(images_mod._personal_model, "_pipeline", None, raising=False)
+    for _corpus in ("folder", "photos"):
+        monkeypatch.setattr(images_mod.model_for(_corpus), "_pipeline", None, raising=False)
 
     # raw_jpeg_display_mode stays at its real default ('both') for these
     # tests — the whole point is proving the mirror fires WITHOUT the display

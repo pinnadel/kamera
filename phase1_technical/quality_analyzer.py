@@ -132,29 +132,45 @@ _MPS_FLUSH_EVERY = 10
 _mps_call_counter = 0
 
 
-def _read_float(key: str, default: float, lo: float, hi: float) -> float:
+def _setting_keys(key: str, corpus: str | None) -> tuple[str, ...]:
+    """Setting lookup order: corpus-scoped first, then the bare global key.
+
+    Photos and camera shots need different decision cutoffs — an iPhone's
+    overall_score median is 93 against the camera corpus's 63 — but nearly
+    every other setting is shared. Falling through to the global key means a
+    corpus only carries the handful of values it actually needs to differ on.
+    """
+    return (f"{corpus}:{key}", key) if corpus else (key,)
+
+
+def _read_float(key: str, default: float, lo: float, hi: float,
+                corpus: str | None = None) -> float:
     try:
         from backend.database import get_setting
-        raw = get_setting(key)
-        if raw is None:
-            return default
-        v = float(raw)
-        if lo <= v <= hi:
-            return v
+        for k in _setting_keys(key, corpus):
+            raw = get_setting(k)
+            if raw is None:
+                continue
+            v = float(raw)
+            if lo <= v <= hi:
+                return v
     except Exception:
         pass
     return default
 
 
-def _read_bool(key: str, default: bool) -> bool:
+def _read_bool(key: str, default: bool, corpus: str | None = None) -> bool:
     # Parsing lives in database.get_bool_setting — one truthy set for the whole
     # app. The try/except stays: this is called from the scoring path, which
     # must survive a missing/locked DB by falling back to the default.
     try:
-        from backend.database import get_bool_setting
-        return get_bool_setting(key, default)
+        from backend.database import get_bool_setting, get_setting
+        for k in _setting_keys(key, corpus):
+            if get_setting(k) is not None:
+                return get_bool_setting(k, default)
     except Exception:
-        return default
+        pass
+    return default
 
 
 def get_sharpness_weight() -> float:
@@ -222,45 +238,56 @@ def compute_overall_score(
     return sharpness_score * w + exposure_score * (1.0 - w)
 
 
-def get_decision_thresholds() -> dict:
-    """Read all auto-decision thresholds + instant-reject toggles in one go."""
+def get_decision_thresholds(corpus: str | None = None) -> dict:
+    """Read all auto-decision thresholds + instant-reject toggles in one go.
+
+    `corpus` scopes every lookup: a `<corpus>:<key>` row wins over the bare
+    key, so a Photos album can carry its own cutoffs while everything left
+    unset keeps using the shared value.
+    """
+    def f(key: str, default: float, lo: float, hi: float) -> float:
+        return _read_float(key, default, lo, hi, corpus=corpus)
+
+    def b(key: str, default: bool) -> bool:
+        return _read_bool(key, default, corpus=corpus)
+
     return {
-        "keep_threshold":            _read_float("keep_threshold",            DEFAULT_KEEP_THRESHOLD,         0.0, 100.0),
-        "maybe_threshold":           _read_float("maybe_threshold",           DEFAULT_MAYBE_THRESHOLD,        0.0, 100.0),
-        "fallback_keep":             _read_float("fallback_keep",             DEFAULT_FALLBACK_KEEP,          0.0, 100.0),
-        "fallback_maybe":            _read_float("fallback_maybe",            DEFAULT_FALLBACK_MAYBE,         0.0, 100.0),
-        "fallback_sharpness_floor":  _read_float("fallback_sharpness_floor",  DEFAULT_FALLBACK_SHARPNESS_FLOOR, 0.0, 100.0),
-        "face_sharpness_floor":      _read_float("face_sharpness_floor",      DEFAULT_FACE_SHARP_FLOOR,       0.0, 100.0),
-        "reject_soft_face":           _read_bool ("reject_soft_face",           DEFAULT_REJECT_SOFT_FACE),
-        "reject_blurry_frame":        _read_bool ("reject_blurry_frame",        DEFAULT_REJECT_BLURRY_FRAME),
-        "reject_low_iqa":             _read_bool ("reject_low_iqa",             DEFAULT_REJECT_LOW_IQA),
-        "iqa_floor":                  _read_float("iqa_floor",                  DEFAULT_IQA_FLOOR, 0.0, 100.0),
-        "reject_closed_eyes":         _read_bool ("reject_closed_eyes",         DEFAULT_REJECT_CLOSED_EYES),
-        "reject_closed_eyes_all_faces": _read_bool ("reject_closed_eyes_all_faces", DEFAULT_REJECT_CLOSED_EYES_ALL_FACES),
-        "reject_reciprocal_rule":     _read_bool ("reject_reciprocal_rule",     DEFAULT_REJECT_RECIPROCAL_RULE),
-        "reject_above_iso_ceiling":   _read_bool ("reject_above_iso_ceiling",   DEFAULT_REJECT_ABOVE_ISO_CEILING),
-        "iso_ceiling":                _read_float("iso_ceiling",                DEFAULT_ISO_CEILING, 0.0, 204800.0),
-        "reject_high_background_distraction": _read_bool(
+        "keep_threshold":            f("keep_threshold",            DEFAULT_KEEP_THRESHOLD,         0.0, 100.0),
+        "maybe_threshold":           f("maybe_threshold",           DEFAULT_MAYBE_THRESHOLD,        0.0, 100.0),
+        "fallback_keep":             f("fallback_keep",             DEFAULT_FALLBACK_KEEP,          0.0, 100.0),
+        "fallback_maybe":            f("fallback_maybe",            DEFAULT_FALLBACK_MAYBE,         0.0, 100.0),
+        "fallback_sharpness_floor":  f("fallback_sharpness_floor",  DEFAULT_FALLBACK_SHARPNESS_FLOOR, 0.0, 100.0),
+        "face_sharpness_floor":      f("face_sharpness_floor",      DEFAULT_FACE_SHARP_FLOOR,       0.0, 100.0),
+        "reject_soft_face":           b("reject_soft_face",           DEFAULT_REJECT_SOFT_FACE),
+        "reject_blurry_frame":        b("reject_blurry_frame",        DEFAULT_REJECT_BLURRY_FRAME),
+        "reject_low_iqa":             b("reject_low_iqa",             DEFAULT_REJECT_LOW_IQA),
+        "iqa_floor":                  f("iqa_floor",                  DEFAULT_IQA_FLOOR, 0.0, 100.0),
+        "reject_closed_eyes":         b("reject_closed_eyes",         DEFAULT_REJECT_CLOSED_EYES),
+        "reject_closed_eyes_all_faces": b("reject_closed_eyes_all_faces", DEFAULT_REJECT_CLOSED_EYES_ALL_FACES),
+        "reject_reciprocal_rule":     b("reject_reciprocal_rule",     DEFAULT_REJECT_RECIPROCAL_RULE),
+        "reject_above_iso_ceiling":   b("reject_above_iso_ceiling",   DEFAULT_REJECT_ABOVE_ISO_CEILING),
+        "iso_ceiling":                f("iso_ceiling",                DEFAULT_ISO_CEILING, 0.0, 204800.0),
+        "reject_high_background_distraction": b(
             "reject_high_background_distraction", DEFAULT_REJECT_HIGH_BACKGROUND_DISTRACTION),
-        "background_distraction_ceiling":     _read_float(
+        "background_distraction_ceiling":     f(
             "background_distraction_ceiling", DEFAULT_BACKGROUND_DISTRACTION_CEILING, 0.5, 0.99),
         # PR3 boundary routing.
-        "auto_cull_uncertain_to_maybe": _read_bool(
+        "auto_cull_uncertain_to_maybe": b(
             "auto_cull_uncertain_to_maybe", DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE),
-        "uncertainty_threshold":        _read_float(
+        "uncertainty_threshold":        f(
             "uncertainty_threshold", DEFAULT_UNCERTAINTY_THRESHOLD, 0.0, 50.0),
         # Burst keep-cap / multi-keep post-pass.
-        "auto_cull_cap_burst_keeps": _read_bool(
+        "auto_cull_cap_burst_keeps": b(
             "auto_cull_cap_burst_keeps", DEFAULT_AUTO_CULL_CAP_BURST_KEEPS),
-        "max_burst_keeps": _read_float(
+        "max_burst_keeps": f(
             "max_burst_keeps", DEFAULT_MAX_BURST_KEEPS, 1.0, 10.0),
-        "burst_keep_margin": _read_float(
+        "burst_keep_margin": f(
             "burst_keep_margin", DEFAULT_BURST_KEEP_MARGIN, 0.0, 50.0),
-        "burst_keep_winner_delta": _read_float(
+        "burst_keep_winner_delta": f(
             "burst_keep_winner_delta", DEFAULT_BURST_KEEP_WINNER_DELTA, 0.0, 50.0),
-        "burst_keep_reject_delta": _read_float(
+        "burst_keep_reject_delta": f(
             "burst_keep_reject_delta", DEFAULT_BURST_KEEP_REJECT_DELTA, 0.0, 100.0),
-        "max_burst_maybes": _read_float(
+        "max_burst_maybes": f(
             "max_burst_maybes", DEFAULT_MAX_BURST_MAYBES, 0.0, 10.0),
     }
 

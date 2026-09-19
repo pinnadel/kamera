@@ -18,8 +18,9 @@ from backend.sources import sink_for
 from backend.sources.folder import _reject_to_system_trash_enabled
 from backend.file_mover import _DECISION_FOLDERS, resolve_dest_folder
 from backend.routers.settings import get_raw_jpeg_display_mode
-from backend.state import _decision_move_lock, _personal_model
-from phase3_learning.auto_trainer import maybe_train_async
+from backend.state import _decision_move_lock, model_for
+from phase3_learning.auto_trainer import _count_samples, maybe_train_async
+from phase3_learning.personal_model import min_decisions_for
 from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION, serialize_features
 
 logger = logging.getLogger(__name__)
@@ -131,7 +132,8 @@ def _compute_auto_decision(
     pay one SQL roundtrip; otherwise it's read fresh per call.
     """
     from phase1_technical.quality_analyzer import get_decision_thresholds
-    t = thresholds or get_decision_thresholds()
+    corpus = row.get("source_type") or "folder"
+    t = thresholds or get_decision_thresholds(corpus)
 
     sharpness  = row.get("sharpness_score") or 0
     face       = bool(row.get("face_detected"))
@@ -192,7 +194,8 @@ def _compute_auto_decision(
     # baseline by the bootstrap margin. Below that the model still renders
     # personal_score in the UI (so the user sees what it's learning) but the
     # automated K/M/X assignment falls back to quality thresholds.
-    info = _personal_model.info()
+    model = model_for(corpus)
+    info = model.info()
     if info.get("model_status") == "ready":
         ps = row.get("personal_score")
         # PR3 boundary routing: when the toggle is on we always go through
@@ -203,11 +206,11 @@ def _compute_auto_decision(
         # ensemble (pre-PR3 pickle, std=0.0) or std_dev is below the threshold.
         std = None
         if t.get("auto_cull_uncertain_to_maybe"):
-            ps_with_std = _personal_model.predict_with_uncertainty(row)
+            ps_with_std = model.predict_with_uncertainty(row)
             if ps_with_std is not None:
                 ps, std = ps_with_std
         elif ps is None:
-            ps = _personal_model.predict_personal_score(row)
+            ps = model.predict_personal_score(row)
 
         if ps is not None:
             if std is not None and std >= t.get("uncertainty_threshold", 8.0):
@@ -473,10 +476,11 @@ def _apply_decision(
                     image_id, companion_id, exc.detail,
                 )
 
-    # Fire-and-forget auto-train. Internally gated by sample count and a
-    # retrain-delta floor, so the daemon thread only actually runs when
-    # there's meaningful new data. Never blocks the user.
-    maybe_train_async(_personal_model)
+    # Fire-and-forget auto-train, aimed at the corpus this photo belongs to.
+    # Internally gated by sample count and a retrain-delta floor, so the
+    # daemon thread only actually runs when there's meaningful new data.
+    # Never blocks the user.
+    maybe_train_async(model_for(image_row.get("source_type") or "folder"))
 
     return {"image_id": image_id, "decision": decision, "new_path": new_path}
 
@@ -697,7 +701,7 @@ def _apply_undo(image_id: int, previous_path: str | None, _mirror: bool = True) 
     # Retrain the personal model so it stops weighting the undone sample.
     # Same fire-and-forget pattern as _apply_decision — gated internally on
     # sample count + retrain-delta floor, never blocks the user.
-    maybe_train_async(_personal_model)
+    maybe_train_async(model_for(image_row.get("source_type") or "folder"))
 
     return {"status": "ok", "image_id": image_id, "decision": None, "new_path": new_path}
 
@@ -887,6 +891,35 @@ def _reject_destination(source_folder: str | None) -> dict:
     return {"mode": "folder", "label": dest.name, "undoable": True}
 
 
+def _corpus_for_source(source_folder: str | None) -> str:
+    """Training corpus a tab belongs to. Mirrors images.source_type."""
+    return "photos" if source_folder and is_photos_source_folder(source_folder) else "folder"
+
+
+def _require_auto_cull_model(corpus: str) -> None:
+    """Refuse auto-cull on a corpus whose model has not earned the ready tier.
+
+    Folder is exempt: without a model it falls back to quality thresholds,
+    which work on RAW. On the Photos corpus they do not — half an iPhone
+    library scores >= 95 sharpness and overall_score's median is 93, so a
+    threshold pass there stamps Keep on most of the album rather than culling
+    it. Better to say "not yet" than to hand back a confident wrong answer.
+    """
+    if corpus == "folder":
+        return
+    if model_for(corpus).info().get("model_status") == "ready":
+        return
+    have = _count_samples(corpus)
+    need = min_decisions_for(corpus)
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Auto-cull needs a trained {corpus} model — {have} of {need} "
+            f"decisions so far. Keep culling by hand and it switches itself on."
+        ),
+    )
+
+
 @router.get("/auto-cull/preview")
 def auto_cull_preview(
     source_folder: str | None = None,
@@ -903,12 +936,8 @@ def auto_cull_preview(
     dedup deliberately does NOT use the grouping time-gap (see
     _group_undecided_into_bursts); grouping here is visual-similarity only.
     """
-    if is_photos_source_folder(source_folder):
-        raise HTTPException(
-            status_code=400,
-            detail="Auto-cull is not available for Photos albums — it runs on "
-                   "the personal model, which is trained on camera photos only",
-        )
+    corpus = _corpus_for_source(source_folder)
+    _require_auto_cull_model(corpus)
     with get_db() as conn:
         if source_folder is not None:
             rows = conn.execute(
@@ -916,13 +945,13 @@ def auto_cull_preview(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
-                  -- Auto-cull is folder-only: it runs on the personal
-                  -- model, which trains on the folder corpus and has
-                  -- never seen a Photos album's distribution.
-                  AND i.source_type = 'folder'
+                  -- Scoped to one corpus: each source_type is judged by the
+                  -- model trained on its own distribution, and the thresholds
+                  -- below are read for that corpus too.
+                  AND i.source_type = ?
                   AND i.source_folder = ?
                 """,
-                (source_folder,),
+                (corpus, source_folder),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -930,22 +959,21 @@ def auto_cull_preview(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
-                  -- Auto-cull is folder-only: it runs on the personal
-                  -- model, which trains on the folder corpus and has
-                  -- never seen a Photos album's distribution.
-                  AND i.source_type = 'folder'
-                """
+                  AND i.source_type = ?
+                """,
+                (corpus,),
             ).fetchall()
 
     rows_dicts = [dict(r) for r in rows]
 
-    if _personal_model.ready and rows_dicts:
-        personal_scores = _personal_model.predict_batch(rows_dicts)
+    cull_model = model_for(corpus)
+    if cull_model.ready and rows_dicts:
+        personal_scores = cull_model.predict_batch(rows_dicts)
         for row, ps in zip(rows_dicts, personal_scores):
             row["personal_score"] = ps
 
     from phase1_technical.quality_analyzer import get_decision_thresholds
-    thresholds = get_decision_thresholds()
+    thresholds = get_decision_thresholds(corpus)
 
     counts: dict[str, int] = {"keep": 0, "maybe": 0, "reject": 0}
     # Bucket every reject reason emitted by _compute_auto_decision into the
@@ -1041,16 +1069,17 @@ def auto_cull_preview(
             # bucketed — the promoted winners count as maybe now.
             rule_counts[_REASON_BUCKET.get(original_reason, "low_score")] += 1
 
-    info = _personal_model.info()
+    info = cull_model.info()
     using_personal = info.get("model_status") == "ready"
     return {
         "scoring_mode": "personal" if using_personal else "threshold",
         "scoring_info": (
-            f"trained on {_personal_model.training_size} decisions"
+            f"trained on {cull_model.training_size} {corpus} decisions"
             if using_personal
             else (
-                f"model still learning ({_personal_model.training_size}/50 samples) — using quality thresholds"
-                if _personal_model.ready
+                f"model still learning ({cull_model.training_size}/{info.get('min_decisions')} "
+                f"samples) — using quality thresholds"
+                if cull_model.ready
                 else "quality thresholds"
             )
         ),
@@ -1481,12 +1510,8 @@ def run_auto_cull(
     dedup groups by visual similarity ONLY, not the grouping time-gap (see
     _group_undecided_into_bursts for why the time-gap was inert on fast bursts).
     """
-    if is_photos_source_folder(source_folder):
-        raise HTTPException(
-            status_code=400,
-            detail="Auto-cull is not available for Photos albums — it runs on "
-                   "the personal model, which is trained on camera photos only",
-        )
+    corpus = _corpus_for_source(source_folder)
+    _require_auto_cull_model(corpus)
     with get_db() as conn:
         if source_folder is not None:
             rows = conn.execute(
@@ -1494,13 +1519,13 @@ def run_auto_cull(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
-                  -- Auto-cull is folder-only: it runs on the personal
-                  -- model, which trains on the folder corpus and has
-                  -- never seen a Photos album's distribution.
-                  AND i.source_type = 'folder'
+                  -- Scoped to one corpus: each source_type is judged by the
+                  -- model trained on its own distribution, and the thresholds
+                  -- below are read for that corpus too.
+                  AND i.source_type = ?
                   AND i.source_folder = ?
                 """,
-                (source_folder,),
+                (corpus, source_folder),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -1508,22 +1533,21 @@ def run_auto_cull(
                 SELECT i.* FROM images i
                 LEFT JOIN decisions d ON d.image_id = i.id
                 WHERE i.analysis_status = 'done' AND d.decision IS NULL
-                  -- Auto-cull is folder-only: it runs on the personal
-                  -- model, which trains on the folder corpus and has
-                  -- never seen a Photos album's distribution.
-                  AND i.source_type = 'folder'
-                """
+                  AND i.source_type = ?
+                """,
+                (corpus,),
             ).fetchall()
 
     rows_dicts = [dict(r) for r in rows]
 
-    if _personal_model.ready and rows_dicts:
-        personal_scores = _personal_model.predict_batch(rows_dicts)
+    cull_model = model_for(corpus)
+    if cull_model.ready and rows_dicts:
+        personal_scores = cull_model.predict_batch(rows_dicts)
         for row, ps in zip(rows_dicts, personal_scores):
             row["personal_score"] = ps
 
     from phase1_technical.quality_analyzer import get_decision_thresholds
-    thresholds = get_decision_thresholds()
+    thresholds = get_decision_thresholds(corpus)
 
     # Phase 1: compute decisions for every row WITHOUT applying them yet.
     # Capturing reasons here is what lets the burst post-pass know whether
@@ -1625,7 +1649,7 @@ def run_auto_cull(
         except HTTPException as exc:
             errors.append({"id": row["id"], "error": exc.detail})
 
-    info = _personal_model.info()
+    info = cull_model.info()
     using_personal = info.get("model_status") == "ready"
     return {
         "scoring_mode": "personal" if using_personal else "threshold",

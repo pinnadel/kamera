@@ -579,6 +579,7 @@ export default function App() {
     setSettings,
     loadSettings,
     modelInfo,
+    photosModelInfo,
     loadModelInfo,
     trainModel,
     trainingModel,
@@ -2635,6 +2636,7 @@ export default function App() {
             localStorage.setItem('pca.autoGenerateExplanation', String(v))
           }}
           modelInfo={modelInfo}
+          photosModelInfo={photosModelInfo}
           onTrain={trainModel}
           training={trainingModel}
           onExportModel={exportTasteModel}

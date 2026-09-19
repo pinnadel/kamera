@@ -25,10 +25,10 @@ from phase1_technical.exposure import compute_histogram as _compute_histogram
 from backend.database import get_bool_setting, get_db, get_setting, write_shooting_log
 from backend.state import (
     PREVIEW_CACHE_DIR,
-    _personal_model,
     _progress,
     _record_error,
     _stop_event,
+    invalidate_all,
     watcher,
 )
 from phase1_technical.exif_parser import extract_exif
@@ -616,7 +616,7 @@ def analyze(request: AnalyzeRequest):
         write_shooting_log(conn, **_shooting_log_kwargs(path, result, exif, sample_uuid))
 
     # Re-analysis can change features → drop the stale cached score for this id.
-    _personal_model.invalidate(image_id)
+    invalidate_all([image_id])
 
     return AnalyzeResponse(
         image_id=image_id,
@@ -872,7 +872,7 @@ def _run_batch(
                             ),
                         ).fetchone()
                         if inserted is not None:
-                            _personal_model.invalidate(inserted["id"])
+                            invalidate_all([inserted["id"]])
                             # The shooting log answers "what are my camera
                             # habits" — focal lengths, apertures, bodies. iPhone
                             # shots out of a Photos album would skew every

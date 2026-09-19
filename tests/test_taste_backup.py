@@ -79,9 +79,12 @@ def backup_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path
     monkeypatch.setattr(fresh, "load", lambda path=pkl_path: _orig_load(path))
     monkeypatch.setattr(fresh, "reset", lambda path=pkl_path: _orig_reset(path))
     monkeypatch.setattr(model_mod, "_personal_model", fresh)
+    # The import path resets every corpus's model, so the registry it loops
+    # over must point at the same throwaway instance the assertions inspect.
+    monkeypatch.setattr(model_mod, "_personal_models", {"folder": fresh})
 
-    auto_trainer._running = False
-    auto_trainer._last_auto_train_at = None
+    auto_trainer._running = {}
+    auto_trainer._last_auto_train_at = {}
     yield db_path
 
 

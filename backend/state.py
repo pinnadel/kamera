@@ -83,4 +83,33 @@ def _record_error(err: dict) -> None:
 # Singletons initialised once at module load
 # ---------------------------------------------------------------------------
 watcher: FolderWatcher = FolderWatcher(DEFAULT_DB_PATH, on_error=_record_error)
-_personal_model: PersonalModel = PersonalModel()
+
+# One model per training corpus. Corpus names are the same strings as
+# images.source_type, so a row picks its model straight from its source type.
+# `_personal_model` stays bound to the folder model — it is the name every
+# existing call site imports, and the folder corpus is what they all meant.
+_personal_models: dict[str, PersonalModel] = {
+    "folder": PersonalModel("folder"),
+    "photos": PersonalModel("photos"),
+}
+_personal_model: PersonalModel = _personal_models["folder"]
+
+
+def model_for(corpus: str) -> PersonalModel:
+    """Model for a corpus / source_type. Unknown names fall back to folder."""
+    return _personal_models.get(corpus, _personal_model)
+
+
+def invalidate_all(image_ids: list[int]) -> None:
+    """Drop cached scores for these images in every model.
+
+    Callers know an image changed but not which corpus owns it, and a stale
+    score in the model that happens not to own the row is just as wrong.
+    """
+    for model in _personal_models.values():
+        model.invalidate_many(image_ids)
+
+
+def clear_all_caches() -> None:
+    for model in _personal_models.values():
+        model.clear_cache()

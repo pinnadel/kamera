@@ -223,6 +223,41 @@ that manual decision *is* recorded as a training sample, so the model learns
 from exactly the moments it got you wrong. A photo auto-culled and never
 touched contributes nothing to training.
 
+### If I cull my Apple Photos library by hand, does that train anything?
+
+**Short answer:** Yes, but into a *second* model, not the camera one — and that
+model stays silent until its corpus is much larger than the camera model's was.
+
+There is one model per corpus. `training_samples.corpus` tags each sample
+`folder` (camera) or `photos` (Apple Photos), taken straight from
+`images.source_type` ([decisions.py:409](backend/routers/decisions.py#L409)), and
+[`state.model_for()`](backend/state.py) hands each row to the model trained on
+its own distribution. They never mix: an iPhone HEIC and a RAF score on
+incompatible sharpness / aperture / ISO distributions, so one GBR over both
+would learn contradictory labels — the same reasoning as the RAW+JPEG
+companion's `_train=False`.
+
+Two things differ for the Photos model:
+
+- **Its training floor is 150, not 30** ([`min_decisions_for()`](phase3_learning/personal_model.py)).
+  An iPhone's computational pipeline flattens exactly the variance the model
+  learns from, so a fit at 30 samples would be noise wearing a model's clothes.
+- **Both models now predict an *absolute* score** rather than adjusting
+  `overall_score`. For Photos that base is unusable: measured on 449 rows, `overall_score` has a median of 93.1
+  and half the corpus sits inside a six-point band, because 50% of iPhone photos
+  score ≥95 sharpness. The camera model switched for a different reason — a
+  bootstrap sweep showed pure GBR beats the old offset formula there too (0.741
+  vs 0.713 ordinal accuracy). A side effect worth knowing: `personal_score` is
+  no longer a quality percentage in either model, which is why the decision
+  cutoffs are derived from the fit instead of typed in.
+
+Until the Photos model reaches the ready tier, Photos rows show no
+`personal_score` and auto-cull on a Photos tab declines with a count of how many
+decisions are still needed ([`_require_auto_cull_model`](backend/routers/decisions.py)).
+That refusal is deliberate: falling back to the quality thresholds there would
+mark roughly 70% of an iPhone library as Keep. Settings → Model shows the
+corpus filling up.
+
 ---
 
 ## Files & workflow

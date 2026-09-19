@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from backend.constants import is_photos_source_folder
 from backend.database import get_db, get_folder_overrides, set_folder_override
-from backend.state import PREVIEW_CACHE_DIR, _personal_model
+from backend.state import PREVIEW_CACHE_DIR, clear_all_caches
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +387,7 @@ def update_settings(request: SettingsRequest):
                 )
 
     if weight_changed:
-        _personal_model.clear_cache()
+        clear_all_caches()
 
     if sidecar_pref_changed:
         # The toggle only changes how RAW files render (sidecar vs. demosaic),

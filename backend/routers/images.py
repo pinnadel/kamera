@@ -17,7 +17,10 @@ from backend.constants import (
 )
 from backend.database import get_db
 from backend.routers.settings import get_raw_jpeg_display_mode
-from backend.state import PREVIEW_CACHE_DIR, _decision_move_lock, _personal_model, _progress
+from backend.state import (
+    PREVIEW_CACHE_DIR, _decision_move_lock, _progress,
+    clear_all_caches, invalidate_all, model_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +100,7 @@ def _delete_image_rows(ids: list[int]) -> int:
         conn.execute(f"DELETE FROM bursts         WHERE hero_image_id IN ({placeholders})", ids)
         conn.execute(f"DELETE FROM images         WHERE id IN ({placeholders})", ids)
 
-    _personal_model.invalidate_many(ids)
+    invalidate_all(ids)
 
     previews_removed = 0
     if PREVIEW_CACHE_DIR.exists():
@@ -176,20 +179,23 @@ def list_images(source_folder: str | None = None):
     rows_dicts = [dict(row) for row in rows]
     rows_dicts = _filter_raw_jpeg_pairs(rows_dicts)
 
-    # Annotate with personal_score if the model has been trained.
-    # predict_batch() calls pipeline.predict() once for all N rows — fast.
-    #
-    # Photos-album rows are scored None regardless: _personal_model is trained
-    # on the 'folder' corpus only, so running it over iPhone HEICs would emit a
-    # confident number from a model that has never seen that distribution. A
-    # separate Photos model is deferred until its corpus is worth training.
-    if _personal_model.ready:
-        personal_scores = _personal_model.predict_batch(rows_dicts)
-        for img, ps in zip(rows_dicts, personal_scores):
-            img["personal_score"] = None if img.get("source_type") == "photos" else ps
-    else:
-        for img in rows_dicts:
-            img["personal_score"] = None
+    # Annotate with personal_score, each source_type scored by the model
+    # trained on its own corpus. Running the camera model over iPhone HEICs
+    # would emit a confident number from a model that has never seen that
+    # distribution, so rows whose corpus has no trained model stay None.
+    # predict_batch() calls pipeline.predict() once per corpus — still fast.
+    rows_by_corpus: dict[str, list[int]] = {}
+    for idx, img in enumerate(rows_dicts):
+        img["personal_score"] = None
+        rows_by_corpus.setdefault(img.get("source_type") or "folder", []).append(idx)
+
+    for corpus, indices in rows_by_corpus.items():
+        model = model_for(corpus)
+        if not model.ready:
+            continue
+        scores = model.predict_batch([rows_dicts[i] for i in indices])
+        for idx, ps in zip(indices, scores):
+            rows_dicts[idx]["personal_score"] = ps
 
     return rows_dicts
 
@@ -456,7 +462,7 @@ def clear_analysis():
         conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('images','bursts','decisions')")
 
     # Every cached personal_score now refers to a deleted row.
-    _personal_model.clear_cache()
+    clear_all_caches()
 
     # Wipe preview cache so stale thumbnails can't outlive their DB row.
     previews_removed = 0

@@ -137,7 +137,13 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
 
   useEffect(() => {
     fetch(`${API}/auto-cull/preview${query}`)
-      .then(r => { if (!r.ok) throw new Error(`${r.status}`); return r.json() })
+      .then(async r => {
+        const data = await r.json().catch(() => ({}))
+        // The refusal carries the reason — a Photos tab whose model has not
+        // reached the ready tier reports how many decisions are still missing.
+        if (!r.ok) throw new Error(data.detail || `${r.status}`)
+        return data
+      })
       .then(setPreview)
       .catch(err => setPreviewError(err.message || 'Could not load preview'))
       .finally(() => setLoading(false))
