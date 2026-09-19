@@ -42,6 +42,7 @@ CLASSES: tuple[str, ...] = (
     "decision_missing",  # marker there, nothing here — decided in Photos
     "not_in_album",      # asset left the album
     "asset_gone",        # asset no longer exists in the library
+    "not_analyzed",      # in the album, KaMeRa has never analysed it
 )
 
 # What may be done about each class. The first entry is the default, and only
@@ -52,6 +53,12 @@ ACTIONS: dict[str, tuple[str, ...]] = {
     "decision_missing": ("skip", "import", "clear"),
     "not_in_album":     ("skip", "drop"),
     "asset_gone":       ("skip", "drop"),
+    # The only class with nothing to write: these photos have no row to fix.
+    # "analyze" hands the album back to the existing analyze flow, which
+    # re-enumerates it and skips what is already done — see the reconcile
+    # endpoint. A Smart Album gains members on its own, so this is the one
+    # kind of drift that appears without the user touching anything.
+    "not_analyzed":     ("skip", "analyze"),
 }
 
 DEFAULT_ACTIONS: dict[str, str] = {name: opts[0] for name, opts in ACTIONS.items()}
@@ -107,6 +114,7 @@ def classify(
     rows: list[dict],
     in_album: dict[str, list[str]],
     library_uuids: set[str],
+    members: dict[str, dict] | None = None,
 ) -> Diff:
     """Compare KaMeRa's rows against the library's actual keywords.
 
@@ -114,6 +122,9 @@ def classify(
     id, filename, photos_uuid, decision (None when undecided).
     `in_album` maps uuid → keywords for every asset currently in the album.
     `library_uuids` is every uuid in the library.
+    `members` maps uuid → {filename, is_movie, has_original, supported} and is
+    what makes the `not_analyzed` class possible; omit it and that class stays
+    empty, which is what callers predating it get.
     """
     diff = Diff()
     seen_uuids: set[str] = set()
@@ -165,12 +176,35 @@ def classify(
         else:
             diff.classes["keyword_foreign"].append(entry)
 
-    # Album assets carrying a marker that no row of ours accounts for.
+    # Album assets no row of ours accounts for. A marker still means
+    # "analysed elsewhere", which stays a bare count — inventing a row for it
+    # would claim an analysis that never ran here. Everything else is simply
+    # new: a photo that joined the album since the last run. Movies and
+    # formats KaMeRa cannot decode are not drift, they are permanent
+    # non-members of the analysable set, and reporting 243 videos as
+    # actionable would bury the two photos that matter.
     for uuid, keywords in in_album.items():
         if uuid in seen_uuids:
             continue
         if marker_of(keywords) is not None:
             diff.unmanaged_keyword += 1
+            continue
+        meta = (members or {}).get(uuid)
+        if meta is None or meta["is_movie"] or not meta["supported"]:
+            continue
+        diff.classes["not_analyzed"].append({
+            "image_id": None,
+            "filename": meta["filename"],
+            "photos_uuid": uuid,
+            "decision": None,
+            "keyword": None,
+            # False means the original lives only in iCloud. Analysis cannot
+            # read it, and substituting the 768×1024 derivative would put a
+            # meaningless sharpness score into training_samples — so the UI
+            # has to say "download this in Photos first" rather than offer a
+            # button that would quietly skip it again.
+            "has_original": meta["has_original"],
+        })
 
     return diff
 

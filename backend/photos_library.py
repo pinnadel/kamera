@@ -551,10 +551,10 @@ def album_assets(library_path: str, album_uuid: str, refresh: bool = False) -> t
 
 def album_keyword_state(
     library_path: str, album_uuid: str, refresh: bool = True
-) -> tuple[dict[str, list[str]], set[str]]:
+) -> tuple[dict[str, list[str]], set[str], dict[str, dict]]:
     """Read every album asset's keywords, plus the library's whole UUID set.
 
-    Returns `(in_album, library_uuids)`:
+    Returns `(in_album, library_uuids, members)`:
       - `in_album` maps asset UUID → its keywords, for EVERY photo in the
         album. Deliberately unfiltered, unlike album_assets(): a movie, an
         unsupported format or an original evicted by "Optimize Mac Storage" is
@@ -562,6 +562,13 @@ def album_keyword_state(
         `not_in_album` and invite dropping a perfectly good row.
       - `library_uuids` is every asset UUID in the library, which is what
         separates "this photo left the album" from "this photo is gone".
+      - `members` maps the same UUIDs to {filename, is_movie, has_original,
+        supported}, mirroring album_assets()'s three drop reasons. Without it
+        a reconcile cannot tell a photo KaMeRa has simply never analysed from
+        a movie it is never going to analyse, and every album's 200-odd videos
+        would be reported as drift. `supported` falls back to the original
+        filename's suffix when the original is not on this Mac, so an evicted
+        HEIC still reads as a photo KaMeRa would take.
 
     `refresh=True` by default: the catalogue is cached per library path, and a
     reconcile's entire job is to see keywords the user changed in Photos since
@@ -576,12 +583,23 @@ def album_keyword_state(
     # meaning. It does mean a Smart Album built on KaMeRa keywords will show
     # members coming and going as you cull — expected, and the reason
     # `not_in_album` still defaults to leaving rows alone.
-    in_album = {
-        photo.uuid: list(photo.keywords or [])
-        for photo in _album_photos(db, library_path, album_uuid)
-    }
+    photos = _album_photos(db, library_path, album_uuid)
+    in_album = {photo.uuid: list(photo.keywords or []) for photo in photos}
+
+    members: dict[str, dict] = {}
+    for photo in photos:
+        path = photo.path
+        name = photo.original_filename or (Path(path).name if path else photo.uuid)
+        suffix = Path(path).suffix.lower() if path else Path(name).suffix.lower()
+        members[photo.uuid] = {
+            "filename": name,
+            "is_movie": bool(photo.ismovie),
+            "has_original": bool(path) and not photo.ismissing,
+            "supported": suffix in SUPPORTED_EXTENSIONS,
+        }
+
     library_uuids = {photo.uuid for photo in db.photos()}
-    return in_album, library_uuids
+    return in_album, library_uuids, members
 
 
 def album_name(library_path: str, album_uuid: str) -> str | None:

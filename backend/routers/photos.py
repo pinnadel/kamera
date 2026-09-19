@@ -428,7 +428,7 @@ def _build_diff(source_folder: str):
     _require_open_library(tab["library_path"])
 
     try:
-        in_album, library_uuids = photos_library.album_keyword_state(
+        in_album, library_uuids, members = photos_library.album_keyword_state(
             tab["library_path"], tab["album_uuid"]
         )
     except KeyError:
@@ -444,7 +444,7 @@ def _build_diff(source_folder: str):
         raise HTTPException(status_code=403, detail=_ACCESS_HELP)
 
     rows = _tab_rows(source_folder)
-    diff = photos_reconcile.classify(rows, in_album, library_uuids)
+    diff = photos_reconcile.classify(rows, in_album, library_uuids, members)
     return tab, rows, diff
 
 
@@ -509,9 +509,22 @@ def photos_album_reconcile(request: ReconcileRequest):
         })
         logger.warning("reconcile: %s failed: %s", entry.get("filename"), detail)
 
+    analysis_requested = 0
+
     for name in photos_reconcile.CLASSES:
         action = actions[name]
         if action == "skip":
+            continue
+
+        if name == "not_analyzed":
+            # The one class with nothing to write — these photos have no row
+            # to fix. Report the count and let the caller start the ordinary
+            # analyze flow, which re-enumerates the album and skips what is
+            # already done. Starting the batch here instead would mean a
+            # second copy of that starter, and it is where the resume bug of
+            # 2026-09-19 lived.
+            applied[name] = len(diff.classes[name])
+            analysis_requested = applied[name]
             continue
 
         for entry in diff.classes[name]:
@@ -589,4 +602,8 @@ def photos_album_reconcile(request: ReconcileRequest):
         "dropped_rows": dropped,
         "errors": errors,
         "actions": actions,
+        # > 0 means the user chose "analyze" for the not_analyzed class. This
+        # endpoint deliberately does not start the batch itself; the caller
+        # runs the normal analyze flow for this album afterwards.
+        "analysis_requested": analysis_requested,
     }

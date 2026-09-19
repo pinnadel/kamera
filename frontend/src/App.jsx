@@ -2673,7 +2673,16 @@ export default function App() {
         <PhotosReconcileModal
           sourceFolder={activeTab.folderPath}
           onClose={() => setReconcileOpen(false)}
-          onComplete={() => { loadImages(); loadModelInfo() }}
+          onComplete={(data) => {
+            loadImages()
+            loadModelInfo()
+            // Reconcile reports which photos joined the album but never
+            // starts the batch itself — that stays the analyze flow's job,
+            // so there is only one copy of it. Photos still in iCloud are
+            // listed in the modal and will be skipped again here; the run
+            // is still right for the rest.
+            if (data?.analysis_requested > 0) resumeAnalysisForTab(activeTab)
+          }}
           onToast={addToast}
         />
       )}

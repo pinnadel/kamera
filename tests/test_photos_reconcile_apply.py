@@ -89,11 +89,23 @@ def env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
                  f"kamera-{uuid}", SOURCE, uuid),
             )
 
-    def set_library(in_album: dict[str, list[str]], library_uuids: set[str] | None = None):
+    def set_library(
+        in_album: dict[str, list[str]],
+        library_uuids: set[str] | None = None,
+        members: dict[str, dict] | None = None,
+    ):
         uuids = library_uuids if library_uuids is not None else set(in_album)
+        # Default every member to an ordinary, locally-available photo: these
+        # tests are about keyword drift, and only the not_analyzed ones care
+        # what kind of asset it is.
+        meta = members if members is not None else {
+            uuid: {"filename": f"{uuid}.HEIC", "is_movie": False,
+                   "has_original": True, "supported": True}
+            for uuid in in_album
+        }
         monkeypatch.setattr(
             photos_router.photos_library, "album_keyword_state",
-            lambda _lib, _alb: (in_album, uuids),
+            lambda _lib, _alb: (in_album, uuids, meta),
         )
 
     def decide(image_id: int, decision: str):
@@ -381,3 +393,74 @@ def test_a_deleted_album_is_named_in_the_error(env, monkeypatch) -> None:
 
     assert exc.value.status_code == 404
     assert "KaMeRa" in exc.value.detail
+
+
+# ── not_analyzed ────────────────────────────────────────────────────────────
+#
+# The one class with nothing to write. Reconcile reports the count; the caller
+# runs the ordinary analyze flow for the album afterwards, which re-enumerates
+# it and skips what is already done.
+
+
+def test_new_album_photos_are_reported_but_nothing_is_written(env) -> None:
+    db, sink, set_library, decide = env
+    decide(1, "keep")
+    set_library(
+        {"u1": [KEEP], "u2": [], "new-1": [], "new-2": []},
+        members={
+            "u1":    {"filename": "IMG_1.HEIC", "is_movie": False,
+                      "has_original": True, "supported": True},
+            "u2":    {"filename": "IMG_2.HEIC", "is_movie": False,
+                      "has_original": True, "supported": True},
+            "new-1": {"filename": "IMG_3951.HEIC", "is_movie": False,
+                      "has_original": True, "supported": True},
+            "new-2": {"filename": "IMG_3949.HEIC", "is_movie": False,
+                      "has_original": False, "supported": True},
+        },
+    )
+
+    result = _reconcile({"not_analyzed": "analyze"})
+
+    assert result["applied"]["not_analyzed"] == 2
+    assert result["analysis_requested"] == 2
+    assert result["dropped_rows"] == 0
+    assert result["errors"] == []
+    # No row exists for these, so nothing may be written on their behalf.
+    assert not any(c[1] in ("new-1", "new-2") for c in sink.calls)
+
+
+def test_skipping_new_photos_requests_no_analysis(env) -> None:
+    db, sink, set_library, decide = env
+    decide(1, "keep")
+    set_library(
+        {"u1": [KEEP], "u2": [], "new-1": []},
+        members={
+            u: {"filename": f"{u}.HEIC", "is_movie": False,
+                "has_original": True, "supported": True}
+            for u in ("u1", "u2", "new-1")
+        },
+    )
+
+    result = _reconcile({})   # default is skip
+
+    assert result["analysis_requested"] == 0
+    assert result["applied"]["not_analyzed"] == 0
+
+
+def test_a_rowless_new_photo_never_reaches_the_row_lookup(env) -> None:
+    """not_analyzed entries carry image_id=None. Falling through to the
+    per-row loop would raise "row no longer exists" for every one of them and
+    report the album's new photos as errors."""
+    db, sink, set_library, decide = env
+    decide(1, "keep")
+    set_library(
+        {"u1": [KEEP], "u2": [], "new-1": []},
+        members={
+            u: {"filename": f"{u}.HEIC", "is_movie": False,
+                "has_original": True, "supported": True}
+            for u in ("u1", "u2", "new-1")
+        },
+    )
+
+    result = _reconcile({"not_analyzed": "analyze"})
+    assert result["errors"] == []

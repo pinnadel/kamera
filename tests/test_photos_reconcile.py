@@ -135,6 +135,91 @@ def test_unmarked_album_asset_we_never_analysed_is_not_counted() -> None:
     assert d.unmanaged_keyword == 0
 
 
+# ── not_analyzed: photos that joined the album ──────────────────────────────
+#
+# A Smart Album is a stored query, so it gains members on its own — this is
+# the only drift class that appears without the user touching KaMeRa at all.
+
+
+def meta(filename: str = "IMG_NEW.HEIC", *, movie: bool = False,
+         original: bool = True, supported: bool = True) -> dict:
+    return {"filename": filename, "is_movie": movie,
+            "has_original": original, "supported": supported}
+
+
+def test_a_new_album_photo_is_not_analyzed() -> None:
+    d = classify(
+        [row(1, "a", "keep")], {"a": [KEEP], "b": []}, {"a", "b"},
+        {"a": meta("IMG_1.HEIC"), "b": meta("IMG_3951.HEIC")},
+    )
+    assert [e["filename"] for e in d.classes["not_analyzed"]] == ["IMG_3951.HEIC"]
+    assert d.classes["not_analyzed"][0]["image_id"] is None
+    assert d.classes["not_analyzed"][0]["has_original"] is True
+
+
+def test_videos_are_not_drift() -> None:
+    """An album of 2116 holds 243 movies. Reporting them as actionable would
+    bury the two photos that actually need analysing."""
+    d = classify(
+        [row(1, "a", "keep")], {"a": [KEEP], "b": []}, {"a", "b"},
+        {"a": meta(), "b": meta("IMG_4000.MOV", movie=True)},
+    )
+    assert d.classes["not_analyzed"] == []
+
+
+def test_an_undecodable_format_is_not_drift() -> None:
+    d = classify(
+        [row(1, "a", "keep")], {"a": [KEEP], "b": []}, {"a", "b"},
+        {"a": meta(), "b": meta("scan.psd", supported=False)},
+    )
+    assert d.classes["not_analyzed"] == []
+
+
+def test_a_photo_whose_original_is_only_in_icloud_is_still_reported() -> None:
+    """It is exactly the case the user hits: new photos land in the album
+    before their originals download. Silently omitting them would look like
+    KaMeRa had already dealt with them."""
+    d = classify(
+        [row(1, "a", "keep")], {"a": [KEEP], "b": []}, {"a", "b"},
+        {"a": meta(), "b": meta("IMG_3951.HEIC", original=False)},
+    )
+    assert len(d.classes["not_analyzed"]) == 1
+    assert d.classes["not_analyzed"][0]["has_original"] is False
+
+
+def test_a_marked_asset_stays_a_bare_count() -> None:
+    """Marked-but-rowless means "analysed elsewhere". Promoting it to
+    not_analyzed would re-analyse something already judged."""
+    d = classify(
+        [row(1, "a", "keep")], {"a": [KEEP], "b": [REJECT]}, {"a", "b"},
+        {"a": meta(), "b": meta("IMG_9.HEIC")},
+    )
+    assert d.unmanaged_keyword == 1
+    assert d.classes["not_analyzed"] == []
+
+
+def test_an_asset_we_already_have_a_row_for_is_never_not_analyzed() -> None:
+    d = classify(
+        [row(1, "a", "keep")], {"a": [KEEP]}, {"a"}, {"a": meta()},
+    )
+    assert d.classes["not_analyzed"] == []
+
+
+def test_without_member_metadata_the_class_stays_empty() -> None:
+    """classify() is still callable with three arguments; a caller that
+    cannot supply metadata gets the pre-existing behaviour rather than a
+    crash or a silently wrong count."""
+    d = classify([row(1, "a", "keep")], {"a": [KEEP], "b": []}, {"a", "b"})
+    assert d.classes["not_analyzed"] == []
+
+
+def test_analyze_is_a_valid_action_and_skip_is_the_default() -> None:
+    assert DEFAULT_ACTIONS["not_analyzed"] == "skip"
+    assert validate_actions({"not_analyzed": "analyze"})["not_analyzed"] == "analyze"
+    with pytest.raises(ValueError):
+        validate_actions({"not_analyzed": "drop"})
+
+
 # ── counting ────────────────────────────────────────────────────────────────
 
 def test_checked_counts_rows_not_album_assets() -> None:

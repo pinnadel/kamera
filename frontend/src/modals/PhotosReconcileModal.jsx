@@ -61,6 +61,14 @@ const CLASS_COPY = {
       drop: { label: 'Remove from KaMeRa', hint: 'Delete the row' },
     },
   },
+  not_analyzed: {
+    title: 'In the album, never analysed',
+    body: 'These joined the album after the last run — a Smart Album picks up new photos on its own. They have no scores yet, so they cannot be culled.',
+    actions: {
+      skip:    { label: 'Leave alone',  hint: 'Analyse them later' },
+      analyze: { label: 'Analyse them', hint: 'Runs on this album; photos already analysed are skipped' },
+    },
+  },
 }
 
 // Actions that delete an images row. Used to tint the confirm button and to
@@ -74,6 +82,7 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
   if (!copy || entries.length === 0) return null
 
   const preview = showAll ? entries : entries.slice(0, 4)
+  const undownloaded = entries.filter(e => e.has_original === false).length
 
   return (
     <div className="border border-[rgba(255,255,255,0.07)] rounded-lg p-3 mb-2.5">
@@ -108,10 +117,32 @@ function ClassRow({ name, entries, choices, chosen, onChoose }) {
       </div>
       <p className="text-[11px] text-[#6a6b6c] mb-2">{copy.actions[chosen]?.hint}</p>
 
+      {/* Analysis reads the original file. An evicted one leaves only a
+          768×1024 derivative, and scoring that would put a meaningless
+          sharpness number into the training corpus — so these are skipped
+          again unless the user downloads them first. Better to say so than
+          to let the run quietly come back having done less than it said. */}
+      {undownloaded > 0 && chosen === 'analyze' && (
+        <p className="text-[11px] text-[#E8B84A] leading-relaxed mb-2">
+          {undownloaded === entries.length
+            ? `All ${undownloaded} are still in iCloud.`
+            : `${undownloaded} of these are still in iCloud.`}{' '}
+          Select them in Photos and choose Download Original first — analysis
+          needs the original file, not the preview.
+        </p>
+      )}
+
       <ul className="space-y-0.5">
         {preview.map(e => (
-          <li key={e.image_id} className="flex items-center gap-2 text-[11px] text-[#8a8a8a]">
+          /* not_analyzed entries have no row yet, so image_id is null for
+             every one of them — the uuid is what makes them distinct. */
+          <li key={e.image_id ?? e.photos_uuid} className="flex items-center gap-2 text-[11px] text-[#8a8a8a]">
             <span className="font-mono truncate">{e.filename}</span>
+            {e.has_original === false && (
+              <span className="text-[#E8B84A] shrink-0" title="The original is in iCloud, not on this Mac — analysis cannot read it">
+                · not downloaded
+              </span>
+            )}
             {e.decision && <DecisionWord kind={e.decision}>{e.decision}</DecisionWord>}
             {e.keyword && <span className="text-[#6a6b6c]">· {e.keyword}</span>}
             {e.ambiguous && (
@@ -182,13 +213,21 @@ export function PhotosReconcileModal({ sourceFolder, onClose, onComplete, onToas
 
       const changed = Object.values(data.applied || {}).reduce((a, b) => a + b, 0)
       const failed = (data.errors || []).length
+      // Queued-for-analysis photos are counted in `applied` but nothing was
+      // written for them, so saying "N reconciled" would overstate the run.
+      const queued = data.analysis_requested || 0
+      const written = changed - queued
+      const queuedNote = queued > 0 ? ` · analysing ${queued} new photo${queued === 1 ? '' : 's'}` : ''
       if (failed > 0) {
         onToast?.({
           type: 'warning',
-          message: `${changed} reconciled · ${failed} could not be applied`,
+          message: `${written} reconciled · ${failed} could not be applied${queuedNote}`,
         })
       } else {
-        onToast?.({ type: 'success', message: `${changed} photo${changed === 1 ? '' : 's'} reconciled` })
+        onToast?.({
+          type: 'success',
+          message: `${written} photo${written === 1 ? '' : 's'} reconciled${queuedNote}`,
+        })
       }
       onComplete?.(data)
       onClose()
