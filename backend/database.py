@@ -612,6 +612,13 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
              last_synced_at DATETIME
          )
          """),
+    # v53: how many analyzable assets the last enumeration of this album found.
+    # The Resume banner needs a denominator, and an album has no directory to
+    # walk — re-enumerating on every tab focus would mean an osxphotos read
+    # (or, for a Smart Album, AppleScript against a running Photos.app) just
+    # to draw a banner. The previous run already counted them, so store it.
+    (53, "Add asset_count to photos_albums",
+         "ALTER TABLE photos_albums ADD COLUMN asset_count INTEGER"),
 ]
 
 

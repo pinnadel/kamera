@@ -4,6 +4,38 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## Resuming a Photos album, which had never actually worked (2026-09-19, late)
+
+An interrupted 1868-photo album analysis could not be picked back up. The
+Resume banner was documented as folder-only and "cosmetic, because re-running
+the analysis already skips finished photos". That was true of the endpoint and
+false of everything downstream.
+
+`_run_batch` opens with `queued = {str(f) for f in to_analyze} | {str(folder /
+name) for name in skipped}`. For a Photos album `folder` is None. On a *fresh*
+album run `skipped` is empty, and an empty set comprehension never evaluates its
+body — so the `TypeError` fired only on a re-run, which is exactly and only what
+a resume is. It raised above the try block, so the `finally` that clears
+`_progress["running"]` never ran: the UI showed an analysis stuck at 0 of N,
+forever, with no way to stop it. `queued` is read only inside the folder-rescan
+branch, which was already gated on `folder is not None` — the guard existed one
+level away from the line that needed it.
+
+The UI half needed two things an album does not have. `/folders/unfinished`
+counts by walking a directory, so albums now use the `asset_count` their last
+run recorded (schema v53) — re-enumerating on every tab focus would mean an
+osxphotos read, or AppleScript against a running Photos.app for a Smart Album,
+just to draw a banner. And the banner's button needs to address the album:
+`album_uuid` was never stored on a tab, so every tab restored out of
+localStorage lacks it — which is the only kind of tab a resume ever happens on.
+`POST /analyze-photos-album` therefore accepts `source_folder` on its own and
+resolves the rest from `photos_albums`.
+
+`tests/test_photos_resume.py` (13 tests) covers the count, the addressing and
+the batch-setup regression; full suite 611.
+
+---
+
 ## A second taste model, and a base score that could not rank (2026-09-19, evening)
 
 Started as a status question — does culling in Photos already train anything? —

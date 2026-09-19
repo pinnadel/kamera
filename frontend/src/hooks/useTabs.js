@@ -7,7 +7,7 @@
 //   - Active-tab persistence (localStorage keyed by folder path, not uuid).
 //   - Lazy image load when a ready tab hasn't been fetched yet.
 //   - On-focus sync-folder scan to drop deleted files from the grid.
-//   - runAnalysisForTab, stopAnalysis, handleNewAnalysis, handleCloseTab,
+//   - runAnalysisForTab, resumeAnalysisForTab, stopAnalysis, handleNewAnalysis, handleCloseTab,
 //     handleTabWatchLive, confirmOverwrite, confirmCloseTab, reorderTabs,
 //     toggleWatchLive, startNewAnalysis.
 
@@ -205,8 +205,6 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     if (!activeTab) return
     if (activeTab.status !== 'ready') return
     if (!activeTab.folderPath) return
-    // No directory to walk, so no Resume banner for Photos albums in v1.
-    if (isPhotosTab(activeTab)) return
     let cancelled = false
     const include = activeTab.includeSubfolders ? '&include_subfolders=true' : ''
     fetch(`${API}/folders/unfinished?folder_path=${encodeURIComponent(activeTab.folderPath)}${include}`)
@@ -322,6 +320,23 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
       { includeSubfolders },
     )
   ), [startAnalysis])
+
+  // Picking up an interrupted batch. Both endpoints skip photos that are
+  // already analysis_status='done', so resume is just "run it again" — the
+  // only thing that differs is which endpoint and how the album is named.
+  // An album is identified by source_folder alone: album_uuid was never
+  // stored on the tab, so a tab restored from localStorage cannot supply it
+  // and the server looks it up in photos_albums instead.
+  const resumeAnalysisForTab = useCallback((tab) => {
+    if (!tab?.folderPath) return
+    if (isPhotosTab(tab)) {
+      return startAnalysis(
+        tab.id, tab.folderPath, '/analyze-photos-album',
+        { source_folder: tab.folderPath },
+      )
+    }
+    return runAnalysisForTab(tab.id, tab.folderPath, tab.includeSubfolders)
+  }, [startAnalysis, runAnalysisForTab])
 
   // The album's source_folder key is computed by the backend (it hashes the
   // library path), so it comes back in the response rather than being built
@@ -648,6 +663,7 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     loadImages,
     // Analysis lifecycle
     runAnalysisForTab,
+    resumeAnalysisForTab,
     runPhotosAnalysisForTab,
     photosPickerRequest,
     startPhotosAnalysis,

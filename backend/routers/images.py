@@ -287,13 +287,32 @@ def folder_unfinished(folder_path: str, include_subfolders: bool = False):
     match analyze_folder's walk semantics — otherwise a freshly-moved photo
     would count as "unfinished" forever.
     """
-    # Walks the filesystem — there is nothing to walk for an album. The
-    # Resume banner is folder-only for now.
+    # An album has no directory to walk, so the denominator comes from the
+    # asset_count the last analyze run recorded. Re-enumerating here instead
+    # would cost an osxphotos read on every tab focus — and for a Smart Album
+    # an AppleScript round-trip that fails outright unless Photos.app is open.
+    # Staleness is bounded and matches what the banner claims: it reports on
+    # the run that was interrupted, not on the album's live membership. Drift
+    # against Photos is what /photos-album/diff is for.
     if is_photos_source_folder(folder_path):
-        raise HTTPException(
-            status_code=400,
-            detail="Unfinished counts are not available for Photos albums",
-        )
+        with get_db() as conn:
+            album = conn.execute(
+                "SELECT asset_count FROM photos_albums WHERE source_folder = ?",
+                (folder_path,),
+            ).fetchone()
+            done_count = conn.execute(
+                "SELECT COUNT(*) FROM images "
+                "WHERE source_folder = ? AND analysis_status = 'done'",
+                (folder_path,),
+            ).fetchone()[0]
+        total = (album["asset_count"] if album else None) or 0
+        return {
+            "folder_path":   folder_path,
+            "total_on_disk": total,
+            "done_count":    done_count,
+            # An album that grew since the last run would go negative.
+            "unfinished":    max(0, total - done_count),
+        }
 
     folder = Path(folder_path)
     if not folder.exists() or not folder.is_dir():

@@ -33,8 +33,37 @@ router = APIRouter()
 
 
 class AnalyzePhotosAlbumRequest(BaseModel):
-    library_path: str
-    album_uuid: str
+    library_path: str | None = None
+    album_uuid: str | None = None
+    # Resume path. A tab reliably knows its source_folder — it *is* the tab's
+    # key — but not the album UUID, which was never stored on the tab and is
+    # therefore absent from every tab restored out of localStorage. Rather
+    # than parse the opaque photos:// key, let the server resolve it from
+    # photos_albums, which already holds the mapping.
+    source_folder: str | None = None
+
+
+def _resolve_album_target(request: AnalyzePhotosAlbumRequest) -> tuple[str, str]:
+    """Return (library_path, album_uuid) for a request that may only name a
+    source_folder."""
+    if request.library_path and request.album_uuid:
+        return request.library_path, request.album_uuid
+    if not request.source_folder:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either library_path + album_uuid, or source_folder",
+        )
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT library_path, album_uuid FROM photos_albums WHERE source_folder = ?",
+            (request.source_folder,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No known Photos album for {request.source_folder}",
+        )
+    return row["library_path"], row["album_uuid"]
 
 
 def _require_photos() -> None:
@@ -234,30 +263,31 @@ def analyze_photos_album(request: AnalyzePhotosAlbumRequest):
     file moves.
     """
     _require_photos()
-    _require_open_library(request.library_path)
+    library_path, album_uuid = _resolve_album_target(request)
+    _require_open_library(library_path)
 
     if _progress.get("running"):
         raise HTTPException(status_code=409, detail="Analysis already running")
 
     try:
         assets, skipped_counts = photos_library.album_assets(
-            request.library_path, request.album_uuid
+            library_path, album_uuid
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except SmartAlbumUnavailable as exc:
         raise _smart_album_unreachable(exc)
     except PhotosLibraryMissing:
-        raise _missing_library(request.library_path)
+        raise _missing_library(library_path)
     except PhotosAccessError as exc:
         logger.warning("Photos library not readable: %s", exc)
         raise HTTPException(status_code=403, detail=_ACCESS_HELP)
 
     source_folder = photos_library.photos_source_folder(
-        request.library_path, request.album_uuid
+        library_path, album_uuid
     )
     album_name = photos_library.album_name(
-        request.library_path, request.album_uuid
+        library_path, album_uuid
     ) or "Photos album"
 
     # Remember the album's identity before anything else: sink preflight and
@@ -267,16 +297,18 @@ def analyze_photos_album(request: AnalyzePhotosAlbumRequest):
         conn.execute(
             """
             INSERT INTO photos_albums
-                (source_folder, library_path, album_uuid, album_name, album_path, last_synced_at)
-            VALUES (?, ?, ?, ?, ?, DATETIME('now'))
+                (source_folder, library_path, album_uuid, album_name, album_path,
+                 asset_count, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, DATETIME('now'))
             ON CONFLICT(source_folder) DO UPDATE SET
                 library_path   = excluded.library_path,
                 album_name     = excluded.album_name,
                 album_path     = excluded.album_path,
+                asset_count    = excluded.asset_count,
                 last_synced_at = excluded.last_synced_at
             """,
-            (source_folder, request.library_path, request.album_uuid,
-             album_name, album_name),
+            (source_folder, library_path, album_uuid,
+             album_name, album_name, len(assets)),
         )
 
     common = {

@@ -244,9 +244,27 @@ other still claims. A refcount table is the fix; rare enough to leave documented
 so the original is decoded instead — correct, and worth re-checking only if HEIC
 decode ever shows up in a profile.
 
-**Resume banner** is off for Photos tabs (`/folders/unfinished` 400s on `photos://`).
-Re-running the analysis on the same tab already skips finished photos, so this is
-cosmetic. Relevant because a 1248-photo album will not be culled in one sitting.
+**Resume banner** — shipped 2026-09-19, and it was not cosmetic after all. The
+note below assumed "re-running the analysis on the same tab already skips
+finished photos", which was true of the *endpoint* and false of the batch:
+`_run_batch` built its `queued` set as `folder / name` over `skipped`, and
+`folder` is None for an album. A fresh run has an empty `skipped`, and an empty
+comprehension never evaluates its body — so the TypeError only appeared on a
+re-run, i.e. only ever on a resume. It raised before the try block, so the
+`finally` never cleared `_progress`, and the UI sat on a batch reporting 0 of N
+with nothing to click. Three parts to the fix:
+
+- the guard on `queued` (`backend/routers/analysis.py`);
+- `/folders/unfinished` answers for albums, using the `asset_count` (schema v53)
+  that the last analyze run recorded — an album has no directory to walk, and
+  re-enumerating per tab focus would mean an osxphotos read, or AppleScript
+  against a running Photos.app for a Smart Album;
+- `POST /analyze-photos-album` accepts `source_folder` alone, because
+  `album_uuid` was never stored on a tab and is therefore absent from every tab
+  restored out of localStorage — which is the only kind of tab a resume
+  happens on.
+
+Covered by `tests/test_photos_resume.py`.
 
 ---
 

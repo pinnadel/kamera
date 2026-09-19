@@ -715,7 +715,15 @@ def _run_batch(
     the watcher resumes.
     """
     analyzed, errors = 0, []
-    queued = {str(f) for f in to_analyze} | {str(folder / name) for name in skipped}
+    # `folder is None` for a Photos album, and there `skipped` holds original
+    # filenames rather than paths — so the join below is both impossible and
+    # meaningless. Only the folder rescan reads `queued`, and that is already
+    # gated on `folder is not None`, so an album needs no entries at all.
+    # This stayed invisible until the first re-run of an album: on a fresh run
+    # `skipped` is empty, and an empty comprehension never evaluates its body.
+    queued = {str(f) for f in to_analyze}
+    if folder is not None:
+        queued |= {str(folder / name) for name in skipped}
     last_rescan = time.monotonic()
 
     # Read settings ONCE before the loop. Settings can't change mid-batch,

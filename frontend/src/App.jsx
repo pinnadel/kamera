@@ -442,6 +442,7 @@ export default function App() {
     setResultDismissed,
     loadImages,
     runAnalysisForTab,
+    resumeAnalysisForTab,
     runPhotosAnalysisForTab,
     photosPickerRequest,
     startPhotosAnalysis,
@@ -3152,16 +3153,17 @@ export default function App() {
           </div>
         </div>
 
-        {/* Resume banner — surfaces when a prior batch left the folder
-            with un-analyzed photos (laptop closed mid-batch, app crash,
-            force-quit). Backend reconciles by walking the disk + the
-            DB's analysis_status='done' set; if the delta is > 0 we show
-            a one-click resume. analyze_folder already skips done files,
-            so resume == "re-POST analyze," nothing fancier. Hidden while
-            analyzing so the progress bar takes precedence. Also hidden while
-            liveAnalyzing (watch-live import running against this same
-            folder) — otherwise a stale unfinishedCount snapshot offers to
-            "resume" a folder that's actively importing right now. */}
+        {/* Resume banner — surfaces when a prior batch left un-analyzed
+            photos behind (laptop closed mid-batch, app crash, force-quit).
+            Both source types: a folder's denominator comes from walking the
+            disk, an album's from the asset_count its last run recorded,
+            since there is no directory to walk. Either way the delta against
+            analysis_status='done' is what the banner counts, and both
+            analyze endpoints already skip done photos — so resume is just
+            "re-POST analyze", nothing fancier. Hidden while analyzing so the
+            progress bar takes precedence, and while liveAnalyzing (watch-live
+            import against this same folder) — otherwise a stale
+            unfinishedCount snapshot offers to "resume" an active import. */}
         {!analyzing
           && !liveAnalyzing
           && activeTab
@@ -3171,14 +3173,14 @@ export default function App() {
           <div className="px-6 pt-3">
             <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-[rgba(232,184,74,0.10)] border border-[rgba(232,184,74,0.30)]">
               <div className="text-xs text-[#E8B84A]">
-                <span className="font-semibold">{activeTab.unfinishedCount}</span> photo{activeTab.unfinishedCount === 1 ? '' : 's'} in this folder {activeTab.unfinishedCount === 1 ? 'is' : 'are'} not yet analyzed — a prior run was interrupted before finishing.
+                <span className="font-semibold">{activeTab.unfinishedCount}</span> photo{activeTab.unfinishedCount === 1 ? '' : 's'} in this {isPhotosTab(activeTab) ? 'album' : 'folder'} {activeTab.unfinishedCount === 1 ? 'is' : 'are'} not yet analyzed — a prior run was interrupted before finishing.
               </div>
               <button
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
-                onClick={() => runAnalysisForTab(activeTab.id, activeTab.folderPath, activeTab.includeSubfolders)}
+                onClick={() => resumeAnalysisForTab(activeTab)}
                 className="px-2.5 py-1 rounded-md text-xs font-medium bg-[rgba(232,184,74,0.20)] text-[#E8B84A] border border-[rgba(232,184,74,0.40)] hover:opacity-80 transition-opacity whitespace-nowrap"
-                title="Re-run analysis on this folder. Already-analyzed photos skip; only the unfinished ones get processed."
+                title={`Re-run analysis on this ${isPhotosTab(activeTab) ? 'album' : 'folder'}. Already-analyzed photos skip; only the unfinished ones get processed.`}
               >
                 Resume analysis
               </button>
