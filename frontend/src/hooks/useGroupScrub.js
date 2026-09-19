@@ -432,5 +432,11 @@ export function useGroupScrub({ suspended = false, topInset } = {}) {
       }
     : null
 
-  return { scrub, preview, stash, restore }
+  // Memoised so the object identity is stable across renders. It is passed
+  // straight to the memo()'d grid tiles, and a fresh literal here re-rendered
+  // every group tile on every keystroke — the same trap as an inline arrow.
+  return useMemo(
+    () => ({ scrub, preview, stash, restore }),
+    [scrub, preview, stash, restore]
+  )
 }

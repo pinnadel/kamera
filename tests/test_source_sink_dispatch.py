@@ -127,7 +127,9 @@ def test_trash_rejects_skips_photos_and_keeps_the_row(env) -> None:
     db_path, _sink = env
     decisions_mod._apply_decision(1, "reject")
 
-    result = decisions_mod.trash_rejects()
+    result = decisions_mod.trash_rejects(
+        decisions_mod.TrashRejectsRequest(source_folder="photos://lib/album")
+    )
 
     assert result["trashed"] == 0
     assert result["skipped_unsupported"] == 1

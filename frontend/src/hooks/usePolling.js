@@ -22,6 +22,24 @@ import { API } from '../api'
 // network-wise.
 const MID_BATCH_PRERANK_EVERY = 50
 
+// Minimum gap between mid-batch /images refetches.
+//
+// The grid used to reload on EVERY completed photo, and /images always
+// returns the tab's WHOLE list — measured at ~1.27 KB per row. Over a
+// 1248-photo album that is ~1248 fetches averaging ~0.8 MB: roughly a
+// gigabyte of JSON serialized, parsed and thrown away, each one also
+// re-running the tab's filter/sort memo and re-rendering every card. The
+// cost grows with the square of the album size, which is why a big import
+// felt progressively heavier the further it got.
+//
+// Throttling is safe because it only affects how often the grid FILLS IN,
+// never its final contents: the batch-completion branch above does one last
+// unconditional full fetch, so the end state is always exact. 1500 ms keeps
+// the fill visibly live (the progress bar itself still ticks at 400 ms)
+// while collapsing the fast-format case — HEIC/JPEG photos complete faster
+// than this, so those refetches coalesce instead of queueing up one per photo.
+const IMAGE_REFETCH_MIN_MS = 1500
+
 export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onWatchProgress, onBatchComplete, onPrerankAdvance }) {
   // Keep a ref that always points at the current tabs array so the polling
   // closure never reads a stale snapshot. The effect that writes it is
@@ -76,6 +94,11 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
     // mid-batch prerank refresh, so we fire at most once per MID_BATCH_PRERANK_EVERY.
     // Reset when wasRunning flips back to false (new batch starts clean).
     let lastPrerankBucket = 0
+    // Timestamp of the last mid-batch /images refetch, for the
+    // IMAGE_REFETCH_MIN_MS throttle. Reset with the rest of the per-batch
+    // state below so a new batch's first completed photo shows up at once
+    // instead of waiting out a window the previous batch opened.
+    let lastImageFetchAt = 0
     // Folders we've already asked App.jsx to materialize a tab for, so we
     // call ensureTabForFolder at most once per folder per batch instead of
     // every 400 ms tick while the new tab is still propagating through state.
@@ -135,6 +158,7 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
             trackingTabId = null
             if (lastDone !== -1) lastDone = -1
             lastPrerankBucket = 0
+            lastImageFetchAt = 0
             autoCreatedFolders.clear()
             return
           }
@@ -171,14 +195,22 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
           ))
           if (data.done !== lastDone) {
             lastDone = data.done
-            fetch(`${API}/images?source_folder=${encodeURIComponent(targetFolder)}`)
-              .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-              .then(images => {
-                setTabs(prev => prev.map(t =>
-                  t.id === targetId ? { ...t, images, loaded: true } : t
-                ))
-              })
-              .catch(() => {})
+            const now = Date.now()
+            // Coalesce bursts of completions into one refetch. Skipping a
+            // tick loses nothing: `done` keeps climbing, the next tick past
+            // the window fetches the newer state, and batch completion
+            // fetches unconditionally.
+            if (now - lastImageFetchAt >= IMAGE_REFETCH_MIN_MS) {
+              lastImageFetchAt = now
+              fetch(`${API}/images?source_folder=${encodeURIComponent(targetFolder)}`)
+                .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+                .then(images => {
+                  setTabs(prev => prev.map(t =>
+                    t.id === targetId ? { ...t, images, loaded: true } : t
+                  ))
+                })
+                .catch(() => {})
+            }
 
             // Mid-batch prerank: every MID_BATCH_PRERANK_EVERY photos, refresh
             // /similarity-groups AND POST /prerank-groups so the AI burst

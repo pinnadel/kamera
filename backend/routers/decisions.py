@@ -15,6 +15,8 @@ from backend.constants import is_raw_format, companion_stem_matches, shot_at_to_
 from backend.database import get_db, get_folder_overrides, get_setting
 from backend.constants import is_photos_source_folder
 from backend.sources import sink_for
+from backend.sources.folder import _reject_to_system_trash_enabled
+from backend.file_mover import _DECISION_FOLDERS, resolve_dest_folder
 from backend.routers.settings import get_raw_jpeg_display_mode
 from backend.state import _decision_move_lock, _personal_model
 from phase3_learning.auto_trainer import maybe_train_async
@@ -756,10 +758,24 @@ def bulk_mark_reviewed(request: BulkMarkReviewedRequest):
     return {"moved": moved, "skipped": skipped, "errors": errors}
 
 
-@router.post("/trash-rejects")
-def trash_rejects():
+class TrashRejectsRequest(BaseModel):
+    """Which tab's rejects to sweep.
+
+    Required, and deliberately so. This endpoint used to take no body and
+    swept every reject in the database, while the button that calls it sits in
+    a bar labelled with the ACTIVE TAB's reject count — so pressing it in tab B
+    trashed tab A's rejects under a number that described neither. Making the
+    scope explicit means the accident cannot come back by omission: a caller
+    that forgets it gets a 422, not a wider sweep.
     """
-    Send all rejected files to the system Trash (recoverable via Trash bin).
+
+    source_folder: str
+
+
+@router.post("/trash-rejects")
+def trash_rejects(request: TrashRejectsRequest):
+    """
+    Send one tab's rejected files to the system Trash (recoverable via Trash bin).
 
     For each image with decision='reject', route through file_mover.trash_photo
     so the send2trash call — and its .HIF sidecar handling — is identical to a
@@ -786,7 +802,9 @@ def trash_rejects():
             FROM images i
             INNER JOIN decisions d ON d.image_id = i.id
             WHERE d.decision = 'reject'
-            """
+              AND i.source_folder = ?
+            """,
+            (request.source_folder,),
         ).fetchall()
 
     trashed: int = 0
@@ -797,10 +815,10 @@ def trash_rejects():
 
     for row in rows:
         file_path = row["file_path"]
-        # This endpoint is not tab-scoped — it sweeps every reject in the DB.
-        # A source that cannot delete (Apple Photos: neither AppleScript nor,
-        # from this process, PhotoKit can remove an asset) is skipped rather
-        # than attempted, and its row is kept so the rejection survives.
+        # Scoped to one source_folder (see TrashRejectsRequest). A source that
+        # cannot delete (Apple Photos: neither AppleScript nor, from this
+        # process, PhotoKit can remove an asset) is skipped rather than
+        # attempted, and its row is kept so the rejection survives.
         sink = sink_for(dict(row))
         if not sink.supports_bulk_trash:
             skipped_unsupported += 1
@@ -841,6 +859,32 @@ def trash_rejects():
         "failed": len(errors) - skipped_missing,
         "errors": errors,
     }
+
+
+def _reject_destination(source_folder: str | None) -> dict:
+    """Describe where auto-cull's rejects would actually land.
+
+    Auto-cull commits through the same sink as a manual R press, so the
+    `reject_to_system_trash` setting applies to it too — a fact the modal used
+    to hide behind "Files move immediately". The UI needs the truth *before*
+    the click, so the preview carries it:
+
+      mode "trash"  — send2trash. Recoverable from the OS Trash, but NOT
+                      undoable in-app: the file is no longer addressable.
+      mode "folder" — moved into a subfolder of the source. Fully reversible
+                      with U, and the file never leaves the shoot.
+
+    `label` is what to show the user. With no source_folder the sweep spans
+    every folder tab, whose per-folder overrides may differ, so we name the
+    default rather than claim one path for all of them.
+    """
+    if _reject_to_system_trash_enabled():
+        return {"mode": "trash", "label": "the system Trash", "undoable": False}
+    if source_folder is None:
+        return {"mode": "folder", "label": f"each folder's {_DECISION_FOLDERS['reject']}", "undoable": True}
+    overrides = get_folder_overrides(source_folder)
+    dest = resolve_dest_folder("reject", source_folder, overrides)
+    return {"mode": "folder", "label": dest.name, "undoable": True}
 
 
 @router.get("/auto-cull/preview")
@@ -1022,6 +1066,11 @@ def auto_cull_preview(
         # Reject (clearly-weak near-duplicates); the rest went to Maybe.
         "demotions": demotions_count,
         "reject_demotions": reject_demotions_count,
+        # Where the rejects actually go, resolved the same way the real run
+        # will resolve it. The modal states this before the click — with
+        # reject_to_system_trash on, auto-cull sends N files to the OS Trash,
+        # which is a materially different promise from "files move".
+        "reject_destination": _reject_destination(source_folder),
     }
 
 

@@ -307,6 +307,47 @@ body {
     inset 0 1px 1px rgba(0,0,0,0.20),
     0 0 0 1px rgba(91,184,212,0.55);
 }
+/* Grid cell — skip layout and paint for tiles that are off-screen.
+   `content-visibility: auto` is the cheap 90% of virtualization: the browser
+   stops laying out and painting a cell once it leaves the viewport, but the
+   element STAYS IN THE DOM. That distinction is the whole reason to prefer it
+   here — this grid has roving tabIndex, `data-grid-idx` lookups, .focus()
+   calls from arrow-key navigation, drag-and-drop and scroll-into-view, all of
+   which address cells directly. A JS virtualizer unmounts off-screen rows and
+   every one of those would need reworking; this changes nothing about the
+   tree.
+
+   `contain-intrinsic-size: auto 15rem` gives an unrendered cell a placeholder
+   height so the scrollbar does not jump. `auto` means the browser remembers
+   each cell's real size once it has been rendered, which handles the tiles
+   whose height varies (filename line, group chips) without hardcoding it. */
+.grid-cell {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 15rem;
+}
+
+/* Destructive primary CTA — coral stroke, transparent fill. Mirrors
+   .new-analysis-btn's outline approach rather than .btn-primary's gradient:
+   a button that sends files to the Trash should read as deliberate, not
+   inviting. Still outweighs BTN_SECONDARY (muted text on a dark surface),
+   so it stays the obvious primary action without baiting the click. */
+.btn-destructive {
+  color: #C97B7B;
+  background: transparent;
+  box-shadow: 0 0 0 1px rgba(201,123,123,0.55);
+  transition: box-shadow 180ms ease, color 120ms ease, background-color 120ms ease;
+}
+.btn-destructive:hover:not(:disabled) {
+  color: #DE9292;
+  background: rgba(201,123,123,0.10);
+  box-shadow:
+    0 0 0 1px rgba(201,123,123,0.80),
+    0 0 14px -2px rgba(201,123,123,0.45);
+}
+.btn-destructive:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+
 /* "+ New analysis" outline button — cyan stroke + cyan glow on hover,
    mirrors .btn-primary's hover chrome but stays transparent-filled. */
 .new-analysis-btn {

@@ -10,6 +10,7 @@ import {
   Filter,
   GraduationCap,
   Monitor,
+  Workflow,
   RefreshCw,
   RotateCcw,
   Scale,
@@ -491,6 +492,12 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               <Brain size={15} /> Model
             </button>
             <button
+              onClick={() => setActiveTab('workflow')}
+              className={`inline-flex items-center gap-1.5 pb-2 text-xs font-medium transition-colors ${activeTab === 'workflow' ? TAB_ACTIVE : TAB_INACTIVE}`}
+            >
+              <Workflow size={15} /> Workflow
+            </button>
+            <button
               onClick={() => setActiveTab('display')}
               className={`inline-flex items-center gap-1.5 pb-2 text-xs font-medium transition-colors ${activeTab === 'display' ? TAB_ACTIVE : TAB_INACTIVE}`}
             >
@@ -901,56 +908,6 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
 
             </div>
 
-            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
-              <p className="label mb-3">Grouping</p>
-              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
-                Controls how similar-photo bursts are formed. Most users won't need to touch this — manually moving photos in and out of groups is usually the right answer. Changes take effect immediately and re-cluster the whole library.
-              </p>
-
-              <div className="mb-4">
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs text-[#cecece]">Similarity</span>
-                  <span className="text-xs text-[#9c9c9d] tabular-nums">{Math.round((groupThreshold ?? 0.9) * 100)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0.80"
-                  max="0.99"
-                  step="0.01"
-                  value={groupThreshold ?? 0.9}
-                  onChange={e => setGroupThreshold?.(parseFloat(e.target.value))}
-                  className="w-full accent-[#5BB8D4]"
-                />
-                <p className="text-[10px] text-[#777] mt-1 leading-tight">
-                  Higher = stricter grouping. Lower = more photos per burst. Also
-                  controls how auto-cull decides which frames are redundant.
-                </p>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs text-[#cecece]">Time gap</span>
-                  <span className="text-xs text-[#9c9c9d] tabular-nums">
-                    {formatTimeGap(groupTimeGapSeconds)}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max={TIME_GAP_STEPS.length - 1}
-                  step="1"
-                  value={timeGapToIndex(groupTimeGapSeconds)}
-                  onChange={e => setGroupTimeGapSeconds?.(TIME_GAP_STEPS[parseInt(e.target.value, 10)])}
-                  className="w-full accent-[#5BB8D4]"
-                />
-                <p className="text-[10px] text-[#777] mt-1 leading-tight">
-                  Max pause between shots in the same burst. Longer pauses start a new burst. Ranges from 1 second to 5 minutes, with the finest steps at the short end.
-                </p>
-                <p className="text-[10px] text-[#6a6b6c] mt-1 leading-tight italic">
-                  Affects grouped review (Bursts / GroupLoupe) only — not auto-cull. Auto-cull groups by visual similarity, so it uses the Similarity slider above, not this one.
-                </p>
-              </div>
-            </div>
 
             <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
               <p className="label mb-3">AI vision model</p>
@@ -1500,51 +1457,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
               </p>
             </div>
 
-            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
-              <p className="label mb-1">Reject destination</p>
-              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
-                Where rejected photos go. By default they live in a per-folder
-                <span className="font-mono text-[#cecece]"> _Rejects/</span>
-                subfolder. Switch on the toggle to send them to the system
-                Trash instead — they can be recovered from the Trash
-                bin until you empty it.
-              </p>
 
-              <div className="flex items-start justify-between gap-4 py-2">
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs text-[#f0f0f0]">Send rejected photos to system Trash</p>
-                  <p className="text-xs text-[#9c9c9d] leading-relaxed mt-1">
-                    Applies only to future R presses. Already-rejected photos
-                    stay where they are. HIF previews follow the file into
-                    the Trash automatically.
-                  </p>
-                </div>
-                <div className={`pt-0.5 ${savingTrash ? 'opacity-50 pointer-events-none' : ''}`}>
-                  <Toggle
-                    enabled={rejectToTrash}
-                    onChange={handleRejectTrashToggle}
-                  />
-                </div>
-              </div>
-            </div>
-
-            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
-              <p className="label mb-1">Advance cursor</p>
-              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
-                Where the focus jumps after each K / M / R. Match it to how you scan the grid.
-              </p>
-              <div className="flex items-center justify-end">
-                <button
-                  onClick={() => onAdvanceDirChange?.(advanceDir === 'forward' ? 'backward' : 'forward')}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-[#cecece] border border-[rgba(255,255,255,0.10)] bg-[#0d0e10] hover:opacity-70 transition-opacity whitespace-nowrap"
-                  aria-label={`Advance cursor: ${advanceDir === 'forward' ? 'to the right' : 'to the left'}`}
-                >
-                  {advanceDir === 'forward'
-                    ? <><ArrowRight size={13} /> to the right</>
-                    : <><ArrowLeft size={13} /> to the left</>}
-                </button>
-              </div>
-            </div>
 
             {/* ── Advanced — Sort options ────────────────────────────────
                 Power-user toggles for which metrics show up under the bottom
@@ -1621,6 +1534,119 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 </div>
               </div>
             )}
+          </div>
+        )}
+        {/* ── Workflow tab ──
+            Three settings that were filed by accident rather than by meaning:
+            Reject destination and Advance cursor sat under Display (next to
+            interface size and the filename toggle), and Grouping sat under
+            Model. None of them is a display preference or a model parameter —
+            they are all "how culling behaves".
+
+            Reject destination is the one that made this worth fixing: it
+            decides whether a reject lands in a recoverable _Rejects/ folder or
+            in the system Trash, which is the single most consequential switch
+            in the app and the only one that makes auto-cull irreversible. It
+            does not belong three sections below the font size. */}
+        {activeTab === 'workflow' && (
+          <div className="space-y-6">
+
+            <div>
+              <p className="label mb-1">Reject destination</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
+                Where rejected photos go. By default they live in a per-folder
+                <span className="font-mono text-[#cecece]"> _Rejects/</span>
+                subfolder. Switch on the toggle to send them to the system
+                Trash instead — they can be recovered from the Trash
+                bin until you empty it.
+              </p>
+
+              <div className="flex items-start justify-between gap-4 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs text-[#f0f0f0]">Send rejected photos to system Trash</p>
+                  <p className="text-xs text-[#9c9c9d] leading-relaxed mt-1">
+                    Applies only to future R presses. Already-rejected photos
+                    stay where they are. HIF previews follow the file into
+                    the Trash automatically.
+                  </p>
+                </div>
+                <div className={`pt-0.5 ${savingTrash ? 'opacity-50 pointer-events-none' : ''}`}>
+                  <Toggle
+                    enabled={rejectToTrash}
+                    onChange={handleRejectTrashToggle}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+              <p className="label mb-1">Advance cursor</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-3">
+                Where the focus jumps after each K / M / R. Match it to how you scan the grid.
+              </p>
+              <div className="flex items-center justify-end">
+                <button
+                  onClick={() => onAdvanceDirChange?.(advanceDir === 'forward' ? 'backward' : 'forward')}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-[#cecece] border border-[rgba(255,255,255,0.10)] bg-[#0d0e10] hover:opacity-70 transition-opacity whitespace-nowrap"
+                  aria-label={`Advance cursor: ${advanceDir === 'forward' ? 'to the right' : 'to the left'}`}
+                >
+                  {advanceDir === 'forward'
+                    ? <><ArrowRight size={13} /> to the right</>
+                    : <><ArrowLeft size={13} /> to the left</>}
+                </button>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
+              <p className="label mb-3">Grouping</p>
+              <p className="text-xs text-[#9c9c9d] leading-relaxed mb-4">
+                Controls how similar-photo bursts are formed. Most users won't need to touch this — manually moving photos in and out of groups is usually the right answer. Changes take effect immediately and re-cluster the whole library.
+              </p>
+
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-[#cecece]">Similarity</span>
+                  <span className="text-xs text-[#9c9c9d] tabular-nums">{Math.round((groupThreshold ?? 0.9) * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.80"
+                  max="0.99"
+                  step="0.01"
+                  value={groupThreshold ?? 0.9}
+                  onChange={e => setGroupThreshold?.(parseFloat(e.target.value))}
+                  className="w-full accent-[#5BB8D4]"
+                />
+                <p className="text-[10px] text-[#777] mt-1 leading-tight">
+                  Higher = stricter grouping. Lower = more photos per burst. Also
+                  controls how auto-cull decides which frames are redundant.
+                </p>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-[#cecece]">Time gap</span>
+                  <span className="text-xs text-[#9c9c9d] tabular-nums">
+                    {formatTimeGap(groupTimeGapSeconds)}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max={TIME_GAP_STEPS.length - 1}
+                  step="1"
+                  value={timeGapToIndex(groupTimeGapSeconds)}
+                  onChange={e => setGroupTimeGapSeconds?.(TIME_GAP_STEPS[parseInt(e.target.value, 10)])}
+                  className="w-full accent-[#5BB8D4]"
+                />
+                <p className="text-[10px] text-[#777] mt-1 leading-tight">
+                  Max pause between shots in the same burst. Longer pauses start a new burst. Ranges from 1 second to 5 minutes, with the finest steps at the short end.
+                </p>
+                <p className="text-[10px] text-[#6a6b6c] mt-1 leading-tight italic">
+                  Affects grouped review (Bursts / GroupLoupe) only — not auto-cull. Auto-cull groups by visual similarity, so it uses the Similarity slider above, not this one.
+                </p>
+              </div>
+            </div>
           </div>
         )}
         </div>

@@ -57,6 +57,7 @@ import {
   Plus,
   Power,
   RotateCcw,
+  GitCompareArrows,
   Search,
   Settings as SettingsIcon,
   SlidersHorizontal,
@@ -68,7 +69,7 @@ import {
 } from 'lucide-react'
 import { MoveIntoGroupModal } from './modals/MoveIntoGroupModal'
 import { API } from './api'
-import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, ACTIVE_TOGGLE, ACTIVE_PILL } from './ui/buttons'
+import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY, BTN_CTA_SECONDARY, ACTIVE_TOGGLE, ACTIVE_PILL } from './ui/buttons'
 import { formatEta, formatDuration, needsReview, isUnconfirmed } from './ui/format'
 import { Spinner, DecisionWord, Toggle } from './ui/primitives'
 import { DownloadToast, ToastStack } from './ui/toasts'
@@ -76,6 +77,7 @@ import { ShortcutsModal } from './modals/ShortcutsModal'
 import { FEEDBACK_URL } from './version'
 import { ConfirmModal } from './modals/ConfirmModal'
 import { AutoCullModal } from './modals/AutoCullModal'
+import { PhotosReconcileModal } from './modals/PhotosReconcileModal'
 import { SettingsModal } from './modals/SettingsModal'
 import { GroupPartnersOverlay } from './modals/GroupPartnersOverlay'
 import { PartnerCountChips, GroupBulkBar } from './ui/TileChips'
@@ -118,6 +120,8 @@ const GRID_ONLY_LAYOUT_OPTIONS = [{ id: 'grid', label: 'Grid', Icon: Grid2x2 }]
 import { FILMSTRIP_CHROME_WITH_BADGES, pillBottomAboveStrip, stripHeight } from './ui/filmstripMetrics'
 import { EMPTY_FILTER, filterPredicate, getActiveFilterChips, groupingPredicate, isFilterEmpty } from './filterUtils'
 import { ViewModePill } from './ViewModePill'
+
+const EMPTY_IMAGES = []
 
 export default function App() {
   const [tabs, setTabs]               = useState(() => [makeNewTab()])
@@ -208,6 +212,7 @@ export default function App() {
   // tab. true = show inline "Switch?" row; cleared on confirm/cancel/menu close.
   const [watchSwitchConfirm, setWatchSwitchConfirm] = useState(false)
   const [autoCullOpen, setAutoCullOpen]     = useState(false)
+  const [reconcileOpen, setReconcileOpen] = useState(false)
   const [bulkConfirm, setBulkConfirm]       = useState(null)
   const [bulkRunning, setBulkRunning]       = useState(false)
   // Stores the tier key at which the user last dismissed the banner (e.g.
@@ -465,13 +470,16 @@ export default function App() {
     dismissSubfolderRequest,
   } = useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast })
 
+  // A module-level constant, not a fresh `[]` per render: an empty tab would
+  // otherwise hand every downstream memo a new array identity each time and
+  // make all of them recompute for nothing.
   // ── Derive active-tab fields so existing call-sites keep working ──────────
   const activeTab = useMemo(
     () => tabs.find(t => t.id === activeTabId) || tabs[0] || null,
     [tabs, activeTabId]
   )
 
-  const images          = activeTab?.images          ?? []
+  const images          = activeTab?.images          ?? EMPTY_IMAGES
   const selectedIdx     = activeTab?.selectedIdx     ?? 0
   const selectedGroupId = activeTab?.selectedGroupId ?? null
   const selectedDecidedGroupKey = activeTab?.selectedDecidedGroupKey ?? null
@@ -1501,6 +1509,34 @@ export default function App() {
   // The human counterpart to the manual-K routing: auto-cull keeps land in
   // plain _Keeps and wait here. Photo stays visible in the Keep-filtered
   // view (badge, not disappear — see docs/PLAN-keeps-reviewed.md).
+  // Grid drag payload — deliberately a STABLE callback.
+  //
+  // ImageCard is memo()'d, but memo compares props shallowly, so a single
+  // inline arrow passed per card defeats it completely: every App render
+  // re-rendered all N cards, including the ones where nothing changed. In a
+  // keyboard-first culling loop that is the worst place to pay it — one arrow
+  // key changes `isSelected` on exactly two tiles, and a thousand were
+  // re-rendering.
+  //
+  // The multi-select state is read through a ref rather than closed over, so
+  // this callback never needs to be rebuilt. Reading `.current` is correct
+  // here (unlike inside a drag MOVE handler, where the frozen-closure trap
+  // applies): the payload is computed once, at dragstart, from the selection
+  // as it stands at that moment.
+  const gridMultiSelectRef = useRef(gridMultiSelect)
+  useEffect(() => { gridMultiSelectRef.current = gridMultiSelect })
+
+  const handleCardDragStart = useCallback((e, image) => {
+    // Carry the whole selection when the dragged photo is part of it,
+    // otherwise just the dragged photo — so drag-to-group works on any tile
+    // without first entering select mode.
+    const selected = gridMultiSelectRef.current.selected
+    const ids = selected.has(image.id) ? Array.from(selected) : [image.id]
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('application/json', JSON.stringify({ kind: 'photos', image_ids: ids }))
+    e.dataTransfer.setData('text/plain', ids.join(','))
+  }, [])
+
   const markReviewed = useCallback(async (imageId) => {
     try {
       const res = await fetch(`${API}/mark-reviewed`, {
@@ -2329,7 +2365,14 @@ export default function App() {
   const trashAllRejects = useCallback(async () => {
     setBulkRunning(true)
     try {
-      const res = await fetch(`${API}/trash-rejects`, { method: 'POST' })
+      // Scoped to the active tab. The bar above this button is labelled with
+      // decisionCounts.reject — this tab's count — so an unscoped sweep would
+      // trash other tabs' rejects under a number that never described them.
+      const res = await fetch(`${API}/trash-rejects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_folder: activeTab?.folderPath }),
+      })
       const data = await res.json()
       await loadImages()
       setDecisionFilter(null)
@@ -2363,7 +2406,9 @@ export default function App() {
       setBulkRunning(false)
       setBulkConfirm(null)
     }
-  }, [loadImages, addToast])
+    // activeTab is a real dependency now: a stale closure here would post a
+    // previous tab's folder and empty the wrong shoot.
+  }, [activeTab, loadImages, addToast])
 
   // ── Keyboard shortcuts (useKeyboard) ──────────────────────────────────────
   const cols = useCallback(() => {
@@ -2592,6 +2637,15 @@ export default function App() {
           setGroupThreshold={setThreshold}
           groupTimeGapSeconds={timeGapSeconds}
           setGroupTimeGapSeconds={setTimeGapSeconds}
+        />
+      )}
+
+      {reconcileOpen && activeTab?.folderPath && (
+        <PhotosReconcileModal
+          sourceFolder={activeTab.folderPath}
+          onClose={() => setReconcileOpen(false)}
+          onComplete={() => { loadImages(); loadModelInfo() }}
+          onToast={addToast}
         />
       )}
 
@@ -3502,7 +3556,12 @@ export default function App() {
             </span>
             {bulkConfirm === 'trash-rejects' ? (
               <div className="ml-auto flex items-center gap-2">
-                <span className="text-[#C97B7B]">Move {decisionCounts.reject} {decisionCounts.reject === 1 ? 'photo' : 'photos'} to Trash?</span>
+                {/* Names the tab: the sweep is scoped to it, and with several
+                    folders open "12 photos" alone does not say whose. */}
+                <span className="text-[#C97B7B]">
+                  Move {decisionCounts.reject} {decisionCounts.reject === 1 ? 'photo' : 'photos'} from{' '}
+                  <span className="font-medium">{tabLabel(activeTab)}</span> to Trash?
+                </span>
                 <button onMouseDown={(e) => e.preventDefault()} onClick={trashAllRejects} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(201,123,123,0.20)] border border-[rgba(255,255,255,0.10)] text-[#C97B7B] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
@@ -3826,7 +3885,7 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className="outline-none"
+                  className="outline-none grid-cell"
                   onFocus={() => {
                     if (selectedGroupId === item.group.best_image_id) return
                     setSelectedGroupId(item.group.best_image_id)
@@ -3892,7 +3951,7 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className="outline-none"
+                  className="outline-none grid-cell"
                   onFocus={() => {
                     if (selectedDecidedGroupKey === item.groupKey) return
                     setSelectedGroupId(null)
@@ -3927,7 +3986,7 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className={`outline-none${item.groupRun && item.groupRun.position !== 'solo' ? ' relative group/run' : ''}${
+                  className={`outline-none grid-cell${item.groupRun && item.groupRun.position !== 'solo' ? ' relative group/run' : ''}${
                     // Selection must win visually over the group-run border overlay
                     // below (z-10, amber/coral) — otherwise the cyan ring is painted
                     // first and gets covered on 3 of 4 edges, leaving only the
@@ -4125,19 +4184,7 @@ export default function App() {
                     inGroupBorder={!!item.groupRun && item.groupRun.position !== 'solo'}
                     onMarkReviewed={markReviewed}
                     draggable
-                    onDragStart={(e) => {
-                      // Payload carries the entire current selection when
-                      // the dragged photo is part of it; otherwise just the
-                      // dragged photo itself. This makes drag-to-create-
-                      // group work on any tile without requiring select mode.
-                      const selected = gridMultiSelect.selected
-                      const ids = selected.has(item.image.id)
-                        ? Array.from(selected)
-                        : [item.image.id]
-                      e.dataTransfer.effectAllowed = 'move'
-                      e.dataTransfer.setData('application/json', JSON.stringify({ kind: 'photos', image_ids: ids }))
-                      e.dataTransfer.setData('text/plain', ids.join(','))
-                    }}
+                    onDragStart={handleCardDragStart}
                   />
                 </div>
               )
@@ -4395,6 +4442,20 @@ export default function App() {
                         onto the photo in Photos. Files are never moved, and undo removes the keyword again.
                         Build a Smart Album on a keyword to collect them.
                       </p>
+
+                      {/* Decisions only flow outward, so the two drift silently:
+                          a keyword deleted in Photos, an asset removed from the
+                          album. This is the way back in. */}
+                      <p className="text-xs text-[#9c9c9d] leading-relaxed mt-3 mb-2">
+                        Edited keywords in Photos, or moved photos out of the album? Compare the two and
+                        choose what wins.
+                      </p>
+                      <button
+                        onClick={() => { setTabSettingsOpen(false); setReconcileOpen(true) }}
+                        className={BTN_CTA_SECONDARY}
+                      >
+                        <GitCompareArrows size={16} /> Compare with Photos
+                      </button>
                     </div>
                   )}
 

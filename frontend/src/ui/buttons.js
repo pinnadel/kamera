@@ -33,6 +33,13 @@ export const BTN_CTA_SECONDARY = `${BASE} px-4 py-2 font-semibold bg-[#1b1c1e] b
 // Cancel / dismiss — quiet.
 export const BTN_SECONDARY     = `${BASE} px-4 py-2 font-medium bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70`
 
+// Destructive PRIMARY — the confirm button of an action that cannot be undone
+// in-app (auto-cull with reject_to_system_trash on, bulk trash). Same footprint
+// as BTN_PRIMARY so it holds the primary slot, but coral-outlined instead of
+// cyan-filled: the chrome should not invite the click it is asking for.
+// Chrome lives in `.btn-destructive` in index.css.
+export const BTN_PRIMARY_DANGER = `${BASE} btn-destructive px-4 py-2 font-semibold`
+
 // Destructive — coral text, no fill. Hover is a coral tint (the only
 // hover-color rule in the system; opacity alone reads dead).
 export const BTN_DANGER        = `${BASE} px-3 py-1.5 font-medium text-[#C97B7B] hover:bg-[rgba(201,123,123,0.12)] !transition-colors`

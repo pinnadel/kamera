@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import { ChevronDown, ChevronUp, WandSparkles, X } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronUp, WandSparkles, X } from 'lucide-react'
 import { API } from '../api'
-import { BTN_ICON, BTN_PRIMARY, BTN_SECONDARY } from '../ui/buttons'
+import { BTN_ICON, BTN_PRIMARY, BTN_PRIMARY_DANGER, BTN_SECONDARY } from '../ui/buttons'
+import { DecisionWord } from '../ui/primitives'
 
 // RuleBreakdown — collapsible "Why rejected?" section shown below the K/M/X bars.
 // Only rendered when there are rejects and rule_breakdown is present in the preview.
@@ -58,6 +59,61 @@ function RuleBreakdown({ breakdown, total }) {
   )
 }
 
+// Consequence — the one line that answers "what could I regret?".
+//
+// This used to read "Files move immediately", which was true only with the
+// default settings. `reject_to_system_trash` routes EVERY reject through
+// send2trash, auto-cull's included (sources/folder.py), so with that toggle on
+// one click sent N files to the OS Trash while the modal still promised a move.
+// The preview now resolves the real destination server-side and we state it,
+// together with the thing the user actually wants to know before committing:
+// whether U can take it back.
+function Consequence({ dest, rejects }) {
+  // Older backend (launcher not restarted since the field shipped) — say the
+  // safe, always-true part rather than inventing a destination.
+  if (!dest) {
+    return (
+      <p className="text-xs text-[#9c9c9d] mb-5">
+        Files are committed immediately. Only undecided photos are affected.
+      </p>
+    )
+  }
+
+  const trashing = dest.mode === 'trash'
+
+  if (!trashing) {
+    return (
+      <p className="text-xs text-[#9c9c9d] mb-5 leading-relaxed">
+        Files move immediately — {rejects}{' '}
+        <DecisionWord kind="reject">{rejects === 1 ? 'Reject' : 'Rejects'}</DecisionWord>
+        {' into '}<span className="font-mono text-[#cecece]">{dest.label}</span>, the rest
+        alongside it. Nothing is deleted, and every photo can be taken back with{' '}
+        <kbd className="px-1 py-0.5 rounded bg-[#1b1c1e] border border-[rgba(255,255,255,0.12)] text-[10px] font-mono text-[#cecece]">U</kbd>
+      </p>
+    )
+  }
+
+  return (
+    <div className="mb-5 px-3 py-2.5 rounded-lg border border-[rgba(201,123,123,0.35)] bg-[rgba(201,123,123,0.07)]">
+      <div className="flex items-start gap-2">
+        <AlertTriangle size={14} className="text-[#C97B7B] mt-0.5 shrink-0" />
+        <div>
+          <p className="text-xs text-[#f0f0f0] font-medium mb-1">
+            {rejects} {rejects === 1 ? 'file goes' : 'files go'} to {dest.label}
+          </p>
+          <p className="text-[11px] text-[#cecece] leading-relaxed">
+            <DecisionWord kind="reject">Reject</DecisionWord> is set to the system Trash in
+            Settings → Workflow, and auto-cull uses the same route as a manual R. You can restore them
+            from the Trash, but{' '}
+            <kbd className="px-1 py-0.5 rounded bg-[#1b1c1e] border border-[rgba(255,255,255,0.12)] text-[10px] font-mono text-[#cecece]">U</kbd>
+            {' '}cannot — once a file leaves the folder, KaMeRa can no longer address it.
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // AutoCullModal — preview and execute automatic K/M/X assignment
 // Scoped to `folderPath` when provided, so tab-triggered auto-cull only
 // previews and acts on photos from the active tab's folder.
@@ -104,6 +160,10 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
       setRunning(false)
     }
   }
+
+  // Destination is resolved server-side (settings + this folder's overrides),
+  // so the modal never has to guess which route a reject will take.
+  const trashing = preview?.reject_destination?.mode === 'trash'
 
   const bars = [
     { key: 'keep',   label: 'Keeps',   fill: 'bg-[#7DB89A]',  text: 'text-[#7DB89A]' },
@@ -217,9 +277,10 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
               <RuleBreakdown breakdown={preview.rule_breakdown} total={preview.counts.reject} />
             )}
 
-            <p className="text-xs text-[#9c9c9d] mb-5">
-              Files move immediately. Only undecided photos are affected.
-            </p>
+            <Consequence
+              dest={preview.reject_destination}
+              rejects={preview.counts.reject ?? 0}
+            />
           </>
         )}
 
@@ -234,10 +295,16 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
           <button
             onClick={runAutoCull}
             disabled={running || loading || !preview || preview.total === 0}
-            className={BTN_PRIMARY}
+            className={trashing ? BTN_PRIMARY_DANGER : BTN_PRIMARY}
           >
-            <WandSparkles size={16} />
-            {running ? 'Running…' : `Cull ${preview?.total ?? '…'} photos`}
+            {trashing ? <AlertTriangle size={16} /> : <WandSparkles size={16} />}
+            {running
+              ? 'Running…'
+              : trashing
+                // With the Trash route on, the number that matters is the one
+                // that leaves the shoot — not the one that merely gets sorted.
+                ? `Cull ${preview?.total ?? '…'} · trash ${preview?.counts?.reject ?? 0}`
+                : `Cull ${preview?.total ?? '…'} photos`}
           </button>
         </div>
       </div>

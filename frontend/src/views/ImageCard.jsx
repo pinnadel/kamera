@@ -162,8 +162,15 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
     <div
       className={`group relative bg-[#161718] rounded-lg overflow-hidden transition-all flex items-stretch ${border} ${dimmedBySelectMode || rejectedOpacity} ${dragCursor}`}
       draggable={draggable}
-      onDragStart={draggable ? onDragStart : undefined}
-      onDragEnd={draggable ? onDragEnd : undefined}
+      // The card hands its own image back to the handler so the parent does
+      // not need a per-card closure. That matters: a fresh arrow function per
+      // card defeats this component's memo() on every single render — with a
+      // thousand tiles, moving the keyboard cursor one step re-rendered all
+      // of them instead of the two whose selection actually changed. Creating
+      // the arrow HERE is free, because memo stops this function running at
+      // all when nothing about this card changed.
+      onDragStart={draggable && onDragStart ? (e) => onDragStart(e, image) : undefined}
+      onDragEnd={draggable && onDragEnd ? (e) => onDragEnd(e, image) : undefined}
     >
       {/* Selection ring, grouped-tile case only: a real `border` (not a
           box-shadow ring) drawn as a separate ABSOLUTE overlay on top of all
