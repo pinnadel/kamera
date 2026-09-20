@@ -4,6 +4,19 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## Browser swipe-navigation gestures disabled (2026-09-20)
+
+A two-finger swipe left/right on the trackpad triggered Chrome's history
+back/forward inside the app window — a browser affordance with no meaning in a
+single-screen culling app, and it takes the grid cursor and any open loupe with
+it. One rule in `frontend/src/index.css`: `overscroll-behavior-x: none` on
+`html, body`. The gesture only fires once a horizontal overscroll reaches the
+viewport, so blocking it at the scroll root also stops it chaining out of inner
+horizontal scrollers (filmstrip, tab bar) when they hit their end. The mobile
+bundle already did this for both axes (`mobile.css`).
+
+---
+
 ## Whole-app critique pass (2026-09-19)
 
 A full-app review found three things worth fixing straight away.

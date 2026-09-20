@@ -57,6 +57,16 @@ html {
   font-feature-settings: "calt" 1, "kern" 1, "liga" 1;
 }
 
+/* Kill the browser's two-finger swipe left/right = history back/forward.
+   KaMeRa is a single-screen app; a horizontal overscroll that navigates the
+   window away mid-cull loses the grid cursor and the open loupe. The gesture
+   fires when a horizontal overscroll reaches the viewport, so blocking it at
+   the scroll root also stops chaining out of inner scrollers (filmstrip,
+   tab bar) once they hit their end. */
+html, body {
+  overscroll-behavior-x: none;
+}
+
 /* App logo: card-stack fills follow system theme (matches favicon + .icns family) */
 :root {
   --logo-red:    #FF5A5A;
