@@ -149,6 +149,43 @@ bundle already did this for both axes (`mobile.css`).
 
 ---
 
+## People mode: one group per person, not one group (2026-09-21)
+
+`/face-groups` put **963 of 977 faces in a single group** — every adult and
+every child in the library. Two hypotheses, one measured wrong:
+
+- **Not the crop.** The suspicion was that `embed_face` feeds FaceNet an
+  unaligned, non-square crop where facenet-pytorch expects an MTCNN-aligned
+  one. Tested by re-embedding a 24-face sample both ways and scoring 143
+  hand-labelled adult×child pairs (certainly different people): the current
+  crop already separates them at median cosine 0.124 with 2.1 % above the 0.50
+  cutoff; eye-aligned crops gave 0.090 / 1.4 %. Real, and far too small to
+  explain a 963-face group. Hypothesis dropped.
+- **It was the linkage.** Within one age group the median pair sits at 0.561 —
+  above the cutoff — and the burst grouper unions on *single* linkage: any one
+  pair across two clusters merges them. At an identical 0.50 threshold on
+  identical embeddings: single → largest group 963, average → 271, complete →
+  86. On the labelled pairs: single merged **143 of 143**, average and complete
+  **0 of 143**.
+
+`face_identity.group_faces_by_identity()` now clusters faces with average
+linkage (SciPy), and `/face-groups` calls it instead of the burst grouper.
+Result on this library: **63 groups instead of 4**, largest 271, in 0.57 s.
+Spot-checked visually — the 271 group is the toddler across two years of hats
+and goggles, the 88 group is one adult across hoods, profiles and beard states.
+
+- Average, not complete: complete linkage requires *every* pair to clear the
+  cutoff, which splits one child across the ages they grow through.
+- `time_gap_seconds` is **gone** from the endpoint rather than silently ignored.
+  Segmenting by capture time is right for bursts and precisely wrong here,
+  where recognising a person across different days is the point.
+- Above 8000 faces it falls back to the old grouper with a logged warning
+  (the pairwise matrix is O(n²)); this library is at 977.
+- Guarded by `tests/test_face_identity_clustering.py`, including a fixture
+  self-check and a call-site test. The bridging-face test fails on single linkage.
+
+---
+
 ## Face sharpness joins the edge-width scale, and the bbox bug behind it (2026-09-20)
 
 Follow-up to yesterday's Photos sharpness switch. `face_sharpness_score` was
@@ -183,6 +220,22 @@ the soft-face instant reject and one of the model's 31 features.
   the model's vector, so **no feature-schema bump and no retrain**. When there
   are labelled folder photos measured on the new scale, the camera-model
   comparison can be run without re-analysing anything.
+- **47 face embeddings were recomputed** (`scripts/backfill_face_embeddings.py`,
+  10 RAW + 37 orientation-6/8 JPEGs of 977). Verified with a 30-row control
+  group of unaffected files: their recomputed vectors match the stored ones at
+  cosine 1.000, so the recomputation is faithful to the pipeline — while the 47
+  affected rows moved to a **median cosine of 0.320**, i.e. they had been
+  pointing at a different region entirely. All 47 moved; none stayed above 0.9.
+- **Open, and separate: People-mode clustering is collapsing.** Measured after
+  the fix, and identical before it (964 vs 963), so this is not caused by the
+  bbox bug: at the default 0.50 cutoff, 963 of 977 faces land in ONE group.
+  13 % of all face pairs score ≥ 0.50 and the pairwise p90 is 0.564, so
+  union-find chains everything together; even at 0.80 the largest group is 244.
+  Likely cause is the crop, not the threshold — `embed_face` feeds FaceNet a
+  MediaPipe box with 0.10 + 0.15 padding, non-square, stretched to 160×160 and
+  never aligned, where facenet-pytorch expects an MTCNN-aligned square crop.
+  (vggface2 is also trained on adult faces, and this library is mostly a
+  toddler.) Not touched in this pass.
 - **The two models have names:** *camera model* and *iPhone model* (Dashboard
   switch, ModelCard, Settings, FAQ). The internal corpus keys stay
   `folder`/`photos` — renaming them is a migration with no payoff. "Camera"

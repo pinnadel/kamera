@@ -202,3 +202,83 @@ def json_to_face_embedding(json_str: str | None) -> list[float] | None:
         return json.loads(json_str)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Identity clustering
+# ---------------------------------------------------------------------------
+
+# Above this many faces the pairwise distance matrix stops being reasonable
+# (8000² float32 ≈ 256 MB, and SciPy's linkage wants its own copy). Beyond it
+# we fall back to the streaming union-find path rather than risk the request.
+_MAX_MATRIX_FACES = 8000
+
+# Single-linkage is the wrong rule for identity. It merges two clusters when
+# ANY pair across them clears the threshold, so one ambiguous face chains two
+# people together — and with 977 faces at the 0.50 cutoff it produced a single
+# 963-face group holding every adult AND every child in the library
+# (measured 2026-09-21). Average linkage asks whether the clusters resemble
+# each other *as a whole*: same faces, same threshold, same embeddings, but the
+# largest group drops to 271 and all 143 hand-labelled adult/child pairs —
+# pairs that are certainly different people — land in different groups, versus
+# 143 out of 143 merged before.
+_LINKAGE = "average"
+
+
+def group_faces_by_identity(
+    items: list[tuple],
+    threshold: float = 0.50,
+) -> list[list[int]]:
+    """
+    Cluster (image_id, face_embedding[, …]) tuples by person.
+
+    Deliberately NOT `similarity_scorer.group_by_similarity`: that function
+    serves burst/scene grouping, where single-linkage chaining along a
+    continuous shoot is the desired behaviour. Identity is the opposite
+    problem — see `_LINKAGE`.
+
+    Returns groups of ≥ 2 image ids, largest first. Singletons are dropped,
+    matching the burst grouper's contract.
+    """
+    if len(items) < 2:
+        return []
+
+    if len(items) > _MAX_MATRIX_FACES:
+        # Honest degradation: the old behaviour, logged, rather than a request
+        # that dies on memory. Revisit with a blocked/approximate clusterer if
+        # a library ever gets here.
+        logger.warning(
+            "face clustering: %d faces exceeds the %d matrix limit — falling back "
+            "to burst-style grouping, which over-merges identities",
+            len(items), _MAX_MATRIX_FACES,
+        )
+        from phase2_quality.similarity_scorer import group_by_similarity
+        return group_by_similarity(items, threshold=threshold, time_gap_seconds=None)
+
+    import numpy as np
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import squareform
+
+    ids = [it[0] for it in items]
+    vecs = np.asarray([it[1] for it in items], dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    vecs = vecs / np.maximum(norms, 1e-12)
+
+    # Cosine distance, clamped: floating-point error can put a self-pair a hair
+    # below 0, and squareform rejects a non-zero diagonal.
+    dist = np.clip(1.0 - vecs @ vecs.T, 0.0, 2.0)
+    np.fill_diagonal(dist, 0.0)
+    labels = fcluster(
+        linkage(squareform(dist, checks=False), method=_LINKAGE),
+        t=1.0 - threshold,
+        criterion="distance",
+    )
+
+    groups: dict[int, list[int]] = {}
+    for image_id, label in zip(ids, labels):
+        groups.setdefault(int(label), []).append(image_id)
+    return sorted(
+        (g for g in groups.values() if len(g) >= 2),
+        key=len,
+        reverse=True,
+    )

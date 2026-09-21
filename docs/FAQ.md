@@ -1112,6 +1112,20 @@ iPhone HEIC and a camera RAW score on incompatible distributions. Camera photos
 They need different amounts of evidence — 30 decisions against 150 — and in the
 database they are still called `folder` and `photos`.
 
+### How does People mode decide two photos show the same person?
+
+It compares face vectors and then groups them, and the *grouping* rule is the
+part that matters. Until 2026-09-21 two people merged as soon as any single
+pair of their faces looked alike — one ambiguous face was enough to chain a
+whole library together, which is why 963 of 977 faces used to land in one
+group. Groups now merge only when they resemble each other on average, which
+splits the same library into 63 groups: one per person, plus the occasional
+duplicate for someone photographed rarely.
+
+Raising the similarity slider is not a substitute. It makes each match stricter
+but doesn't stop the chaining, and it pushes faces out of grouping entirely —
+at a high setting a third of the faces end up in no group at all.
+
 ## Dashboard
 
 ### Why doesn't the timeframe filter change the taste-model card?

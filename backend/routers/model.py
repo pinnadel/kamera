@@ -27,6 +27,7 @@ from phase2_quality.similarity_scorer import (
     json_to_embedding as _json_to_embedding,
 )
 from phase2_quality.face_identity import (
+    group_faces_by_identity as _group_faces_by_identity,
     json_to_face_embedding as _json_to_face_embedding,
 )
 
@@ -759,7 +760,7 @@ def similarity_groups(threshold: float = 0.90, time_gap_seconds: float = 60.0):
 
 
 @router.get("/face-groups")
-def face_groups(threshold: float = 0.50, time_gap_seconds: float | None = None):
+def face_groups(threshold: float = 0.50):
     """
     Cluster photos by person identity using FaceNet face-identity embeddings.
 
@@ -779,9 +780,11 @@ def face_groups(threshold: float = 0.50, time_gap_seconds: float | None = None):
     Photos analysed before schema v38 have NULL face_embedding and won't
     appear here until re-analysed. The endpoint silently filters them.
 
-    Time-gap split defaults to OFF: people-clustering wants to track the
-    same face across separate moments, so segmenting by capture time would
-    defeat the purpose. Callers may still pass time_gap_seconds to enable it.
+    Clusters with AVERAGE linkage (see face_identity.group_faces_by_identity).
+    Single linkage — what the burst grouper uses — merges two people whenever
+    any one pair of their faces clears the cutoff, which put 963 of 977 faces
+    in a single group here. There is no time-gap split: tracking the same
+    person across separate days is the entire point of this endpoint.
 
     Returns the same shape as GET /similarity-groups so the frontend can
     render the groups identically via GroupTile + GroupLoupe.
@@ -837,12 +840,18 @@ def face_groups(threshold: float = 0.50, time_gap_seconds: float | None = None):
                 "decision": row["decision"],
             }
 
-    raw_groups = _group_by_similarity(
-        items, threshold=threshold, time_gap_seconds=time_gap_seconds,
-    )
+    # Identity clustering, NOT the burst grouper (2026-09-21). Two differences
+    # that both matter here:
+    #   * average linkage instead of single — single-linkage chaining merged
+    #     every adult and child in this library into one 963-face group.
+    #   * no time-gap split. Segmenting by capture time is right for bursts and
+    #     exactly wrong for People mode, whose whole purpose is to recognise the
+    #     same person across different days. The query parameter is gone rather
+    #     than silently ignored.
+    raw_groups = _group_faces_by_identity(items, threshold=threshold)
 
     groups = []
-    for group_ids in sorted(raw_groups, key=len, reverse=True):
+    for group_ids in raw_groups:   # already largest-first
         images = [meta[gid] for gid in group_ids if gid in meta]
         best_id = max(images, key=lambda img: img["overall_score"] or 0)["id"]
         best_img = next((img for img in images if img["id"] == best_id), images[0])
