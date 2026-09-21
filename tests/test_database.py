@@ -610,3 +610,66 @@ def test_v52_photos_albums_table(tmp_db: Path) -> None:
         "source_folder", "library_path", "album_uuid",
         "album_name", "album_path", "last_synced_at",
     } <= columns
+
+
+def test_migration_55_resolves_fuji_film_mode_opcodes(tmp_path):
+    """Rows written before the print-conversion fix carry raw Fuji opcodes.
+
+    The mapping was not taken from a spec — it was read back off real RAF
+    files by running exiftool twice, once with -n and once without. These
+    seven codes are exactly the distinct values that existed in shooting_log.
+    """
+    from backend.database import create_tables, get_db, write_shooting_log
+
+    db = tmp_path / "films.db"
+    create_tables(db)
+
+    codes = {
+        "1280": "Pro Neg. Std",
+        "1281": "Pro Neg. Hi",
+        "1536": "Classic Chrome",
+        "1792": "Eterna",
+        "2048": "Classic Negative",
+        "2560": "Nostalgic Neg",
+        "2816": "Reala ACE",
+    }
+    with get_db(db) as conn:
+        for i, code in enumerate(codes):
+            write_shooting_log(
+                conn, sample_uuid=f"u{i}", shot_at="2026-04-01 10:00:00",
+                camera="X100VI", lens_model=None, film_simulation=code,
+                format="RAF", focal_length_mm=23.0, aperture=2.0,
+                shutter_speed=0.004, iso=400, overall_score=70.0,
+            )
+        # An opcode outside the verified set: not information, so it goes.
+        write_shooting_log(
+            conn, sample_uuid="unknown", shot_at="2026-04-01 10:00:00",
+            camera="X100VI", lens_model=None, film_simulation="9999",
+            format="RAF", focal_length_mm=23.0, aperture=2.0,
+            shutter_speed=0.004, iso=400, overall_score=70.0,
+        )
+        # A name that already resolved must survive untouched.
+        write_shooting_log(
+            conn, sample_uuid="named", shot_at="2026-04-01 10:00:00",
+            camera="X100VI", lens_model=None, film_simulation="Velvia",
+            format="RAF", focal_length_mm=23.0, aperture=2.0,
+            shutter_speed=0.004, iso=400, overall_score=70.0,
+        )
+        # Roll the version back and re-run so migration 55 fires on these rows.
+        conn.execute("DELETE FROM schema_version WHERE version >= 55")
+
+    create_tables(db)
+
+    with get_db(db) as conn:
+        got = {
+            r["sample_uuid"]: r["film_simulation"]
+            for r in conn.execute(
+                "SELECT sample_uuid, film_simulation FROM shooting_log"
+            )
+        }
+
+    for i, name in enumerate(codes.values()):
+        assert got[f"u{i}"] == name
+
+    assert got["unknown"] is None, "an unresolvable opcode is not a label"
+    assert got["named"] == "Velvia", "already-resolved names must not be touched"

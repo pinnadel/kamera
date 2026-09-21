@@ -30,6 +30,9 @@ Why these features?
 
 Feature count: 31 — sharpness/exposure/clipping (6) + face block (8) + expressions (2)
 + camera physics (3) + scene one-hots (8) + SigLIP content axes (4)
+
+Separately, `_SHADOW_COLUMNS` are written into every training sample but are
+not model inputs — see the comment on that list.
 """
 
 import json
@@ -98,6 +101,21 @@ _COLUMNS: list[str] = [
     "decisive_moment_score",
 ]
 
+# Recorded into every training sample but NOT part of the model's input vector
+# (2026-09-19). Edge-width sharpness replaced the Photos score, and the open
+# question is whether it also beats the legacy metric on camera RAW — which
+# can't be answered without labelled folder photos measured on the new scale.
+# Writing it into features_json now means the samples decided from today carry
+# it, so the comparison is possible later without re-analysing anything. Adding
+# one of these to _COLUMNS is a FEATURE_SCHEMA_VERSION bump and a retrain;
+# `features_from_json` already ignores keys it doesn't know, so recording them
+# early is backwards- and forwards-safe.
+_SHADOW_COLUMNS: list[str] = [
+    "edge_width_px",
+    "face_edge_width_px",
+]
+
+
 # Scene label → feature column name (for computed extraction below).
 _SCENE_FEATURE_LABELS: tuple[str, ...] = (
     "portrait", "landscape", "street", "night", "macro", "indoor", "action", "water",
@@ -165,6 +183,9 @@ def serialize_features(row: dict) -> str:
     payload: dict[str, float | None] = {}
     for name, val in zip(_COLUMNS, arr.tolist()):
         payload[name] = None if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
+    for name in _SHADOW_COLUMNS:
+        raw = row.get(name)
+        payload[name] = None if raw is None else float(raw)
     return json.dumps(payload, separators=(",", ":"))
 
 

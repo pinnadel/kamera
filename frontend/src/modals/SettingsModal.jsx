@@ -982,7 +982,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                 anything useful, which is why its floor is higher. */}
             {photosModelInfo && (
               <div className="pt-4 border-t border-[rgba(255,255,255,0.05)]">
-                <p className="label mb-3">Apple Photos model</p>
+                <p className="label mb-3">iPhone model</p>
                 {(() => {
                   const have = photosModelInfo.decided_count ?? 0
                   const need = photosModelInfo.min_decisions ?? 150
@@ -1667,7 +1667,7 @@ function OllamaStatusPanel() {
         <>Run <span className="font-mono text-[#cecece]">ollama serve</span> in a Terminal, then click Refresh.</>
       )
     } else if (needsVisionPull) {
-      // Same affordance for both branches: button to pull qwen2.5vl, plus a
+      // Same affordance for both branches: button to pull qwen3-vl, plus a
       // copy-paste fallback. When the user is in the "ready, text-only"
       // state they're typically upgrading from moondream — add a small
       // cleanup hint so they know how to reclaim the disk.
@@ -1681,12 +1681,12 @@ function OllamaStatusPanel() {
         <div className="space-y-2">
           <PullVisionModelButton onDone={refresh} />
           <p>
-            Or run <span className="font-mono text-[#cecece]">ollama pull qwen2.5vl:7b</span> (≈6 GB, vision-capable) in Terminal — or browse{' '}
+            Or run <span className="font-mono text-[#cecece]">ollama pull qwen3-vl:30b-a3b-instruct</span> (≈20 GB, vision-capable) in Terminal — or browse{' '}
             <a href="https://ollama.com/library" target="_blank" rel="noreferrer" className="text-[#5BB8D4] hover:opacity-70 underline">ollama.com/library</a>.
           </p>
           {isUpgradeFlow && status?.model && (
             <p className="text-[#9c9c9d]">
-              After qwen2.5vl is ready, reclaim disk space with{' '}
+              After qwen3-vl is ready, reclaim disk space with{' '}
               <span className="font-mono text-[#cecece]">ollama rm {status.model}</span>.
             </p>
           )}
@@ -1734,7 +1734,7 @@ function OllamaStatusPanel() {
         Two features rely on a local AI model that can actually look at your photos:
         <span className="text-[#cecece]"> picking the best shot from a burst</span> (the model compares every frame in the burst at once and chooses the keeper), and
         <span className="text-[#cecece]"> writing a short explanation of each photo's rating</span> in detail view.
-        Both require a model that can see images (e.g. <span className="font-mono text-[#cecece]">qwen2.5vl</span>, <span className="font-mono text-[#cecece]">llava</span>). Text-only models can still produce explanations from numeric scores, but the burst pick will fall back to score-based selection.
+        Both require a model that can see images (e.g. <span className="font-mono text-[#cecece]">qwen3-vl</span>, <span className="font-mono text-[#cecece]">qwen2.5vl</span>, <span className="font-mono text-[#cecece]">llava</span>). Text-only models can still produce explanations from numeric scores, but the burst pick will fall back to score-based selection.
       </p>
 
       <div className="flex items-center justify-between gap-3">

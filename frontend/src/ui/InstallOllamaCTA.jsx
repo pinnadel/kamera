@@ -1,7 +1,7 @@
 // InstallOllamaCTA — shown when status === "not_installed".
 //
 // Before today this state was prose-only ("Install Ollama from ollama.com,
-// then ollama pull qwen2.5vl:7b") with no actionable button. The pull
+// then ollama pull qwen3-vl:30b-a3b-instruct") with no actionable button. The pull
 // button doesn't help here — there's nothing to pull from until Ollama
 // itself is installed, and clicking it on a fresh machine sends the user
 // into a 30-minute silent poll that times out.
@@ -80,7 +80,7 @@ export function InstallOllamaCTA({ compact = false }) {
       </div>
       <p className="text-xs text-[#9c9c9d] leading-relaxed">
         Once Ollama is installed, click Refresh — the app will then offer to
-        download the vision model (qwen2.5vl:7b, ≈6 GB).
+        download the vision model (qwen3-vl:30b-a3b-instruct, ≈20 GB).
       </p>
     </div>
   )

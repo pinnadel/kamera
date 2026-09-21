@@ -18,8 +18,30 @@ DOMAIN="gui/$(id -u)"
 [ -f "$SRC" ] || { echo "Missing $SRC" >&2; exit 1; }
 
 mkdir -p "$HOME/Library/LaunchAgents"
-cp "$SRC" "$DEST"
+
+# launchd gives a job /usr/bin:/bin:/usr/sbin:/sbin and nothing else, so
+# Homebrew binaries the backend shells out to (exiftool, ollama) are invisible
+# to it. Bake THIS shell's PATH into the plist — the installer runs from a
+# terminal, so it has the real one. Homebrew prefixes are appended defensively
+# in case the installing shell is itself minimal.
+AGENT_PATH="$PATH"
+for extra in /opt/homebrew/bin /usr/local/bin; do
+    case ":$AGENT_PATH:" in
+        *":$extra:"*) ;;
+        *) [ -d "$extra" ] && AGENT_PATH="$AGENT_PATH:$extra" ;;
+    esac
+done
+
+if ! command -v exiftool >/dev/null 2>&1; then
+    echo "WARNING: exiftool is not on this shell's PATH." >&2
+    echo "         RAF/HIF files will be analysed without any EXIF." >&2
+fi
+
+# The plist carries a __KAMERA_PATH__ placeholder; | is safe as the sed
+# delimiter because PATH entries are absolute paths containing /.
+sed "s|__KAMERA_PATH__|$AGENT_PATH|" "$SRC" > "$DEST"
 echo "Installed $DEST"
+echo "  PATH = $AGENT_PATH"
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$DEST"

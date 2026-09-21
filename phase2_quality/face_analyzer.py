@@ -127,9 +127,17 @@ def analyze_faces_array(rgb: np.ndarray) -> dict:
 
     # Downscale if the image is larger than MediaPipe needs — keeps inference fast
     # regardless of whether the caller passed half-size or full-res data.
+    bbox_upscale = 1.0
     if max(h_orig, w_orig) > _FACE_MAX_SIDE:
         scale = _FACE_MAX_SIDE / max(h_orig, w_orig)
         rgb = cv2.resize(rgb, (int(w_orig * scale), int(h_orig * scale)), interpolation=cv2.INTER_AREA)
+        # `face_bbox` is returned in the CALLER's pixels, not this downscaled
+        # frame's — callers crop the array they passed in (_embed_face,
+        # _photos_sharpness). Returning detector-frame pixels meant a 4032 px
+        # RAW got a bbox at 0.496× its true position, so every RAW face
+        # embedding cropped the wrong region (2026-09-19). Ratios above
+        # (size/offsets) are scale-free and unaffected.
+        bbox_upscale = 1.0 / scale
 
     height, width = rgb.shape[:2]
     model_path = _ensure_model()
@@ -178,7 +186,7 @@ def analyze_faces_array(rgb: np.ndarray) -> dict:
             'face_size_ratio': face_size_ratio,
             'face_center_offset_x': offset_x,
             'face_center_offset_y': offset_y,
-            'face_bbox': bbox,
+            'face_bbox': _scale_bbox(bbox, bbox_upscale),
             'smile_score': round(smile_score, 3),
             'mouth_open_score': round(mouth_open_score, 3),
             'faces_eyes_open': faces_eyes_open,
@@ -201,7 +209,7 @@ def analyze_faces_array(rgb: np.ndarray) -> dict:
             'face_size_ratio': face_size_ratio,
             'face_center_offset_x': offset_x,
             'face_center_offset_y': offset_y,
-            'face_bbox': bbox,
+            'face_bbox': _scale_bbox(bbox, bbox_upscale),
             'smile_score': None,      # blendshapes unavailable without landmarks
             'mouth_open_score': None,
             'faces_eyes_open': None,
@@ -494,6 +502,13 @@ def _face_region_sharpness(rgb: np.ndarray, bbox: tuple) -> float:
     gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
     lap = cv2.Laplacian(gray.astype(np.float64), cv2.CV_64F)
     return round(float(lap.var()), 1)
+
+
+def _scale_bbox(bbox: tuple, factor: float) -> tuple:
+    """Map a bbox from the detector's frame back to the caller's pixels."""
+    if factor == 1.0:
+        return bbox
+    return tuple(int(round(v * factor)) for v in bbox)
 
 
 def _no_face_result(error: Optional[str] = None) -> dict:

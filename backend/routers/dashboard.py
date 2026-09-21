@@ -12,6 +12,27 @@ Six endpoints:
   GET /dashboard/shooting/cameras           — count + last_shot per camera
   GET /dashboard/shooting/distributions     — focal length, aperture, ISO, film sim, lens histograms
   GET /dashboard/shooting/timeline          — shots per week/month
+
+Two filter dimensions, and they do NOT cover the same endpoints:
+
+  `corpus`  ('folder' | 'photos') applies to the three model/decision
+            endpoints only. Since the 2026-09-19 corpus split each corpus
+            trains its own model on its own slice of training_samples;
+            pooling them here would average the two incompatible
+            distributions the split exists to keep apart.
+
+  `since`   applies to every endpoint EXCEPT the model's own facts.
+            training_size / trained_at / accuracy describe one pickle that
+            was fit on everything — there is no 30-day model to report.
+            model-card therefore answers `since` with `window_sample_count`
+            (how many decisions landed inside the window) and leaves the
+            model facts all-time, so the frontend can label them honestly
+            instead of implying the number moved.
+
+The shooting endpoints are deliberately corpus-agnostic: shooting_log has no
+source_type column, and a phone frame is still a frame you shot. The frontend
+labels that section "all sources" rather than letting the corpus switch
+silently appear to filter it.
 """
 
 import logging
@@ -48,17 +69,62 @@ def _parse_since(since: str | None) -> str | None:
     return since
 
 
+# Corpora that own a model + a training_samples slice. Mirrors
+# state._personal_models — an unknown name is rejected rather than silently
+# falling back to 'folder', because a dashboard that answers the wrong corpus
+# with a straight face is worse than one that errors.
+_CORPORA = ("folder", "photos")
+
+
+def _parse_corpus(corpus: str | None) -> str:
+    """Validate the corpus name, defaulting to 'folder'."""
+    if corpus is None or corpus == "":
+        return "folder"
+    if corpus not in _CORPORA:
+        raise HTTPException(
+            status_code=400,
+            detail=f"corpus must be one of {_CORPORA}, got {corpus!r}",
+        )
+    return corpus
+
+
 # ---------------------------------------------------------------------------
 # Model card
 # ---------------------------------------------------------------------------
 
 
 @router.get("/model-card")
-def model_card():
-    """Same payload as /model-info — kept under /dashboard/* so the frontend
-    can fetch all dashboard data through one prefix without bouncing between
-    namespaces. No payload duplication: we call the same function."""
-    return personal_model_info()
+def model_card(corpus: str | None = None, since: str | None = None):
+    """/model-info for one corpus, plus the window count the timeframe chips
+    are allowed to move.
+
+    Kept under /dashboard/* so the frontend fetches every card through one
+    prefix. No payload duplication — we call personal_model_info directly.
+
+    `since` does NOT window the model's own facts (see the module docstring).
+    It adds two fields instead:
+
+      window_sample_count — decisions in this corpus inside the window
+      window_since        — the window's start, echoed back so the frontend
+                            can label the card without recomputing the date
+    """
+    corpus = _parse_corpus(corpus)
+    since = _parse_since(since)
+    info = personal_model_info(corpus)
+
+    if since:
+        with get_db() as conn:
+            window_count = conn.execute(
+                "SELECT COUNT(*) FROM training_samples "
+                "WHERE corpus = ? AND decided_at >= ?",
+                (corpus, since),
+            ).fetchone()[0]
+    else:
+        window_count = info.get("decided_count", 0)
+
+    info["window_sample_count"] = window_count
+    info["window_since"] = since
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +133,12 @@ def model_card():
 
 
 @router.get("/decisions/timeline")
-def decisions_timeline(bucket: str = Query("week"), since: str | None = None):
-    """K/M/X counts per time bucket from training_samples.
+def decisions_timeline(
+    bucket: str = Query("week"),
+    since: str | None = None,
+    corpus: str | None = None,
+):
+    """K/M/X counts per time bucket from training_samples, for one corpus.
 
     Returns rows ordered chronologically. Empty buckets are omitted (the
     frontend renders that as a gap, which matches honest reality — we
@@ -78,9 +148,10 @@ def decisions_timeline(bucket: str = Query("week"), since: str | None = None):
     if fmt is None:
         return {"bucket": bucket, "rows": [], "error": "bucket must be 'week' or 'month'"}
     since = _parse_since(since)
+    corpus = _parse_corpus(corpus)
 
-    where = "WHERE decided_at >= ?" if since else ""
-    params: tuple = (fmt, since) if since else (fmt,)
+    where = "WHERE corpus = ?" + (" AND decided_at >= ?" if since else "")
+    params: tuple = (fmt, corpus, since) if since else (fmt, corpus)
 
     with get_db() as conn:
         rows = conn.execute(
@@ -104,6 +175,7 @@ def decisions_timeline(bucket: str = Query("week"), since: str | None = None):
 
     return {
         "bucket": bucket,
+        "corpus": corpus,
         "rows": [
             {"period": p, **counts}
             for p, counts in sorted(pivot.items())
@@ -112,33 +184,48 @@ def decisions_timeline(bucket: str = Query("week"), since: str | None = None):
 
 
 @router.get("/decisions/feature-deltas")
-def decisions_feature_deltas(since: str | None = None):
-    """For each of the 17 features, the median value among kept photos vs the
-    median among rejected photos. SQLite has no median aggregate, so we load
-    feature_json blobs and compute in numpy.
+def decisions_feature_deltas(since: str | None = None, corpus: str | None = None):
+    """For each feature, the median value among kept photos vs the median
+    among rejected photos, within one corpus. SQLite has no median aggregate,
+    so we load feature_json blobs and compute in numpy.
 
-    Returns 17 rows: kept_median, rejected_median, n_kept, n_rejected.
-    Both medians can be null if either side has zero samples — the frontend
-    renders that as "—".
+    Per-feature rows carry kept_median, rejected_median, n_kept, n_rejected —
+    where the two n's count the *non-NaN* values in that column, which is what
+    the median was actually taken over.
+
+    The response also carries top-level `n_kept_photos` / `n_rejected_photos`:
+    the number of decisions on each side. The frontend's header shows photos,
+    not column counts — a feature that is NaN for half the corpus (e.g. face
+    metrics on landscapes) would otherwise make the header under-report how
+    many photos the user has judged.
     """
     names = feature_names()
     since = _parse_since(since)
+    corpus = _parse_corpus(corpus)
 
-    sql = "SELECT decision, features_json FROM training_samples WHERE decision IN ('keep', 'reject')"
-    params: tuple = ()
+    sql = (
+        "SELECT decision, features_json FROM training_samples "
+        "WHERE decision IN ('keep', 'reject') AND corpus = ?"
+    )
+    params: tuple = (corpus,)
     if since:
         sql += " AND decided_at >= ?"
-        params = (since,)
+        params = (corpus, since)
 
     with get_db() as conn:
         rows = conn.execute(sql, params).fetchall()
 
     if not rows:
-        return {"features": [
-            {"feature": n, "kept_median": None, "rejected_median": None,
-             "n_kept": 0, "n_rejected": 0}
-            for n in names
-        ]}
+        return {
+            "corpus": corpus,
+            "n_kept_photos": 0,
+            "n_rejected_photos": 0,
+            "features": [
+                {"feature": n, "kept_median": None, "rejected_median": None,
+                 "n_kept": 0, "n_rejected": 0}
+                for n in names
+            ],
+        }
 
     kept_vecs:    list[np.ndarray] = []
     rejected_vecs: list[np.ndarray] = []
@@ -167,16 +254,34 @@ def decisions_feature_deltas(since: str | None = None):
             "feature":         name,
             "kept_median":     float(np.median(kept_clean)) if kept_clean.size else None,
             "rejected_median": float(np.median(rej_clean))  if rej_clean.size  else None,
+            # Means exist for the 0/1 features, where a median is a majority
+            # vote and reads as nonsense: "face present, kept 0.00 vs rejected
+            # 1.00" tells you which side won, not by how much. The mean of a
+            # binary column IS the share, so the frontend can say "faces
+            # appear in 12% of keeps and 68% of rejects" instead.
+            "kept_mean":       float(np.mean(kept_clean)) if kept_clean.size else None,
+            "rejected_mean":   float(np.mean(rej_clean))  if rej_clean.size  else None,
             "n_kept":          int(kept_clean.size),
             "n_rejected":      int(rej_clean.size),
         })
 
-    return {"features": out}
+    return {
+        "corpus": corpus,
+        "n_kept_photos": len(kept_vecs),
+        "n_rejected_photos": len(rejected_vecs),
+        "features": out,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Shooting behavior — sourced from shooting_log (permanent, decoupled from
-# the images table)
+# the images table).
+#
+# Deliberately NOT corpus-filtered: shooting_log has no source_type column,
+# and the question these answer ("what do I shoot with?") doesn't split along
+# the model's corpus boundary — a phone frame is still a frame you shot. The
+# frontend labels the section "all sources" so the corpus switch never looks
+# like it filters something it doesn't.
 # ---------------------------------------------------------------------------
 
 

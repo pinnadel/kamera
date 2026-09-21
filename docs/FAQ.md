@@ -228,8 +228,10 @@ touched contributes nothing to training.
 **Short answer:** Yes, but into a *second* model, not the camera one — and that
 model stays silent until its corpus is much larger than the camera model's was.
 
-There is one model per corpus. `training_samples.corpus` tags each sample
-`folder` (camera) or `photos` (Apple Photos), taken straight from
+There is one model per corpus — the **camera model** and the **iPhone model**
+in the UI, `folder` and `photos` in the database (the internal keys predate the
+names and are not worth a migration). `training_samples.corpus` tags each sample,
+taken straight from
 `images.source_type` ([decisions.py:409](backend/routers/decisions.py#L409)), and
 [`state.model_for()`](backend/state.py) hands each row to the model trained on
 its own distribution. They never mix: an iPhone HEIC and a RAF score on
@@ -237,7 +239,7 @@ incompatible sharpness / aperture / ISO distributions, so one GBR over both
 would learn contradictory labels — the same reasoning as the RAW+JPEG
 companion's `_train=False`.
 
-Two things differ for the Photos model:
+Two things differ for the iPhone model:
 
 - **Its training floor is 150, not 30** ([`min_decisions_for()`](phase3_learning/personal_model.py)).
   An iPhone's computational pipeline flattens exactly the variance the model
@@ -251,7 +253,7 @@ Two things differ for the Photos model:
   no longer a quality percentage in either model, which is why the decision
   cutoffs are derived from the fit instead of typed in.
 
-Until the Photos model reaches the ready tier, Photos rows show no
+Until the iPhone model reaches the ready tier, Photos rows show no
 `personal_score` and auto-cull on a Photos tab declines with a count of how many
 decisions are still needed ([`_require_auto_cull_model`](backend/routers/decisions.py)).
 That refusal is deliberate: falling back to the quality thresholds there would
@@ -376,13 +378,42 @@ Apple's own smart albums (Favourites, Recents, Screenshots, Selfies…) are not
 offered. They are not addressable the same way and their names exist only as
 runtime localisations, so KaMeRa offers the ones you made yourself.
 
+### New photos are in my Smart Album but I cannot see them in KaMeRa
+
+**Short answer:** Tab settings → **Re-analyse album**. It re-reads the album
+and analyses anything new; everything already analysed is skipped. Then read
+the result banner — it now says what it could *not* take.
+
+A Smart Album is a stored query, so it gains members on its own. Nothing polls
+for that: the Resume banner measures against the asset count the last run
+recorded, so an album that grew still reports nothing missing — the counter is
+written by the very run it is supposed to prompt.
+
+**If almost nothing appears, the photos are probably still in iCloud.** This is
+the common case for photos shot in the last day or two: the asset is in the
+album, but its original file has not come down to this Mac yet. Analysis reads
+the original — the local 768×1024 derivative would produce a sharpness score
+that means nothing and would then enter the training corpus as if it were real
+([photos_library.py](../backend/photos_library.py), `album_assets`). Measured on
+one real album: of 18 new members, 16 were iCloud-only.
+
+The result banner names them in amber. To fix it, select those photos in
+Photos, choose **Download Original**, wait for the download, then re-analyse.
+Videos are listed separately and greyed out — they are never analysed.
+
+**Compare with Photos** shows the same photos under *"In the album, never
+analysed"*, with the iCloud ones marked *not downloaded*. It is the better view
+when you want the list before acting, but it re-parses the whole library
+catalogue (~11s on a 2000-photo album), so the button is the faster route when
+you just want them in.
+
 ### I changed a KaMeRa keyword in Photos — does KaMeRa notice?
 
 **Not on its own.** Decisions flow one way: KaMeRa writes the keyword and never
 reads it back. Open the Photos tab's settings and press **Compare with Photos**
 to see the drift and decide what wins.
 
-The comparison sorts every disagreement into five kinds, because they do not all
+The comparison sorts every disagreement into six kinds, because they do not all
 have the same answer:
 
 | What it found | What it usually means | Default |
@@ -392,12 +423,27 @@ have the same answer:
 | Decided in Photos only | You set the keyword directly in Photos | Leave alone |
 | No longer in this album | The photo left the album | Leave alone |
 | Gone from the library | The photo was deleted | Leave alone |
+| In the album, never analysed | Photos joined the album after the last run | Leave alone |
 
 **Why only the first one is preselected:** Photos and KaMeRa disagree for good
 reasons in both directions — a keyword you set by hand is a real decision, and so
 is one you made here. Picking a winner automatically would be wrong about half the
 time and you would never see it happen. The first row is different: there is no
 contradiction there, one side simply never got the message.
+
+**The last row is the only one that is not a disagreement.** A Smart Album is a
+stored query, so it picks up new photos on its own — those sit in the album with
+no scores and cannot be culled. Choosing *Analyse them* does not write anything
+from the comparison; it runs the album's ordinary analysis afterwards, which
+skips everything already done. Videos and formats KaMeRa cannot decode are not
+listed: they are permanent non-members of the analysable set, and an album's few
+hundred videos would bury the photos that matter.
+
+Photos whose **original is still in iCloud** are listed but marked *not
+downloaded*. Analysis reads the original file; the local 768×1024 derivative
+would produce a sharpness score that means nothing and then enter the training
+corpus as if it were real. Select them in Photos, choose **Download Original**,
+then run the comparison again.
 
 Two things it refuses rather than guesses:
 
@@ -803,7 +849,7 @@ See `_promote_ai_pick` in
 ### How does AI burst ranking work?
 
 When you open a similarity group, the app sends up to 12 preview JPEGs in one
-chat call to a local vision model (qwen2.5vl:7b by default, via Ollama) and
+chat call to a local vision model (qwen3-vl:30b-a3b-instruct by default, via Ollama) and
 asks it to rank them best-to-worst with a one-line reason per photo. The
 result is cached in the `burst_rankings` SQLite table keyed by the sha1 of
 the sorted member-ids — so re-opening the same group is instant. Re-clustering
@@ -838,7 +884,7 @@ Reject rest" batch action) — it never writes a decision on its own, and
 reference to it. The personal GBR model (trained only on your own manual
 decisions) is the only thing that drives auto-cull.
 
-The reasoning: `qwen2.5vl` is a generic vision model with generic "good photo"
+The reasoning: `qwen3-vl` is a generic vision model with generic "good photo"
 priors, not your taste specifically. Letting it influence a *committed*
 decision — even just as a tiebreaker in the burst-keep-guarantee post-pass,
 which only ever promotes to Maybe — would mean a generic model's judgment
@@ -881,17 +927,19 @@ Re-posting growing supersets is safe — the backend's `enqueue_groups` skips an
 
 If a burst hits an analyzed RAF or NEF whose preview hasn't been generated yet (Z6III HE\* NEFs always; RAFs whose viewer cache wasn't warmed), the ranker now generates one on the fly using the same `_generate_preview` path as `/previews/<id>` and writes it back to the cache — so the viewer benefits too. See [phase2_quality/burst_ranker.py](../phase2_quality/burst_ranker.py) `_resolve_preview_bytes`.
 
-### How do I install the qwen2.5vl vision model?
+### How do I install the qwen3-vl vision model?
 
 Two paths, both end at the same result:
 
 1. **In-app (recommended).** When the app detects no vision model is installed,
    the GroupLoupe top bar and the Settings → AI explainer panel both show a
-   "Pull qwen2.5vl now (≈6 GB)" button. Click it, the download runs in a
+   "Pull qwen3-vl now (≈20 GB)" button. Click it, the download runs in a
    background thread and reports progress through the same model-status banner
    that shows SigLIP/TOPIQ-NR/TOPIQ-IAA/FaceNet downloads. The model is reused
    forever after.
-2. **Terminal.** `ollama pull qwen2.5vl:7b`. Same result, no app interaction.
+2. **Terminal.** `ollama pull qwen3-vl:30b-a3b-instruct`. Same result, no app interaction.
+
+Upgrading from `qwen2.5vl:7b`? Both can stay installed — the app prefers `qwen3-vl` whenever it is present (order of `_VISION_PREFIXES` in [phase2_quality/llm_explainer.py](../phase2_quality/llm_explainer.py)). Free the 6 GB with `ollama rm qwen2.5vl:7b` once you are happy with it.
 
 Users who previously had `moondream` installed can free the disk with
 `ollama rm moondream` — the app no longer uses it. (Moondream was removed
@@ -990,3 +1038,120 @@ picture pane) or Esc close DetailView.
 ---
 
 *Last updated: 2026-07-27*
+
+---
+
+### Why did a blurry photo get Sharpness 100?
+
+Only on the old metric, and only when the frame was grainy. It measured how much
+*contrast energy* the pixels carry, and sensor noise carries plenty — at ISO 1000
+on an iPhone the grain alone reads as "sharp". Photos now use edge width instead
+([edge_sharpness.py](../phase1_technical/edge_sharpness.py)): how many pixels an
+edge takes to go from dark to light. Blur widens it; grain and contrast don't
+change it. Folder photos still use the old metric on purpose — its thresholds are
+tuned on that scale.
+
+### Why does a photo with a sharp background but a soft face still say "soft face"?
+
+Because that is its own reject reason, and it has to be. On iPhone photos the
+sharpness number you see is the *lower* of frame and face — a soft face drags
+the whole score down, which is the point. But the soft-face rule needs the
+frame's own sharpness to ask its question ("the camera focused on something,
+just not the face"), so it reads a separate stored measurement
+([edge_width_px](../backend/routers/decisions.py)) rather than the score on screen.
+
+It matters more than it looks: once the model is ready, auto-cull decides on the
+model's verdict and never reaches the "blurry frame" fallback, so soft-face is
+the only sharpness guard left standing.
+
+### What is the difference between the camera model and the iPhone model?
+
+They are two taste models over two separate sets of your decisions, because an
+iPhone HEIC and a camera RAW score on incompatible distributions. Camera photos
+(folder tabs) train the camera model; Apple Photos albums train the iPhone one.
+They need different amounts of evidence — 30 decisions against 150 — and in the
+database they are still called `folder` and `photos`.
+
+## Dashboard
+
+### Why doesn't the timeframe filter change the taste-model card?
+
+**Short answer:** Because there is no 30-day model. The chips window
+*decisions*; the model card reports a single pickle that was fit on the whole
+corpus, so it reports how many decisions landed inside the window instead of
+pretending its own numbers moved.
+
+`training_size`, `trained_at` and the accuracy-vs-baseline pair all describe
+one artifact on disk (`data/models/personal_model.pkl`). Nothing about them is
+time-sliceable: narrowing to 30 days doesn't produce a model trained on 30
+days, it just changes which rows a *query* sees.
+
+The old dashboard passed `since` to five endpoints and silently dropped it on
+the sixth. The chips sat above all four cards, so selecting "30d" changed three
+and left one alone with no explanation — "Trained on 2 971 decisions" read as a
+30-day figure.
+
+[dashboard.py](backend/routers/dashboard.py) now returns two extra fields from
+`/dashboard/model-card`:
+
+- `window_sample_count` — decisions in this corpus inside the window
+- `window_since` — the window's start, echoed so the frontend can label the
+  card without recomputing the date
+
+and [ModelCard.jsx](frontend/src/views/dashboard/ModelCard.jsx) renders the
+footnote *"Model facts are all-time — a 30d window can't retrain the model. 823
+decisions landed inside it."*
+
+If you actually want a model over a narrower slice, that's a retrain, not a
+filter — Settings → Model → Retrain now, after the corpus itself has changed.
+
+### Why does the dashboard have a Folder / Photos switch?
+
+**Short answer:** Since 2026-09-19 each corpus trains its own model on its own
+slice of `training_samples`, and pooling their statistics produces medians that
+describe neither.
+
+The split exists because iPhone HEIC and camera RAW have incompatible
+distributions — the Photos corpus has a median `overall_score` of 93.1 with
+half the rows inside a six-point band, where the folder corpus spreads across
+the full range. A GBR fit across both learns the difference between *cameras*,
+not between your keeps and rejects. Same reasoning as the RAW+JPEG companion's
+`_train=False` (see CLAUDE.md).
+
+Three endpoints take `corpus`:
+
+- `/dashboard/model-card` — which pickle, and which floor (folder 30,
+  photos 150, from `min_decisions_for()`)
+- `/dashboard/decisions/timeline` — K/M/R per week
+- `/dashboard/decisions/feature-deltas` — kept vs rejected medians
+
+An unrecognised corpus is a **400**, not a fallback to folder
+([dashboard.py](backend/routers/dashboard.py) `_parse_corpus`): a dashboard
+that answers the wrong corpus with a straight face is worse than one that
+errors.
+
+**Shooting behavior is not filtered by it.** `shooting_log` has no
+`source_type` column, and the question it answers ("what do I shoot with?")
+doesn't split along the model's boundary — a phone frame is still a frame you
+shot. The card header says "all sources" so the switch never appears to filter
+something it doesn't.
+
+### What does the ✗ in "What you keep vs reject" mean?
+
+**Short answer:** It means your behaviour disagrees with what the feature
+itself considers better — and that's the interesting row, not an error.
+
+Each feature carries a `good` direction in
+[KeepVsReject.jsx](frontend/src/views/dashboard/KeepVsReject.jsx) —
+`'higher'` (sharpness), `'lower'` (ISO, clipping), or `'context'` (focal
+length: a 35mm frame isn't objectively better than a 50mm one). The ✓/✗
+compares the sign of `kept_median − rejected_median` against that direction.
+
+A ✗ on `sharpness_score` says you are keeping the *softer* photos. That isn't
+a bug in the scorer; it's the part of your taste the technical score can't
+express, and it's exactly what the GBR delta model exists to learn. `context`
+features get no glyph, because there's nothing to agree or disagree with.
+
+The medians are computed over `features_json` blobs frozen at decision time,
+so they reflect what the photo scored *when you judged it*, not what a rescore
+would say today.

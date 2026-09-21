@@ -15,13 +15,18 @@
 //   idle → pulling → done       (model is now installed; caller refetches /lm-status)
 //                  → error      (HTTP error, daemon not running, or poll timeout)
 //
-// Times out after 30 minutes — a stalled pull shouldn't hang the UI forever.
+// Times out after 90 minutes — the recommended model is ≈20 GB, and a stalled
+// pull still shouldn't hang the UI forever.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { API } from '../api'
 
 const POLL_INTERVAL_MS = 2000
-const POLL_TIMEOUT_MS  = 30 * 60 * 1000  // 30 minutes — generous for slow links
+const POLL_TIMEOUT_MS  = 90 * 60 * 1000  // 90 minutes — ≈20 GB on a slow link
+
+// Single source of truth for the vision model the UI recommends. Backend
+// preference order lives in llm_explainer._VISION_PREFIXES.
+export const VISION_MODEL = { name: 'qwen3-vl:30b-a3b-instruct', label: 'qwen3-vl', size: '≈20 GB' }
 
 export function usePullModel() {
   const [state, setState]     = useState('idle')   // idle | pulling | done | error
@@ -49,7 +54,7 @@ export function usePullModel() {
     }
   }, [])
 
-  const pull = useCallback(async (name = 'qwen2.5vl:7b') => {
+  const pull = useCallback(async (name = VISION_MODEL.name) => {
     stopPolling()
     setState('pulling')
     setDetail(null)

@@ -535,6 +535,10 @@ export default function App() {
   const progress        = activeTab?.progress        ?? null
   const analyzeResult   = activeTab?.analyzeResult   ?? null
   const resultDismissed = activeTab?.resultDismissed ?? false
+  // What the last album run could not take. Collected since the Photos source
+  // shipped and never rendered until now — which is why "I re-analysed and my
+  // new photos still are not here" had no answer anywhere in the UI.
+  const photosSkipped   = activeTab?.photosSkipped   ?? null
   // Watch-live indicator (the /watch path, e.g. Provenance's Import & Analyze)
   // — separate from `analyzing` (the /analyze-folder batch path). Files
   // trickle in continuously so there's no fixed total; liveAnalyzed+liveLeft
@@ -1562,6 +1566,36 @@ export default function App() {
     e.dataTransfer.setData('application/json', JSON.stringify({ kind: 'photos', image_ids: ids }))
     e.dataTransfer.setData('text/plain', ids.join(','))
   }, [])
+
+  // Group-tile drag & drop: dragging a stacked tile onto another one merges
+  // them. The payload is the same `photos` shape a card drag carries, so the
+  // drop side doesn't care whether a photo or a whole tile landed on it.
+  // Source = the photos the tile shows (undecided members, or the decided
+  // run in this view).
+  const groupTileDragStart = useCallback((e, imageIds) => {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('application/json', JSON.stringify({ kind: 'photos', image_ids: imageIds }))
+    e.dataTransfer.setData('text/plain', imageIds.join(','))
+  }, [])
+
+  // The target's full member list rides along with the incoming photos so the
+  // whole target cluster gets anchored to one manual_group_id. Anchoring only
+  // the hero would strand its auto-clustered siblings in a separate group.
+  const dropOntoGroupTile = useCallback((e, targetHeroId, targetMemberIds) => {
+    e.preventDefault()
+    setDropHoverGroupId(null)
+    try {
+      const raw = e.dataTransfer.getData('application/json')
+      if (!raw) return
+      const payload = JSON.parse(raw)
+      if (payload?.kind !== 'photos' || !Array.isArray(payload.image_ids) || payload.image_ids.length === 0) return
+      const targetSet = new Set(targetMemberIds)
+      if (payload.image_ids.every(id => targetSet.has(id))) return // dropped on itself
+      const ids = [...new Set([...payload.image_ids, ...targetMemberIds])].filter(id => id !== targetHeroId)
+      setManualGroup({ image_ids: ids, mode: 'join_group', target_image_id: targetHeroId })
+      gridMultiSelect.exit()
+    } catch { /* silently ignore malformed payloads */ }
+  }, [setManualGroup, gridMultiSelect])
 
   const markReviewed = useCallback(async (imageId) => {
     try {
@@ -3325,6 +3359,27 @@ export default function App() {
                 </button>
               </div>
 
+              {/* Album-only. Analysis reads the ORIGINAL file; an iCloud-only
+                  photo leaves just a 768×1024 derivative, and scoring that
+                  would put a meaningless sharpness number into the training
+                  corpus. So it is skipped — and saying so is the difference
+                  between "KaMeRa is broken" and "download these first". */}
+              {photosSkipped && photosSkipped.missingOriginals > 0 && (
+                <p className="mt-2 pt-2 border-t border-[rgba(255,255,255,0.05)] text-[11px] text-[#E8B84A] leading-relaxed">
+                  {photosSkipped.missingOriginals} photo{photosSkipped.missingOriginals === 1 ? '' : 's'} in this album
+                  {photosSkipped.missingOriginals === 1 ? ' was' : ' were'} not read — the original is still in iCloud,
+                  not on this Mac. Select {photosSkipped.missingOriginals === 1 ? 'it' : 'them'} in Photos, choose
+                  Download Original, then re-analyse the album.
+                </p>
+              )}
+
+              {photosSkipped && photosSkipped.videos > 0 && (
+                <p className="mt-1.5 text-[11px] text-[#6a6b6c] leading-relaxed">
+                  {photosSkipped.videos} video{photosSkipped.videos === 1 ? '' : 's'} in this album
+                  {photosSkipped.videos === 1 ? ' is' : ' are'} never analysed — KaMeRa scores photos.
+                </p>
+              )}
+
               {skippedExpanded && skippedFiles.length > 0 && (
                 <div className="mt-2 pt-2 border-t border-[rgba(255,255,255,0.05)] space-y-1 max-h-32 overflow-y-auto">
                   {skippedFiles.map((name, i) => (
@@ -3966,22 +4021,13 @@ export default function App() {
                         setDropHoverGroupId(null)
                       }
                     }}
-                    onDrop={(e) => {
-                      e.preventDefault()
-                      setDropHoverGroupId(null)
-                      try {
-                        const raw = e.dataTransfer.getData('application/json')
-                        if (!raw) return
-                        const payload = JSON.parse(raw)
-                        if (payload?.kind !== 'photos' || !Array.isArray(payload.image_ids) || payload.image_ids.length === 0) return
-                        setManualGroup({
-                          image_ids: payload.image_ids,
-                          mode: 'join_group',
-                          target_image_id: item.group.best_image_id,
-                        })
-                        gridMultiSelect.exit()
-                      } catch { /* silently ignore malformed payloads */ }
-                    }}
+                    onDragStart={(e) => groupTileDragStart(e, item.undecidedImages.map(i => i.id))}
+                    onDragEnd={() => setDropHoverGroupId(null)}
+                    onDrop={(e) => dropOntoGroupTile(
+                      e,
+                      item.group.best_image_id,
+                      (item.group.images || item.undecidedImages).map(i => i.id),
+                    )}
                   />
                 </div>
               ) : item.type === 'decidedGroup' ? (
@@ -4012,6 +4058,22 @@ export default function App() {
                     isSelectMode={gridMultiSelect.isSelectMode}
                     showFilename={showFilenames}
                     scrub={groupScrub}
+                    isDropHover={dropHoverGroupId === item.hero.id}
+                    onDragStart={(e) => groupTileDragStart(e, item.images.map(i => i.id))}
+                    onDragEnd={() => setDropHoverGroupId(null)}
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      if (dropHoverGroupId !== item.hero.id) setDropHoverGroupId(item.hero.id)
+                    }}
+                    onDragLeave={() => {
+                      if (dropHoverGroupId === item.hero.id) setDropHoverGroupId(null)
+                    }}
+                    onDrop={(e) => dropOntoGroupTile(
+                      e,
+                      item.hero.id,
+                      (item.groupChip?.members || item.images).map(i => i.id),
+                    )}
                     onSelect={() => {
                       setSelectedGroupId(null)
                       setSelectedDecidedGroupKey(item.groupKey)
@@ -4486,6 +4548,25 @@ export default function App() {
                         onto the photo in Photos. Files are never moved, and undo removes the keyword again.
                         Build a Smart Album on a keyword to collect them.
                       </p>
+
+                      {/* A Smart Album is a stored query, so it picks up new
+                          photos on its own. The Resume banner cannot see that:
+                          it measures against the count the last run recorded,
+                          so an album that grew still reports nothing missing.
+                          Compare with Photos does find them, but costs a full
+                          catalogue re-parse (~10s) — too heavy a door for the
+                          thing you do most often. */}
+                      <p className="text-xs text-[#9c9c9d] leading-relaxed mt-3 mb-2">
+                        New photos in the album? Re-analyse it — everything already analysed is skipped.
+                      </p>
+                      <button
+                        onClick={() => { setTabSettingsOpen(false); resumeAnalysisForTab(activeTab) }}
+                        className={BTN_CTA_SECONDARY}
+                        disabled={analyzing}
+                        title={analyzing ? 'An analysis is already running' : 'Re-read the album and analyse anything new'}
+                      >
+                        <RotateCcw size={16} /> Re-analyse album
+                      </button>
 
                       {/* Decisions only flow outward, so the two drift silently:
                           a keyword deleted in Photos, an asset removed from the

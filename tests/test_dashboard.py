@@ -309,3 +309,152 @@ def test_dashboard_data_survives_clear_images(dash_db):
 
     assert len(cams) == 1, "shooting_log should survive image deletion"
     assert len(timeline) == 1, "training_samples should survive image deletion"
+
+
+# ---------------------------------------------------------------------------
+# Corpus scoping (2026-09-19 split)
+#
+# Before the split these endpoints pooled every training_samples row. That
+# averaged the folder corpus (camera RAW) with the photos corpus (iPhone
+# HEIC) — the exact mixing the split exists to prevent, surfaced as a chart
+# claiming to describe one taste. These guard that a corpus only ever sees
+# its own rows.
+# ---------------------------------------------------------------------------
+
+
+def _seed_corpus_sample(db_path: Path, *, uuid: str, decision: str,
+                        corpus: str, sharpness: float) -> None:
+    """A training sample explicitly tagged with a corpus."""
+    names = feature_names()
+    features = {n: 0.0 for n in names}
+    features["sharpness_score"] = sharpness
+    with get_db(db_path) as conn:
+        conn.execute(
+            """INSERT INTO training_samples
+               (sample_uuid, decision, features_json, overall_score, schema_version, corpus)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (uuid, decision, json.dumps(features), 70.0, FEATURE_SCHEMA_VERSION, corpus),
+        )
+
+
+def test_timeline_is_scoped_to_one_corpus(dash_db):
+    _seed_corpus_sample(dash_db, uuid="f1", decision="keep",   corpus="folder", sharpness=80.0)
+    _seed_corpus_sample(dash_db, uuid="f2", decision="reject", corpus="folder", sharpness=20.0)
+    _seed_corpus_sample(dash_db, uuid="p1", decision="keep",   corpus="photos", sharpness=95.0)
+
+    folder = dash_mod.decisions_timeline(bucket="week", corpus="folder")
+    photos = dash_mod.decisions_timeline(bucket="week", corpus="photos")
+
+    assert folder["corpus"] == "folder"
+    assert sum(r["keep"] + r["reject"] for r in folder["rows"]) == 2
+    assert sum(r["keep"] + r["reject"] for r in photos["rows"]) == 1
+
+
+def test_feature_deltas_do_not_pool_corpora(dash_db):
+    # Folder keeps are soft (30), photos keeps are sharp (95). Pooled, the
+    # kept median lands between them and describes neither corpus.
+    _seed_corpus_sample(dash_db, uuid="f1", decision="keep",   corpus="folder", sharpness=30.0)
+    _seed_corpus_sample(dash_db, uuid="f2", decision="keep",   corpus="folder", sharpness=30.0)
+    _seed_corpus_sample(dash_db, uuid="f3", decision="reject", corpus="folder", sharpness=10.0)
+    _seed_corpus_sample(dash_db, uuid="p1", decision="keep",   corpus="photos", sharpness=95.0)
+    _seed_corpus_sample(dash_db, uuid="p2", decision="reject", corpus="photos", sharpness=90.0)
+
+    folder = dash_mod.decisions_feature_deltas(corpus="folder")
+    photos = dash_mod.decisions_feature_deltas(corpus="photos")
+
+    def sharp(payload):
+        return next(f for f in payload["features"] if f["feature"] == "sharpness_score")
+
+    assert sharp(folder)["kept_median"] == 30.0
+    assert sharp(photos)["kept_median"] == 95.0
+    assert folder["n_kept_photos"] == 2 and folder["n_rejected_photos"] == 1
+    assert photos["n_kept_photos"] == 1 and photos["n_rejected_photos"] == 1
+
+
+def test_photo_counts_are_decisions_not_column_counts(dash_db):
+    """n_kept_photos counts decisions; a feature that is NaN for some rows
+    must not drag the headline count down with it."""
+    names = feature_names()
+    with get_db(dash_db) as conn:
+        for i, decision in enumerate(["keep", "keep", "reject"]):
+            features = {n: 0.0 for n in names}
+            # face metrics missing on every row — the classic landscape case
+            features["face_sharpness_score"] = None
+            conn.execute(
+                """INSERT INTO training_samples
+                   (sample_uuid, decision, features_json, overall_score, schema_version, corpus)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (f"n{i}", decision, json.dumps(features), 70.0, FEATURE_SCHEMA_VERSION, "folder"),
+            )
+
+    payload = dash_mod.decisions_feature_deltas(corpus="folder")
+    face = next(f for f in payload["features"] if f["feature"] == "face_sharpness_score")
+
+    assert face["n_kept"] == 0, "the column itself has no observed values"
+    assert payload["n_kept_photos"] == 2, "but two photos were kept"
+    assert payload["n_rejected_photos"] == 1
+
+
+def test_unknown_corpus_is_rejected_not_silently_folder(dash_db):
+    from fastapi import HTTPException
+
+    for endpoint in (
+        lambda: dash_mod.decisions_timeline(bucket="week", corpus="nonsense"),
+        lambda: dash_mod.decisions_feature_deltas(corpus="nonsense"),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            endpoint()
+        assert exc.value.status_code == 400
+
+
+def test_model_card_reports_window_without_windowing_the_model(dash_db, monkeypatch):
+    """`since` must not appear to shrink the model's training size — the
+    pickle was fit on everything. It reports a window count instead."""
+    monkeypatch.setattr(
+        dash_mod, "personal_model_info",
+        lambda corpus="folder": {"ready": True, "training_size": 999,
+                                 "decided_count": 3, "corpus": corpus},
+    )
+    _seed_corpus_sample(dash_db, uuid="a", decision="keep", corpus="folder", sharpness=50.0)
+
+    with get_db(dash_db) as conn:
+        conn.execute("UPDATE training_samples SET decided_at = '2020-01-01 00:00:00'")
+
+    out = dash_mod.model_card(corpus="folder", since="2026-01-01")
+    assert out["training_size"] == 999, "model facts stay all-time"
+    assert out["window_sample_count"] == 0, "but the window is reported honestly"
+    assert out["window_since"] == "2026-01-01"
+
+
+def test_feature_deltas_expose_means_for_binary_features(dash_db):
+    """Binary features need a share, not a median.
+
+    The median of a 0/1 column is a majority vote: for `face_present` it
+    printed "kept 0.00 vs rejected 1.00", which reads as "my keeps NEVER have
+    faces and my rejects ALWAYS do". The real shares were 47% and 57% — a
+    near-nothing difference stated as an absolute. The mean of a binary column
+    is exactly that share.
+    """
+    names = feature_names()
+    # 3 keeps, 2 of which have a face; 2 rejects, 1 with a face.
+    plan = [("k1", "keep", 1.0), ("k2", "keep", 1.0), ("k3", "keep", 0.0),
+            ("r1", "reject", 1.0), ("r2", "reject", 0.0)]
+    with get_db(dash_db) as conn:
+        for uuid, decision, face in plan:
+            features = {n: 0.0 for n in names}
+            features["face_present"] = face
+            conn.execute(
+                """INSERT INTO training_samples
+                   (sample_uuid, decision, features_json, overall_score, schema_version, corpus)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (uuid, decision, json.dumps(features), 70.0, FEATURE_SCHEMA_VERSION, "folder"),
+            )
+
+    payload = dash_mod.decisions_feature_deltas(corpus="folder")
+    face = next(f for f in payload["features"] if f["feature"] == "face_present")
+
+    # The median says "keeps always have faces, rejects are a coin flip".
+    assert face["kept_median"] == 1.0
+    # The mean says what actually happened: 2 of 3 vs 1 of 2.
+    assert face["kept_mean"] == pytest.approx(2 / 3)
+    assert face["rejected_mean"] == pytest.approx(0.5)

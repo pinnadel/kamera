@@ -5,7 +5,7 @@
 // and supply onDone (typically a refetch of /lm-status).
 //
 // Visual contract:
-//   idle      → cyan "Pull qwen2.5vl now (≈6 GB)" button
+//   idle      → cyan "Pull qwen3-vl now (≈20 GB)" button
 //   pulling   → amber pulse dot + "Downloading… (takes a few minutes)"
 //   done      → green check + "Installed and ready"
 //   error     → coral hint + inline Retry link
@@ -18,7 +18,7 @@
 
 import { useEffect } from 'react'
 import { Check } from 'lucide-react'
-import { usePullModel } from '../hooks/usePullModel'
+import { usePullModel, VISION_MODEL } from '../hooks/usePullModel'
 
 function _formatEta(seconds) {
   if (typeof seconds !== 'number' || !isFinite(seconds) || seconds <= 0) return null
@@ -54,7 +54,7 @@ export function PullVisionModelButton({ onDone, compact = false }) {
   }, [state, onDone])
 
   if (state === 'pulling') {
-    // Copy shape: "Downloading qwen2.5vl · 1.0 of 5.6 GB · ~25 min left".
+    // Copy shape: "Downloading qwen3-vl · 1.0 of 19 GB · ~40 min left".
     // Bytes-downloaded vs. total is the most meaningful information here —
     // the user can map it to their network speed at a glance. Percent was
     // redundant (X-of-Y already conveys progress) so it's dropped.
@@ -62,7 +62,7 @@ export function PullVisionModelButton({ onDone, compact = false }) {
     // generic placeholder until bytes are flowing.
     const bytePair = progress ? _formatBytePair(progress.currentMb, progress.totalMb) : null
     const eta      = progress ? _formatEta(progress.etaSeconds) : null
-    const segments = ['Downloading qwen2.5vl']
+    const segments = [`Downloading ${VISION_MODEL.label}`]
     if (bytePair) segments.push(bytePair)
     if (eta)      segments.push(`~${eta} left`)
     return (
@@ -71,7 +71,7 @@ export function PullVisionModelButton({ onDone, compact = false }) {
         <span>
           {bytePair
             ? segments.join(' · ')
-            : `Downloading qwen2.5vl…${!compact ? ' (≈6 GB, takes a few minutes)' : ''}`}
+            : `Downloading ${VISION_MODEL.label}…${!compact ? ` (${VISION_MODEL.size}, takes a while)` : ''}`}
         </span>
       </div>
     )
@@ -80,17 +80,17 @@ export function PullVisionModelButton({ onDone, compact = false }) {
     return (
       <div className="flex items-center gap-2 text-xs text-[#7DB89A]">
         <Check size={13} />
-        <span>qwen2.5vl installed and ready</span>
+        <span>{VISION_MODEL.label} installed and ready</span>
       </div>
     )
   }
   return (
     <div className="flex items-center gap-3 flex-wrap">
       <button
-        onClick={() => pull('qwen2.5vl:7b')}
+        onClick={() => pull(VISION_MODEL.name)}
         className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs bg-[rgba(91,184,212,0.12)] text-[#5BB8D4] border border-[rgba(91,184,212,0.30)] hover:opacity-70 transition-opacity"
       >
-        {compact ? 'Pull qwen2.5vl' : 'Pull qwen2.5vl now (≈6 GB)'}
+        {compact ? `Pull ${VISION_MODEL.label}` : `Pull ${VISION_MODEL.label} now (${VISION_MODEL.size})`}
       </button>
       {state === 'error' && (
         <span className="text-xs text-[#C97B7B] flex items-center gap-1.5">

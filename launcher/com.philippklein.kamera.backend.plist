@@ -31,6 +31,30 @@
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/philippklein/dev/kamera</string>
+    <!--
+      A LaunchAgent does NOT inherit the login shell's PATH. launchd hands the
+      job /usr/bin:/bin:/usr/sbin:/sbin, and `/bin/bash start.sh` is neither
+      interactive nor a login shell, so no profile is ever read.
+
+      That silently broke every RAF and HIF analysed through the app:
+      exiftool lives in /opt/homebrew/bin, pyexiftool could not find it, and
+      extract_exif returned an all-None dict. The photo still scored, so the
+      row was written with camera, shot_at, lens, focal length, aperture,
+      shutter and ISO all NULL — 1 530 rows of shooting_log, ~23% of the
+      corpus, with no error anywhere. JPEG/NEF/3FR were unaffected because
+      exifread is pure Python and needs no binary. `ollama` was equally
+      unreachable, so the LLM explainer was off too.
+
+      install_agent.sh rewrites this string with the installing shell's own
+      PATH, so it follows the machine rather than hardcoding a Homebrew
+      prefix. exif_parser.py additionally locates exiftool by absolute path
+      as a second line of defence.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__KAMERA_PATH__</string>
+    </dict>
     <key>RunAtLoad</key>
     <false/>
     <key>KeepAlive</key>

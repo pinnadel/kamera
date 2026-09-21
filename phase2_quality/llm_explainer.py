@@ -41,7 +41,9 @@ _MAX_TOKENS    = 160
 
 # Vision-capable Ollama model name prefixes. When picking a default model the
 # explainer prefers these so vision input actually informs the response.
-_VISION_PREFIXES = ("qwen2.5vl", "llava", "bakllava", "llama3.2-vision", "minicpm-v", "qwen2-vision")
+# Order is preference order: when several are installed, the earliest prefix wins
+# (qwen3-vl over its predecessor), not whichever Ollama happens to list first.
+_VISION_PREFIXES = ("qwen3-vl", "qwen2.5vl", "llava", "bakllava", "llama3.2-vision", "minicpm-v", "qwen2-vision")
 
 
 def _is_daemon_reachable() -> bool:
@@ -99,17 +101,27 @@ def list_models() -> list[str]:
         return []
 
 
+def pick_vision_from(models: list[str]) -> str | None:
+    """Best vision-capable name in `models` by `_VISION_PREFIXES` preference, else None.
+
+    Within a prefix, an `-instruct` build wins: the plain `qwen3-vl:30b` tag is
+    the *thinking* variant, which spends the whole `num_predict` budget on
+    reasoning and returns empty `content` (`think: false` is ignored by it).
+    """
+    for prefix in _VISION_PREFIXES:
+        matches = [m for m in models if m.lower().startswith(prefix)]
+        if matches:
+            return min(matches, key=lambda m: "instruct" not in m.lower())
+    return None
+
+
 def _pick_model() -> str | None:
     """Pick the best installed model for explanations. Vision-capable wins; falls
     back to first available text model. None when no models are pulled."""
     models = list_models()
     if not models:
         return None
-    for m in models:
-        name = m.lower()
-        if any(name.startswith(p) for p in _VISION_PREFIXES):
-            return m
-    return models[0]
+    return pick_vision_from(models) or models[0]
 
 
 def _is_vision_capable(model_name: str | None) -> bool:

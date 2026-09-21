@@ -1,7 +1,19 @@
-// DecisionHistory — stacked weekly K/M/X bars + all-time totals.
+// DecisionHistory — stacked weekly K/M/R bars + totals.
 //
-// Empty state: a single line of copy, no empty bars (per plan: "never render
-// an empty bar chart").
+// The bars used to be fixed 12px columns in an `overflow-x-auto` strip: over
+// a year that hid ~40 weeks behind a scrollbar with no affordance pointing at
+// them, inside a page that already scrolls vertically. They now flex to fill
+// the card, so the whole series is always visible and the card's width sets
+// the bar width instead of the other way round.
+//
+// Hover uses HoverPopover (portalled, themed) rather than the native `title`
+// tooltip — a light OS tooltip on a #07080a canvas was the loudest break with
+// the design system on this page.
+//
+// Empty state is one line of copy, never an empty axis.
+
+import { HoverPopover } from '../../ui/primitives'
+import { Card, Empty, useGrow } from './primitives'
 
 const COLORS = {
   keep:   '#7DB89A',
@@ -9,7 +21,7 @@ const COLORS = {
   reject: '#C97B7B',
 }
 
-export function DecisionHistory({ data }) {
+export function DecisionHistory({ data, error, loading, stale }) {
   const rows = data?.rows || []
 
   const totals = rows.reduce(
@@ -22,74 +34,106 @@ export function DecisionHistory({ data }) {
   )
   const grandTotal = totals.keep + totals.maybe + totals.reject
 
-  // Find the max bar height so weekly bars are scaled relative to the busiest
-  // week. Using the same scale across all bars makes the trend legible.
+  // One scale across all bars so the trend is legible; each bar's internal
+  // split is a share of its own week.
   const maxWeek = rows.reduce(
     (m, r) => Math.max(m, (r.keep || 0) + (r.maybe || 0) + (r.reject || 0)),
     0,
   )
 
-  const keepRate = grandTotal === 0 ? null : totals.keep / grandTotal
+  const busiest = rows.find(
+    r => (r.keep || 0) + (r.maybe || 0) + (r.reject || 0) === maxWeek,
+  )
 
   return (
-    <section className="rounded-xl border border-[#2a2b2d] bg-[#101111] p-6">
-      <div className="flex items-baseline justify-between mb-4">
-        <h2 className="text-base font-semibold text-[#f9f9f9]">Decision history</h2>
-        {grandTotal > 0 && (
-          <span className="text-xs text-[#9c9c9d]">
-            <span className="font-mono text-[#f9f9f9]">{grandTotal}</span> all-time
-            {keepRate != null && (
-              <>
-                {' · '}keep rate{' '}
-                <span className="font-mono text-[#7DB89A]">
-                  {(keepRate * 100).toFixed(0)}%
-                </span>
-              </>
-            )}
+    <Card
+      title="Decision history"
+      headerRight={
+        grandTotal > 0 && (
+          <span>
+            <span className="font-mono text-[#f9f9f9] tabular-nums">
+              {grandTotal.toLocaleString()}
+            </span>{' '}
+            decisions
           </span>
-        )}
-      </div>
-
+        )
+      }
+      error={error}
+      loading={loading}
+      stale={stale}
+      footnote={
+        busiest
+          ? `Busiest week: ${formatPeriod(busiest.period)} with ${maxWeek} decisions.`
+          : null
+      }
+    >
       {rows.length === 0 ? (
-        <p className="text-xs text-[#9c9c9d] leading-relaxed">
-          Your decisions will appear here as you cull. Each K/M/X press is recorded forever in a corpus that survives Clear Analysis and folder moves.
-        </p>
+        <Empty>
+          Your decisions will appear here as you cull. Each K/M/R press is recorded in a
+          corpus that survives Clear Analysis and folder moves.
+        </Empty>
       ) : (
         <div className="flex flex-col gap-3">
-          <div className="flex items-end gap-1 h-32 overflow-x-auto pb-2">
-            {rows.map((r) => (
+          <div className="flex items-end gap-px h-28" role="img"
+               aria-label={`Weekly decisions: ${totals.keep} keep, ${totals.maybe} maybe, ${totals.reject} reject across ${rows.length} weeks`}>
+            {rows.map(r => (
               <WeekBar key={r.period} row={r} maxTotal={maxWeek} />
             ))}
           </div>
-          <div className="flex items-center gap-4 text-xs">
+          <div className="flex items-center justify-between text-[11px] text-[#8a8b8c] font-mono">
+            <span>{formatPeriod(rows[0].period)}</span>
+            <span>{formatPeriod(rows[rows.length - 1].period)}</span>
+          </div>
+          <div className="flex items-center gap-4 text-xs pt-1">
             <Legend color={COLORS.keep}   label="Keep"   count={totals.keep} />
             <Legend color={COLORS.maybe}  label="Maybe"  count={totals.maybe} />
             <Legend color={COLORS.reject} label="Reject" count={totals.reject} />
           </div>
         </div>
       )}
-    </section>
+    </Card>
   )
+}
+
+// "2026-W37" → "W37 '26". Weeks are the unit the backend buckets by; showing
+// the raw strftime output was the kind of leak that makes a chart feel unfinished.
+function formatPeriod(period) {
+  const m = /^(\d{4})-W(\d{2})$/.exec(period || '')
+  if (!m) return period
+  return `W${Number(m[2])} '${m[1].slice(2)}`
 }
 
 function WeekBar({ row, maxTotal }) {
   const total = (row.keep || 0) + (row.maybe || 0) + (row.reject || 0)
-  const heightPct = maxTotal === 0 ? 0 : (total / maxTotal) * 100
-  // Each segment is sized as a share of THIS bar (not the max), so the
-  // colour split inside one week is proportional to its own counts.
-  const seg = (n) => total === 0 ? 0 : (n / total) * 100
+  const targetPct = maxTotal === 0 ? 0 : (total / maxTotal) * 100
+  const heightPct = useGrow(targetPct)
+  const seg = (n) => (total === 0 ? 0 : (n / total) * 100)
 
   return (
-    <div className="flex flex-col items-center gap-1 flex-shrink-0" title={`${row.period}: ${total} decisions`}>
-      <div className="flex flex-col-reverse w-3 h-32 justify-start" style={{ height: '7rem' }}>
-        <div style={{ height: `${heightPct}%` }} className="w-full flex flex-col-reverse rounded-[2px] overflow-hidden">
+    <HoverPopover
+      block
+      className="group flex-1 min-w-[2px] cursor-default"
+      content={
+        <span className="flex flex-col gap-0.5">
+          <span className="font-mono">{formatPeriod(row.period)}</span>
+          <span>{row.keep || 0} keep · {row.maybe || 0} maybe · {row.reject || 0} reject</span>
+        </span>
+      }
+    >
+      <div className="h-28 flex flex-col justify-end">
+        <div
+          className="w-full flex flex-col-reverse rounded-[2px] overflow-hidden opacity-90 group-hover:opacity-100 transition-opacity"
+          style={{
+            height: `${heightPct}%`,
+            transition: 'height 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 120ms ease',
+          }}
+        >
           <div style={{ height: `${seg(row.reject)}%`, backgroundColor: COLORS.reject }} />
           <div style={{ height: `${seg(row.maybe)}%`,  backgroundColor: COLORS.maybe  }} />
           <div style={{ height: `${seg(row.keep)}%`,   backgroundColor: COLORS.keep   }} />
         </div>
       </div>
-      <span className="text-[9px] text-[#6a6b6c] font-mono">{row.period.slice(-3)}</span>
-    </div>
+    </HoverPopover>
   )
 }
 
@@ -98,7 +142,7 @@ function Legend({ color, label, count }) {
     <span className="inline-flex items-center gap-1.5 text-[#9c9c9d]">
       <span className="w-2 h-2 rounded-sm" style={{ backgroundColor: color }} />
       <span>{label}</span>
-      <span className="font-mono text-[#f9f9f9]">{count}</span>
+      <span className="font-mono text-[#f9f9f9] tabular-nums">{count.toLocaleString()}</span>
     </span>
   )
 }

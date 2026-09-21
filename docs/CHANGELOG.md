@@ -17,6 +17,261 @@ bundle already did this for both axes (`mobile.css`).
 
 ---
 
+## Face sharpness joins the edge-width scale, and the bbox bug behind it (2026-09-20)
+
+Follow-up to yesterday's Photos sharpness switch. `face_sharpness_score` was
+still Laplacian variance — the same noise blindness, on the signal that drives
+the soft-face instant reject and one of the model's 31 features.
+
+- **Photos face sharpness is now 0–100 edge width**, calibrated on the same
+  scale as the frame score (the skin offset is applied), so "face 30 / frame 80"
+  compares like with like. Was variance: p5/50/95 of 11 / 101 / 1105 across 972
+  faces, now 31 / 78 / 100. Folder keeps variance.
+- **`analyze_faces_array` returned its bbox in the detector's downscaled frame**
+  while every caller cropped the full-resolution array it had passed in. On a
+  4032 px RAW the box sat at 0.496× its true position, so **every folder RAW face
+  identity embedding cropped the wrong region** — `/face-groups` clustering has
+  been running on whatever occupied the top-left quadrant. Fixed at the source;
+  `tests/test_face_bbox_frame.py` fails without it.
+- **The JPEG branch now always `exif_transpose`s.** The face bbox comes from
+  `analyze_faces()`, which decodes upright; 52 of this library's 105 Photos JPEGs
+  are orientation 6/8, so the face crop landed 90° away for those too.
+- **The soft-face reject nearly died silently.** It asks "frame sharp, face
+  soft?", but on Photos `sharpness_score` is now `min(frame, face)`, so its
+  precondition could never hold. In personal-model mode
+  `_compute_auto_decision` returns on the model's verdict long before the
+  threshold-fallback `reject_blurry_frame` line — so this was the *only*
+  sharpness guard, not a redundant one. It now reads `edge_width_px` (frame
+  only). Measured on the corpus: **13 photos fire the rule, 2 would have
+  without the fix.** Guarded by `tests/test_soft_face_rule.py`, including a
+  call-site check that auto-cull still selects the whole image row.
+- **Edge width is recorded for every corpus** (`images.edge_width_px` /
+  `face_edge_width_px`, migration v54) and written into every new training
+  sample via `feature_extractor._SHADOW_COLUMNS` — present in the JSON, not in
+  the model's vector, so **no feature-schema bump and no retrain**. When there
+  are labelled folder photos measured on the new scale, the camera-model
+  comparison can be run without re-analysing anything.
+- **The two models have names:** *camera model* and *iPhone model* (Dashboard
+  switch, ModelCard, Settings, FAQ). The internal corpus keys stay
+  `folder`/`photos` — renaming them is a migration with no payoff. "Camera"
+  always carries the noun "model" so it never reads as the app's own name.
+
+---
+
+## Photos sharpness measures edge width, not gradient energy (2026-09-19)
+
+IMG_2332 (a blurred, grainy ISO-1000 iPhone frame) scored Sharpness 100 /
+Overall 99. Cause: `batch_sharpness_analyzer` measures Laplacian/Tenengrad
+*energy*, which cannot tell an edge from sensor grain — the face crop read 877
+Laplacian variance against a pure-noise floor of ~867 (σ≈6.6). A synthetic blur
+ladder reproduced it: σ=2 px blur scores 5 clean, 97 with σ=6 noise, 100 with σ=10.
+
+- **`phase1_technical/edge_sharpness.py`** — edge width (`contrast / (2.507 ·
+  peak gradient)`) at a fixed 1600 px long side. Flat under noise, monotone in
+  blur (1.25 → 2.82 px for σ_b 0 → 3), contrast-independent. Sharpest-tiles
+  aggregate (p20) for bokeh; with a face, `max(frame width, face width − 0.14)`
+  so a sharp background can't rescue a soft face. Featureless frames return
+  `None` → fall back to the legacy metric (47 of 1868).
+- **Photos corpus only.** `analyze_photo_quality(corpus="photos")`, passed by
+  `_run_batch` from `source_folder_override`. Folder keeps the legacy metric: its
+  thresholds are user-tuned on the old scale and its labelled images are no
+  longer on disk to re-validate against.
+- **Backfill:** `scripts/backfill_edge_sharpness.py` (dry run by default; `--apply`
+  backs the DB up to `pca.db.pre-edge-sharpness-backup` first). Photos share ≥95:
+  60 % → 24 %; Blurry <40: 17 % → 6 % (the old metric marked low-contrast sharp
+  subjects — a grey spider on grey, a peony — as blurry).
+- **Measured, not argued:** Spearman vs TOPIQ-NR 0.406 → 0.456 overall (no face
+  0.43 → 0.60, with face 0.48 → 0.57 — the face rule costs some agreement with a
+  whole-frame metric, by design).
+- Also fixed: DetailView EXIF showed raw float32 (`6.764999865652793mm`).
+- **Open:** `face_sharpness_score` is still Laplacian variance and feeds the
+  soft-face instant reject and the GBR — same noise blindness, not touched.
+  `analyze_faces_array` returns its bbox in the ≤2000 px frame it ran on, but the
+  RAW branch crops `rgb_full` with it (`_embed_face`) — folder RAW face embeddings
+  likely crop the wrong region. Left alone deliberately; needs its own decision.
+
+---
+
+## The 23% of shooting_log with no EXIF (2026-09-20)
+
+The open question left by the readability pass had an answer, and it was not
+in the dashboard.
+
+**A LaunchAgent does not inherit the login shell's PATH.** launchd hands the
+job `/usr/bin:/bin:/usr/sbin:/sbin`, and the plist ran `/bin/bash start.sh` —
+neither interactive nor a login shell, so no profile is read. Homebrew's
+`/opt/homebrew/bin` was never on it, and `exiftool` is the only reader for RAF
+and HIF. `pyexiftool` could not find it, `_extract_via_exiftool` returned None,
+and `extract_exif` fell back to exifread's all-None dict.
+
+The photo still **scored**, so the row was written anyway — with camera,
+shot_at, lens, film simulation, focal length, aperture, shutter and ISO all
+NULL. 1 530 rows, 23% of `shooting_log`, no error anywhere. JPEG/NEF/3FR/HEIC
+were untouched because exifread is pure Python and needs no binary, which is
+exactly why it never looked like a systemic failure — just a suspiciously
+large "Unknown" bar.
+
+`ollama` was equally unreachable, so the LLM explainer had been off whenever
+the app was launched normally.
+
+Reproduced directly: the same RAF returns full EXIF under a normal PATH and an
+all-None dict under the agent's.
+
+Fixed two ways, because one of them is machine-specific:
+
+- `launcher/install_agent.sh` substitutes the installing shell's PATH into a
+  `__KAMERA_PATH__` placeholder in the plist's `EnvironmentVariables`, and
+  warns if exiftool isn't on that shell's PATH either. **Re-run it after any
+  plist edit** or the placeholder ships literally.
+- `exif_parser._find_exiftool()` tries PATH, then `/opt/homebrew/bin`,
+  `/usr/local/bin`, `/usr/bin`, and passes `executable=` to `ExifToolHelper`.
+  A wrong PATH now degrades to "works" instead of to "quietly loses data".
+
+A missing binary warns **once per process at WARNING level**. It was debug-only
+to avoid flooding a batch — the right instinct for a per-photo error, the wrong
+one for a condition that holds for the whole run, and the reason this stayed
+invisible for months.
+
+Guarded by four tests in `tests/test_exif.py`. Not done: the 1 530 existing
+rows still carry no EXIF. They are historical `shooting_log` entries whose
+`images` rows are long gone; re-analysing the source files is the only way to
+recover them, and only where those files still exist.
+
+---
+
+## Dashboard readability pass (2026-09-20)
+
+Follow-up to the critique. "I don't understand this" about *What you keep vs
+reject* turned out to be three problems stacked, and chasing them reached two
+real data bugs underneath.
+
+- **Rows are claims, not columns.** `FEATURE · UNIT · KEPT · REJ. · Δ · ✓/✗`
+  became a sentence plus a dumbbell: *"Your keeps are far sharper"* over
+  `Sharpness · 0–100  ──○────────●──  33 → 80`. Nothing said "80" was a median;
+  `Δ +47` restated the two numbers beside it; and the ✓/✗ legend had moved to a
+  footnote at the bottom of the card, far from any row. The gap between the two
+  dots **is** the delta, so the column is gone. Each feature carries a written
+  label and a comparative clause; 31 of them are hand-written.
+- **The binary rows were lying.** A median of a 0/1 column is a majority vote,
+  so `face present · kept 0.00 · rejected 1.00` read as "my keeps never have
+  faces, my rejects always do". The true shares are 47% and 57% — nearly no
+  difference at all. The endpoint now also returns `kept_mean` /
+  `rejected_mean` (for a binary column the mean *is* the share) and those rows
+  read *"Faces appear in 47% of keeps and 57% of rejects"*.
+- **Effect size decides what you see.** Rows sort by unexpected-first, then by
+  how far the pair moved across the measure's own scale; anything under 5% of
+  that scale hides behind "show N that barely differ" and drops its directional
+  claim (*"Exposure made no real difference"* rather than *"slightly worse
+  exposed"* next to `95.00 → 95.00`). This is what demoted `highlight clip
+  0.07 vs 0.04`, which the old table had flagged with a red ✗ as though it were
+  a finding. `face_count` got an explicit `[0, 5]` range after the adaptive
+  scale turned a one-face median shift into a perfect 1.0 effect and the
+  loudest sentence on the card.
+- **"Unknown" left the charts.** 70% of `shooting_log` rows carry no
+  `lens_model`, and that bucket was setting the scale — 911 frames on the
+  135mm drew at a fifth of a bar meaning "we don't know". Missing data is now
+  excluded from the bars and stated underneath ("4 612 shots (71%) have no lens
+  recorded"). Film simulation was 94% unknown for the same reason. Each
+  histogram also carries **its own** denominator: shares had been divided by
+  the Cameras total, but `/shooting/cameras` filters `WHERE camera IS NOT NULL`
+  while `/shooting/distributions` does not, so the lens tooltip said 92% where
+  the truth was 70.5%.
+- **Film simulation was a chart of opcodes.** pyexiftool defaults to
+  `common_args=["-G", "-n"]`, and `-n` disables exiftool's print conversion:
+  good for FNumber, destructive for every enum tag. `FilmMode` was stored as
+  `2816` rather than `"Reala ACE"`. The parser now reads with print conversion
+  on and `_to_float` handles exiftool's printed forms (`"23.0 mm"`, `"f/2.8"`,
+  `"1/140"`) — a parsing job we control, versus an enum table to chase every
+  time Fujifilm ships a simulation. A still-numeric value is dropped, so a
+  regression shows as a blank instead of a bar chart of integers. Migration 55
+  backfilled the seven historical codes; the mapping was read off real RAF
+  files by running exiftool twice and pairing the output, not taken from a spec.
+- **One camera, two names.** `X100VI` (2 482, JPEG) and `FUJIFILM X100VI`
+  (378, RAF/HIF) were the same body, split by which parser read the file —
+  exifread normalised through `canonical_camera_name`, the exiftool fallback
+  built `"Make Model"` itself. Both paths now share the normaliser and Make is
+  never prepended; migration 56 folded the existing rows.
+- **`Segmented` gained arrow keys**, and `HoverPopover` an optional
+  `className` so a portalled wrapper can be a flex child.
+
+Open, not fixed: 1 530 of 6 541 `shooting_log` rows (23%) carry no camera,
+focal length, aperture or ISO, and they are still appearing (110 in September).
+That is the same 23% showing as "Unknown" in those three histograms. The cause
+could not be diagnosed from this session — the sandbox cannot read the source
+RAFs, and the exiftool failures observed here were that permission error, not
+a real one.
+
+---
+
+## Dashboard critique pass (2026-09-19)
+
+A design + interaction review of the Dashboard found that the page had quietly
+started lying after the morning's corpus split, and that its chrome had drifted
+from the rest of the app.
+
+- **The dashboard is corpus-aware.** `/dashboard/model-card`,
+  `/decisions/timeline` and `/decisions/feature-deltas` take `corpus`
+  (`folder` | `photos`); a header `Segmented` switches between them. They used
+  to pool every `training_samples` row, so the kept/rejected medians averaged
+  camera RAW with iPhone HEIC — the exact mixing the split exists to prevent —
+  while a card titled "Personal model" described only the folder pickle. An
+  unknown corpus is a **400**, never a silent fallback to folder. The shooting
+  endpoints stay deliberately shared (`shooting_log` has no `source_type`) and
+  the card is labelled "all sources" so the switch never looks like it filters
+  something it doesn't.
+- **The timeframe tells the truth.** `since` cannot window a pickle —
+  `training_size` / `trained_at` / accuracy describe one fit over everything.
+  `model-card` now answers `since` with `window_sample_count`, and the card
+  says "Model facts are all-time — a 30d window can't retrain the model. N
+  decisions landed inside it." Previously the chips visibly governed a card
+  they didn't touch.
+- **One failing endpoint no longer blanks the page.** `useDashboard` was
+  `Promise.all` over six calls: one rejection meant `setData` never ran and
+  every card went empty, including ones whose data had already arrived. Now
+  `allSettled` with per-card errors, and results merge rather than replace so
+  a flaky endpoint shows a stale value with its error rather than a hole.
+- **Entry point.** A four-KPI row (accuracy vs baseline · keep rate ·
+  decisions · shots) sits above a 2-column grid. The four equal-weight stacked
+  cards had no reading order, and the page's largest number existed only in
+  the *untrained* state — once the model was ready, accuracy-vs-baseline was
+  the typographically quietest thing on the page.
+- **Real loading states.** Only `ModelCard` had a skeleton; the other three
+  rendered their *empty* copy during the first fetch, so a returning user with
+  2 971 decisions briefly read "No shooting data yet — analyze a folder".
+  Every card now has shimmer-on-first-load, dim-on-refetch, and its own error
+  line. Refresh spins while in flight and otherwise shows "2m ago" — it had no
+  observable effect at all before.
+- **Charts.** Weekly bars flex to fill the card instead of sitting as fixed
+  12px columns in an `overflow-x-auto` strip that hid ~40 weeks behind an
+  unmarked scrollbar. Hover moved from native `title` (500ms delay, light OS
+  box on a `#07080a` canvas) to the portalled `HoverPopover`, which gained an
+  optional `className` so a wrapper can be a flex child. Bars grow from zero
+  over 240ms ease-out, the duration DESIGN.md already specified; skipped under
+  `prefers-reduced-motion`.
+- **Accessibility.** Keep/reject columns had no headers — the two medians were
+  distinguished *only* by sage vs coral with the meaning in `title`. Each
+  column now carries a real header row. Both charts got `role="img"` +
+  `aria-label`. `Segmented` moved from SettingsModal into `ui/primitives` and
+  gained the arrow-key navigation its `role="radio"` had been promising.
+- **Tokens.** Card borders `#2a2b2d` → `rgba(255,255,255,0.06)` (the app's
+  border, 53 other usages); bar fill `#cecece` → `#a8a8a8` per DESIGN.md (the
+  old code's comment claimed it was already following the system); three bar
+  geometries collapsed into one `StatBar`; 9px/10px text raised to 11px, the
+  scale's floor. `min-h-screen` inside a page that already has a tab bar →
+  `min-h-full`, which was guaranteeing a scrollbar over empty canvas.
+- **Dead cells dropped.** Histogram blocks with no rows are omitted rather than
+  rendered as a labelled "No data in this dimension yet" — *Film simulation*
+  could never fill for a Nikon- or Hasselblad-only window.
+- **Count fix.** The "N kept · N rejected" header read `features[0].n_kept`,
+  which counts non-NaN values of one column, not photos. The backend now sends
+  `n_kept_photos` / `n_rejected_photos` separately.
+
+Guarded by five new tests in `tests/test_dashboard.py` (corpus scoping on both
+decision endpoints, photo-vs-column counts, 400 on unknown corpus, and that
+`since` never appears to shrink the model).
+
+---
+
 ## Whole-app critique pass (2026-09-19)
 
 A full-app review found three things worth fixing straight away.
@@ -40,6 +295,106 @@ Review of the Settings modal found three save models living in one tab with noth
 - **Bug:** `ToggleRow` never accepted `indent`, so "Only when ALL faces are closed" rendered flush with its parent.
 - **Accessibility:** `Toggle` takes a `label` (was an unnamed switch) and has a focus ring; `InfoTooltip` was `aria-hidden` yet focusable — now `role="button"`; the modal is a `role="dialog"` with Escape-to-close; tabs are a real tablist with arrow-key navigation; number inputs and sliders are named; `#6a6b6c` / `#777` hint text (3.5–4.2:1) → `#8a8b8c` (≈5.5:1) within Settings.
 - Not done: presets still don't cover the burst fields (copy now says so rather than implying they do); critical explanations for the burst-dedupe rules remain tooltip-only.
+
+---
+
+## Vision model: qwen2.5vl:7b → qwen3-vl:30b-a3b-instruct (2026-09-19)
+
+Default burst-rank / explainer model is now `qwen3-vl:30b-a3b-instruct` (≈20 GB). It is a
+mixture-of-experts model (~3B active parameters), so it should not be slower
+than the dense 7B on the M1 Max / 64 GB — unmeasured, verify on real bursts.
+
+- **Picker honours preference.** `_pick_vision_model` and `_pick_model` used to
+  return whichever vision model Ollama listed first. Both now go through
+  `llm_explainer.pick_vision_from`, which walks `_VISION_PREFIXES` in order —
+  `qwen3-vl` first, `qwen2.5vl` kept as fallback. Both models can coexist.
+- **One frontend constant.** `VISION_MODEL` in `hooks/usePullModel.js` drives the
+  pull button name, size and copy. The pull poll timeout went 30 → 90 min (20 GB).
+- **Plain `qwen3-vl:30b` is the thinking build — unusable here.** First attempt
+  showed "AI rank unavailable": `raw=''` in the log. The model reasons first and
+  burned the whole 400-token `num_predict` on it, so `message.content` was empty;
+  `think: false` was ignored. Use the `-instruct` tag. The picker prefers
+  `instruct` names, and the ranker now logs the reasoning-ate-the-budget case.
+- **Not yet verified:** multi-image ranking quality vs. qwen2.5vl on known bursts.
+
+## A Re-analyse button, and the number that made it honest (2026-09-20)
+
+"New photos are in the Smart Album again and I cannot see them — does a
+re-analyse button make sense?" Yes, but on its own it would have made things
+worse. Measured against the live album first: 18 new members, and **16 of them
+had no local original** — still in iCloud, so analysis cannot read them. A bare
+button picks up 2 of 18, says nothing about the rest, and looks broken.
+
+The reason it would say nothing turned out to be a gap that had been there
+since the Photos source shipped. `analyze_photos_album` has always returned
+`missing_originals` and `skipped_videos`; `useTabs.js` stored them on the tab
+as `photosSkipped`; **nothing ever rendered them**. The counts were collected
+and discarded, which is why "I re-analysed and my photos are still missing" had
+no answer anywhere in the UI.
+
+So both halves shipped together:
+
+- **Tab settings → Re-analyse album.** Routes through the existing
+  `resumeAnalysisForTab`, which POSTs `/analyze-photos-album` with
+  `source_folder` alone and skips everything already done. Compare with Photos
+  finds the same photos through the `not_analyzed` class, but costs a full
+  catalogue re-parse — 11s on this 2116-member album — and lives two levels
+  deep in a settings panel. Wrong door for the thing you do most often.
+- **The skip line in the result banner.** "16 photos in this album were not
+  read — the original is still in iCloud, not on this Mac. Select them in
+  Photos, choose Download Original, then re-analyse." Plus a muted line for the
+  248 videos, which are never analysed by design.
+
+One trap on the way: `photosSkipped` was only captured by
+`runPhotosAnalysisForTab` (the album-picker path). The button goes through
+`startAnalysis`, which dropped those fields — so the button's own path would
+have been the one place the new explanation never appeared.
+
+The Resume banner cannot be made to cover this, incidentally: it measures
+against the `asset_count` a run recorded, so an album that grew reports zero
+unfinished. The counter is written by the very action it is supposed to
+prompt.
+
+---
+
+## Compare with Photos learned to see arrivals (2026-09-19, later)
+
+Photos that join a Smart Album after the last analysis were invisible. The
+Resume banner cannot surface them — it compares against the `asset_count` the
+last run recorded, so an album that *grew* still reports zero unfinished, and
+the banner meant to trigger the run needs the run to notice itself. The
+reconcile's five classes were all about decisions and departures; nothing
+covered an arrival.
+
+`not_analyzed` is the sixth class: an album asset with no `images` row and no
+KaMeRa keyword. A marker still means "analysed elsewhere" and stays the bare
+`unmanaged_keyword` count — promoting it would re-analyse something already
+judged.
+
+Telling a new photo from a movie needed data the reconcile did not have.
+`album_keyword_state` deliberately returns *every* member's keywords, movies
+included, because treating a movie as absent would misreport it as
+`not_in_album` and invite dropping a good row. It now also returns `members`
+(`{filename, is_movie, has_original, supported}`) built from the same catalogue
+read, mirroring `album_assets`'s three drop reasons — without it the test
+album's 243 videos would have been reported as actionable drift alongside the
+5 photos that mattered. `classify(..., members=None)` keeps the class empty, so
+callers predating it are unaffected.
+
+This is the one class that writes nothing. `action="analyze"` sets
+`analysis_requested` in the response and the frontend then runs the ordinary
+analyze flow, which re-enumerates the album and skips what is done. Starting
+the batch inside reconcile would have meant a second copy of the batch starter
+— which is exactly where the resume bug fixed an hour earlier had lived.
+
+Measured against the real album: 1868 checked, 1868 in sync, drift 5 — and all
+five are photos shot in the last two days whose originals are still in iCloud.
+They are listed and flagged *not downloaded* rather than quietly omitted:
+analysis reads the original, and scoring the local 768x1024 derivative would
+put a meaningless sharpness number into `training_samples`.
+
+`tests/test_photos_reconcile.py` +9, `tests/test_photos_reconcile_apply.py` +3;
+full suite 623.
 
 ---
 

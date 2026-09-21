@@ -673,3 +673,15 @@ def test_rank_burst_expands_rankings_to_absorbed_ids(tmp_db, fake_picker, fake_p
     # all three photos got an effective rank.
     assert set(result["evaluated_ids"]) == {1, 2, 3}
     conn.close()
+
+
+def test_pick_vision_prefers_qwen3_over_listing_order():
+    """Both installed → qwen3-vl wins regardless of which Ollama lists first."""
+    from phase2_quality.llm_explainer import pick_vision_from
+
+    assert pick_vision_from(["qwen2.5vl:7b", "qwen3-vl:30b"]) == "qwen3-vl:30b"
+    assert pick_vision_from(["qwen3-vl:30b", "qwen2.5vl:7b"]) == "qwen3-vl:30b"
+    assert pick_vision_from(["qwen2.5vl:7b", "phi3"]) == "qwen2.5vl:7b"
+    assert pick_vision_from(["phi3"]) is None
+    # the plain 30b tag is the thinking build — an instruct build must beat it
+    assert pick_vision_from(["qwen3-vl:30b", "qwen3-vl:30b-a3b-instruct"]) == "qwen3-vl:30b-a3b-instruct"

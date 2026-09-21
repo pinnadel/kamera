@@ -857,8 +857,10 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
             {[
               ['Camera',  image.camera],
               ['Shot at', image.shot_at],
-              ['Focal',   image.focal_length_mm ? `${image.focal_length_mm}mm` : null],
-              ['f/',      image.aperture ? `f/${image.aperture}` : null],
+              // Photos-library EXIF arrives as raw float32 (6.764999865652793) —
+              // round to one decimal; `+` drops the trailing zero (24.0 → 24).
+              ['Focal',   image.focal_length_mm ? `${+Number(image.focal_length_mm).toFixed(1)}mm` : null],
+              ['f/',      image.aperture ? `f/${+Number(image.aperture).toFixed(1)}` : null],
               ['Shutter', shutter],
               ['ISO',     image.iso],
             ].map(([label, val]) => val != null && (
@@ -889,7 +891,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
                     <span className="text-xs text-[#cecece] leading-relaxed">
                       Generated from scores + EXIF only — the connected
                       model (<span className="font-mono text-[#E8B84A]">{explainStatus.model}</span>) can't see images. Pull{' '}
-                      <span className="font-mono text-[#E8B84A]">qwen2.5vl:7b</span> for vision-aware explanations
+                      <span className="font-mono text-[#E8B84A]">qwen3-vl:30b-a3b-instruct</span> for vision-aware explanations
                       (Settings → Narrative explanations).
                     </span>
                   </div>
@@ -1137,7 +1139,7 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
 
 //   not_installed → install hint + link to ollama.com
 //   not_running   → start hint (run `ollama serve`)
-//   no_models     → pull hint (run `ollama pull qwen2.5vl:7b`)
+//   no_models     → pull hint (run `ollama pull qwen3-vl:30b-a3b-instruct`)
 //   anything else → fallback generic message
 function OllamaUnavailable({ status, onRetry }) {
   const s = status?.status
@@ -1168,7 +1170,7 @@ function OllamaUnavailable({ status, onRetry }) {
       <div className="space-y-2">
         <PullVisionModelButton onDone={onRetry} />
         <p>
-          Or run <span className="font-mono text-[#cecece]">ollama pull qwen2.5vl:7b</span> in Terminal (≈6 GB, vision-capable) — or any model name from{' '}
+          Or run <span className="font-mono text-[#cecece]">ollama pull qwen3-vl:30b-a3b-instruct</span> in Terminal (≈20 GB, vision-capable) — or any model name from{' '}
           <a href="https://ollama.com/library" target="_blank" rel="noreferrer" className="text-[#5BB8D4] hover:opacity-70 underline">ollama.com/library</a>.
         </p>
       </div>

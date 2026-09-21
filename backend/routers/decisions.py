@@ -141,6 +141,18 @@ def _compute_auto_decision(
     face_count = row.get("face_count") or 0
     face_sharp = row.get("face_sharpness_score") or 0
 
+    # The soft-face rule asks "is the FRAME sharp while the face is soft?" — on
+    # the Photos corpus `sharpness_score` can no longer answer that, because it
+    # is min(frame, face) since the edge-width switch, so a soft face drags the
+    # frame score down with it and the precondition below could never be true.
+    # `edge_width_px` is the frame-only measurement, on the same 0-100 scale.
+    # Folder is untouched: its face sharpness is still Laplacian variance, and
+    # judging it against an edge-width frame score would mix two scales.
+    frame_sharp = sharpness
+    if corpus == "photos" and row.get("edge_width_px") is not None:
+        from phase1_technical.edge_sharpness import width_to_score
+        frame_sharp = width_to_score(row["edge_width_px"])
+
     # Instant-reject rules apply in BOTH personal-model and threshold mode.
     if face:
         if t["reject_closed_eyes"] and eyes_open == 0:
@@ -155,7 +167,7 @@ def _compute_auto_decision(
                 # else: at least one face has open eyes — let it through
             else:
                 return "reject", "closed_eyes"
-        if t["reject_soft_face"] and face_sharp < t["face_sharpness_floor"] and sharpness >= t["fallback_sharpness_floor"]:
+        if t["reject_soft_face"] and face_sharp < t["face_sharpness_floor"] and frame_sharp >= t["fallback_sharpness_floor"]:
             return "reject", "soft_face"
 
     # Low-IQA instant reject — catches the false-sharp failure mode the Phase-1

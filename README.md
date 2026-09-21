@@ -65,7 +65,7 @@ brew install python-tk@3.13     # required for the folder picker on Python 3.13
 
 ```bash
 ollama serve &                  # start daemon temporarily
-ollama pull qwen2.5vl:7b        # download model
+ollama pull qwen3-vl:30b-a3b-instruct         # download model (≈20 GB)
 ```
 
 You can stop the manual `ollama serve` after — KaMeRa launches and shuts down its own daemon.
@@ -146,7 +146,7 @@ For curious readers — a quick map of how it works.
 | Image processing | rawpy · Pillow · pillow-heif · OpenCV · ExifRead · pyexiftool |
 | Phase 2 ML | MediaPipe · pyiqa (TOPIQ) · SigLIP-2 · FaceNet · LAION aesthetic predictor |
 | Phase 3 ML | scikit-learn GBR · NumPy |
-| LLM | Ollama (local daemon) + qwen2.5vl:7b vision model |
+| LLM | Ollama (local daemon) + qwen3-vl:30b-a3b-instruct vision model |
 | Launcher | headless PWA-watch loop (macOS) · pystray (Windows / Linux tray) |
 
 **How the personal model works**

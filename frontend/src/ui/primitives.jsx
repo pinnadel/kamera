@@ -226,7 +226,10 @@ export function Toggle({ enabled, onChange, label }) {
 // affordance and you don't want a separate icon.
 //   block — when true, wrap with a <div> so the trigger participates in
 //           block-level layout (used by row-sized triggers like meter rows).
-export function HoverPopover({ content, children, block = false }) {
+//   className — replaces the wrapper's own class. Needed when the wrapper is
+//           itself a layout child (a flex-1 chart column): styling the
+//           element *inside* the wrapper can't make the wrapper flex.
+export function HoverPopover({ content, children, block = false, className }) {
   const triggerRef = useRef(null)
   const [pos, setPos] = useState(null)
 
@@ -258,7 +261,7 @@ export function HoverPopover({ content, children, block = false }) {
       onMouseLeave={close}
       onFocus={open}
       onBlur={close}
-      className={block ? '' : 'inline-flex'}
+      className={className ?? (block ? '' : 'inline-flex')}
     >
       {children}
       {pos && createPortal(

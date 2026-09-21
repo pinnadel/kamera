@@ -31,9 +31,9 @@ from phase2_quality.llm_explainer import (
     _OLLAMA_KEY,
     _OLLAMA_NATIVE,
     _TIMEOUT,
-    _VISION_PREFIXES,
     _recover_wedged_runner,
     list_models,
+    pick_vision_from,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,13 +98,9 @@ def _pick_vision_model() -> str | None:
 
     Stricter than llm_explainer's general picker: text-only models can't
     rank images by sight, so we'd rather return None and let the UI nudge
-    the user to `ollama pull qwen2.5vl:7b` than burn a call that can't see.
+    the user to `ollama pull qwen3-vl:30b-a3b-instruct` than burn a call that can't see.
     """
-    for m in list_models():
-        name = m.lower()
-        if any(name.startswith(p) for p in _VISION_PREFIXES):
-            return m
-    return None
+    return pick_vision_from(list_models())
 
 
 _PROMPT_TEMPLATE = (
@@ -804,6 +800,11 @@ def _leader_compute_rank(h, evaluated_ids, filtered_from, conn, merged_map=None)
         data = r.json()
         # Native /api/chat returns {message: {role, content}, ...}.
         raw = (data.get("message", {}).get("content") or "").strip()
+        if not raw and data.get("message", {}).get("thinking"):
+            logger.warning(
+                "burst_ranker: %s spent its %d-token budget on reasoning and "
+                "returned no answer — use an -instruct build", model_id, _MAX_TOKENS,
+            )
     except Exception:
         logger.exception("Ollama burst-rank call failed for hash %s", h)
         return _result(

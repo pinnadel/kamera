@@ -72,7 +72,7 @@ This is the part that matters for any future commercial use of KaMeRa. The libra
 | MediaPipe FaceLandmarker | Face landmarks + blendshapes (eyes, expression) | Apache 2.0 | Clean for any use. |
 | MediaPipe BlazeFace (short-range) | Fallback face detector | Apache 2.0 | Clean for any use. |
 | SigLIP-2 base / patch-16 | Image embeddings + zero-shot scene tags | Apache 2.0 (Google) | Clean for any use. |
-| Ollama qwen2.5vl:7b | Optional LLM explanations of picks | Apache 2.0 (Alibaba) | Clean for any use. Loaded only if Ollama is installed. |
+| Ollama qwen3-vl:30b-a3b-instruct | Optional LLM explanations of picks | Apache 2.0 (Alibaba) | Clean for any use. Loaded only if Ollama is installed. |
 | TOPIQ-NR / TOPIQ-IAA (pyiqa) | No-reference image quality and aesthetic scores | **Research-only** — trained on KonIQ-10k, SPAQ, AVA datasets which restrict commercial redistribution of derived models | Personal / research / non-commercial use only. |
 | CLIP ViT-L/14 (OpenAI) | Backbone for the LAION aesthetic predictor | **Research-only** (OpenAI original release) | Personal / research / non-commercial use only. |
 | LAION aesthetic predictor v2 (linearMSE) | Aesthetic score head, sits on top of CLIP ViT-L/14 | MIT (linear head) — but inherits CLIP's research-only constraint via the backbone | Personal / research / non-commercial use only. |

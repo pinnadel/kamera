@@ -62,6 +62,9 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
   // (selection is per-photo). Render them visibly disabled.
   isSelectMode = false,
   onDragOver, onDragLeave, onDrop,
+  // Drag source: dragging the whole tile onto another group tile merges the
+  // two. Parent supplies the payload (same `photos` shape a card drag uses).
+  onDragStart, onDragEnd,
   // Peek panel (hooks/useGroupScrub.js). A CLICK opens it — alongside, not
   // instead of, selecting the tile; double-click still opens the loupe.
   // Sweeping across the tile steps
@@ -110,6 +113,9 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
         scrub?.onClick(e, group.images || undecidedImages)
       }}
       onDoubleClick={disabled ? undefined : onOpen}
+      draggable={!disabled && !!onDragStart}
+      onDragStart={disabled ? undefined : onDragStart}
+      onDragEnd={onDragEnd}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
@@ -198,6 +204,8 @@ function DecidedGroupTileImpl({
   isSelected, onSelect, onOpen, onBulkDecide,
   showFilename = true,
   isSelectMode = false,
+  isDropHover = false,
+  onDragStart, onDragEnd, onDragOver, onDragLeave, onDrop,
   scrub,
 }) {
   // The peek walks the WHOLE burst, not just this view's bucket — seeing which
@@ -215,7 +223,9 @@ function DecidedGroupTileImpl({
   // selection/select-mode dimming taking the same priority order GroupTile
   // uses.
   let ringClass
-  if (isSelected) {
+  if (isDropHover) {
+    ringClass = `${SELECTION_RING_STRONG} scale-[1.02]`
+  } else if (isSelected) {
     ringClass = SELECTION_RING
   } else if (decision === 'reject') {
     ringClass = 'ring-1 ring-[rgba(201,123,123,0.40)] hover:ring-[rgba(201,123,123,0.65)]'
@@ -234,6 +244,12 @@ function DecidedGroupTileImpl({
         scrub?.onClick(e, scrubMembers)
       }}
       onDoubleClick={disabled ? undefined : onOpen}
+      draggable={!disabled && !!onDragStart}
+      onDragStart={disabled ? undefined : onDragStart}
+      onDragEnd={onDragEnd}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
       onMouseMove={disabled ? undefined : scrub?.onMove}
       aria-disabled={disabled || undefined}
       className={`group/run relative block w-full text-left bg-transparent rounded-lg transition-[transform,opacity] ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}

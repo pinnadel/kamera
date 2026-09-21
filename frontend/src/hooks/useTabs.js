@@ -286,7 +286,22 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
         // Stash the skipped list from the immediate response so the result
         // banner can show it once the batch finishes.
         setTabs(prev => prev.map(t => t.id === tabId
-          ? { ...t, _pendingSkipped: data.skipped || [] }
+          ? {
+              ...t,
+              _pendingSkipped: data.skipped || [],
+              // An album response also reports what it could not take. Only
+              // runPhotosAnalysisForTab used to capture this, so a re-analyse
+              // started from here would drop the very number that explains
+              // why almost nothing appeared: photos whose original is still
+              // in iCloud are skipped silently otherwise.
+              ...(data.missing_originals !== undefined ? {
+                photosSkipped: {
+                  missingOriginals: data.missing_originals || 0,
+                  videos: data.skipped_videos || 0,
+                  unsupported: data.skipped_unsupported || 0,
+                },
+              } : {}),
+            }
           : t))
       } else {
         // Empty-folder shortcut or legacy synchronous response.

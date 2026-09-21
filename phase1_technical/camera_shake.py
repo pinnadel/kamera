@@ -54,12 +54,22 @@ def _parse_fraction(tag_value) -> Optional[float]:
         return None
 
 
-def _get_camera_name(tags: dict) -> Optional[str]:
-    """Match EXIF model tag against known cameras."""
-    model_tag = tags.get("Image Model")
-    if not model_tag:
+def canonical_camera_name(model: Optional[str]) -> Optional[str]:
+    """Normalise an EXIF model string to the name the user calls the body.
+
+    Shared by BOTH extraction paths on purpose. exifread (JPEG/NEF/3FR) used
+    this while the exiftool fallback (RAF/HIF) assembled "Make Model" itself,
+    so one X100VI appeared in the dashboard twice — "X100VI" with 2 482 shots
+    and "FUJIFILM X100VI" with 378 — split by which parser happened to read
+    the file, not by which camera took the picture. Every per-camera statistic
+    was quietly divided between the two.
+
+    Make is never prepended: "X100VI" is what the body is called, and it is
+    what the majority of rows already carried.
+    """
+    if not model:
         return None
-    model = str(model_tag).strip()
+    model = str(model).strip()
     if "X100VI" in model:
         return "X100VI"
     if "X-H" in model or "X Half" in model:
@@ -67,6 +77,11 @@ def _get_camera_name(tags: dict) -> Optional[str]:
     if "Z 6" in model or "Z6" in model:
         return "Z6III"
     return model
+
+
+def _get_camera_name(tags: dict) -> Optional[str]:
+    """Match EXIF model tag against known cameras."""
+    return canonical_camera_name(tags.get("Image Model"))
 
 
 def _analyze_exif(image_path: str) -> dict:

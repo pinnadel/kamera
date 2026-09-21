@@ -171,7 +171,7 @@ class PrerankGroupsRequest(BaseModel):
 
 
 class PullLlmModelRequest(BaseModel):
-    # Optional. Defaults to the recommended vision model (qwen2.5vl:7b).
+    # Optional. Defaults to the recommended vision model (qwen3-vl:30b-a3b-instruct).
     name: str | None = None
 
 
@@ -1092,11 +1092,11 @@ def delete_llm_model_endpoint(name: str):
     """Delete a locally-installed Ollama model.
 
     Used by the Settings panel's "Remove unused" affordance when the user
-    upgrades from one vision model to another (e.g. moondream → qwen2.5vl)
+    upgrades from one vision model to another (e.g. qwen2.5vl → qwen3-vl)
     and wants to reclaim disk without dropping to Terminal.
 
     The `{name:path}` converter is important: Ollama model names contain
-    a colon (`qwen2.5vl:7b`), which would otherwise be parsed as a path
+    a colon (`qwen3-vl:30b-a3b-instruct`), which would otherwise be parsed as a path
     parameter delimiter.
     """
     from phase2_quality.llm_explainer import delete_model as _delete_model

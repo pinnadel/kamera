@@ -393,8 +393,9 @@ _INSERT_SQL = """
         scene, scene_confidence,
         subject_prominence_score, background_distraction_score,
         eye_contact_score, decisive_moment_score,
+        edge_width_px, face_edge_width_px,
         analysis_status, imported_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', DATETIME('now'))
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', DATETIME('now'))
     ON CONFLICT(file_path) DO UPDATE SET
         uuid                 = COALESCE(images.uuid, excluded.uuid),
         camera               = excluded.camera,
@@ -430,6 +431,8 @@ _INSERT_SQL = """
         background_distraction_score = excluded.background_distraction_score,
         eye_contact_score           = excluded.eye_contact_score,
         decisive_moment_score       = excluded.decisive_moment_score,
+        edge_width_px        = excluded.edge_width_px,
+        face_edge_width_px   = excluded.face_edge_width_px,
         analysis_status      = 'done'
     RETURNING id, uuid
 """
@@ -550,6 +553,10 @@ def _build_insert_params(
         result.get("concepts", {}).get("background_distraction"),
         result.get("concepts", {}).get("eye_contact"),
         result.get("concepts", {}).get("decisive_moment"),
+        # Edge-width sharpness in px at a fixed 1600 px long side — recorded for
+        # every corpus, scored on only by Photos. NULL on a featureless frame.
+        (result.get("edge") or {}).get("frame_width_px"),
+        (result.get("edge") or {}).get("face_width_px"),
     )
 
 
@@ -862,6 +869,7 @@ def _run_batch(
                             stop_event=_stop_event,
                             sharpness_weight=sharpness_weight,
                             predecoded=predecoded,
+                            corpus="photos" if source_folder_override else "folder",
                         )
                         _progress["_current_step"] = "exif"
                         exif   = extract_exif(path_str)

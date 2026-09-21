@@ -16,12 +16,15 @@ care about.
 """
 
 import logging
+import os
+import shutil
 from pathlib import Path
+import re
 from datetime import datetime
 from typing import Optional
 import exifread
 
-from .camera_shake import _parse_fraction, _get_camera_name
+from .camera_shake import _parse_fraction, _get_camera_name, canonical_camera_name
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,62 @@ def _extract_via_exifread(image_path: str) -> dict:
     }
 
 
+# Resolved once. A LaunchAgent inherits launchd's PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin), not the login shell's, so `exiftool` from
+# Homebrew is invisible to the backend even though it is plainly installed.
+# That cost every RAF and HIF its entire EXIF block — silently, because the
+# photo still scored and the row was written with every metadata column NULL.
+# 1 530 rows of shooting_log before it was caught on 2026-09-20.
+#
+# The LaunchAgent now declares a PATH (launcher/install_agent.sh); this is the
+# second line of defence, so a wrong PATH degrades to "works" rather than to
+# "quietly loses data".
+_EXIFTOOL_FALLBACKS = (
+    "/opt/homebrew/bin/exiftool",   # Apple Silicon Homebrew
+    "/usr/local/bin/exiftool",      # Intel Homebrew
+    "/usr/bin/exiftool",            # distro packages
+)
+
+_exiftool_path: Optional[str] = None
+_exiftool_warned = False
+
+
+def _find_exiftool() -> Optional[str]:
+    """Locate the exiftool binary, PATH first, then the usual install roots."""
+    global _exiftool_path
+    if _exiftool_path is not None:
+        return _exiftool_path
+    found = shutil.which("exiftool")
+    if not found:
+        for candidate in _EXIFTOOL_FALLBACKS:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                found = candidate
+                break
+    _exiftool_path = found or ""
+    return _exiftool_path or None
+
+
+def _warn_missing_exiftool_once() -> None:
+    """Warn loudly, once per process.
+
+    This failure used to be logged at debug level to keep a big batch from
+    flooding the log. That was the right instinct for a per-photo error and
+    the wrong one for a missing dependency: the condition is constant for the
+    whole run, so one warning says everything and nothing is lost by it.
+    """
+    global _exiftool_warned
+    if _exiftool_warned:
+        return
+    _exiftool_warned = True
+    logger.warning(
+        "exiftool not found (PATH=%s). RAF/HIF files will be analysed with NO "
+        "EXIF at all — no camera, date, lens, focal length, aperture or ISO. "
+        "Install it (brew install exiftool) or re-run launcher/install_agent.sh "
+        "so the backend's PATH includes it.",
+        os.environ.get("PATH", ""),
+    )
+
+
 def _extract_via_exiftool(image_path: str) -> Optional[dict]:
     """Fallback for formats exifread can't read (RAF in particular).
 
@@ -125,8 +184,23 @@ def _extract_via_exiftool(image_path: str) -> Optional[dict]:
         logger.warning("pyexiftool not installed; cannot read RAF EXIF.")
         return None
 
+    executable = _find_exiftool()
+    if executable is None:
+        _warn_missing_exiftool_once()
+        return None
+
     try:
-        with ExifToolHelper() as et:
+        # common_args=["-G"] drops pyexiftool's default "-n".
+        #
+        # "-n" disables exiftool's print conversion, which is what we want for
+        # FNumber/ISO but silently destroys every enum-backed tag: FilmMode
+        # came back as 2816 instead of "Reala ACE", so the dashboard's film
+        # simulation histogram was a list of raw Fuji opcodes. Keeping print
+        # conversion on means the numeric tags arrive formatted instead
+        # ("23.0 mm", "1/140"), which _to_float below is built to handle —
+        # a parsing job we control, versus an enum table we would have to
+        # chase every time Fujifilm ships a new simulation.
+        with ExifToolHelper(executable=executable, common_args=["-G"]) as et:
             metadata_list = et.get_metadata(image_path)
         if not metadata_list:
             return None
@@ -147,17 +221,11 @@ def _extract_via_exiftool(image_path: str) -> Optional[dict]:
                     return m[full]
         return None
 
-    make  = _g("Make")
-    model = _g("Model")
-    camera: Optional[str] = None
-    if model:
-        model_str = str(model).strip()
-        # Match the format _get_camera_name uses: model only when it already
-        # contains the make (e.g., "X100VI"), else "Make Model".
-        if make and str(make).strip().lower() not in model_str.lower():
-            camera = f"{str(make).strip()} {model_str}"
-        else:
-            camera = model_str
+    # Route through the same normaliser exifread's path uses. This branch used
+    # to build "Make Model" itself, which is why RAF/HIF files logged
+    # "FUJIFILM X100VI" while the JPEGs off the same body logged "X100VI" —
+    # one camera, two rows, in every camera statistic on the dashboard.
+    camera: Optional[str] = canonical_camera_name(_g("Model"))
 
     shot_at: Optional[str] = None
     date_raw = _g("DateTimeOriginal", "CreateDate", "DateTime")
@@ -170,20 +238,40 @@ def _extract_via_exiftool(image_path: str) -> Optional[dict]:
             pass
 
     def _to_float(v):
+        """Parse exiftool's printed numeric forms.
+
+        With print conversion on, exiftool formats numbers for humans:
+        "23.0 mm", "f/2.8", "1/140". Bare floats still arrive for tags it
+        doesn't decorate, so the plain path stays first.
+        """
         if v is None:
             return None
-        try:
+        if isinstance(v, (int, float)):
             return float(v)
-        except (TypeError, ValueError):
+        s = str(v).strip()
+        if not s:
             return None
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        # "f/2.8" → 2.8
+        m = re.match(r"^f/\s*([0-9]*\.?[0-9]+)", s, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+        # "1/140" → 0.00714  (shutter speeds)
+        m = re.match(r"^([0-9]*\.?[0-9]+)\s*/\s*([0-9]*\.?[0-9]+)$", s)
+        if m and float(m.group(2)) != 0:
+            return float(m.group(1)) / float(m.group(2))
+        # "23.0 mm" → 23.0  (leading number, unit dropped)
+        m = re.match(r"^([-+]?[0-9]*\.?[0-9]+)", s)
+        if m:
+            return float(m.group(1))
+        return None
 
     def _to_int(v):
-        if v is None:
-            return None
-        try:
-            return int(float(v))
-        except (TypeError, ValueError):
-            return None
+        f = _to_float(v)
+        return None if f is None else int(f)
 
     # Lens model: Fuji X100VI has a fixed lens written to EXIF:LensModel;
     # X-mount and Z6III bodies usually surface it via MakerNotes:LensID
@@ -198,6 +286,12 @@ def _extract_via_exiftool(image_path: str) -> Optional[dict]:
     #     in the same dashboard column.
     film_raw = _g("FilmMode", "PictureControlBase")
     film_simulation: Optional[str] = str(film_raw).strip() if film_raw not in (None, "") else None
+    # Guard against a regression to raw opcodes: a bare integer here means
+    # print conversion was off again, and a histogram of "2816" is worse than
+    # an honest blank.
+    if film_simulation is not None and re.fullmatch(r"-?\d+", film_simulation):
+        logger.debug("Dropping unresolved numeric FilmMode %r", film_simulation)
+        film_simulation = None
 
     return {
         "camera":          camera,

@@ -22,6 +22,7 @@ from phase1_technical.batch_sharpness_analyzer import (
     detect_sharpness_array as _detect_sharpness_array,
     get_threshold,
 )
+from phase1_technical.edge_sharpness import analyze_edge_sharpness
 from phase1_technical.exposure import analyze_exposure, analyze_exposure_array, compute_histogram
 from phase2_quality.face_analyzer import analyze_faces, analyze_faces_array
 from phase2_quality.face_identity import embed_face as _embed_face
@@ -359,14 +360,72 @@ def decode_raw(image_path: str) -> tuple:
     return rgb_full, pil_full
 
 
+def measure_edge_sharpness(rgb, face_result: dict) -> dict | None:
+    """
+    One edge-width measurement per photo. It is the Photos corpus's sharpness
+    score AND the shadow feature every corpus records (images.edge_width_px),
+    so a later folder comparison has data to stand on. None when the frame
+    carries too few edges to judge — see edge_sharpness.py.
+    """
+    if rgb is None:
+        return None
+    return analyze_edge_sharpness(rgb, face_result.get('face_bbox'))
+
+
+def _photos_sharpness(edge: dict | None, legacy_result: dict | None,
+                      image_path: str, shape: tuple | None) -> dict:
+    """
+    Shape the edge measurement like a legacy sharpness result. A featureless
+    frame has no edges to judge — fall back to the legacy metric rather than
+    invent a score, which is also why the legacy result is computed on demand.
+    """
+    if edge is None or shape is None:
+        return legacy_result if legacy_result is not None else calculate_sharpness(image_path)
+    h, w = shape
+    return {
+        'sharpness_score': edge['sharpness_score'],
+        'laplacian_variance': 0.0,  # no equivalent under edge width; kept for the response schema
+        'normalized_score': edge['frame_width_px'],
+        'sharpness_label': edge['sharpness_label'],
+        'width': w,
+        'height': h,
+        'metric': 'edge_width',
+    }
+
+
+def _apply_edge_sharpness(edge: dict | None, corpus: str, face_result: dict,
+                          sharpness_result: dict | None, image_path: str,
+                          shape: tuple | None) -> dict:
+    """
+    Photos-corpus override: the edge measurement replaces BOTH the frame score
+    and face_sharpness_score, so the two are on one scale. Folder keeps the
+    legacy pair untouched and only records the measurement (see the caller).
+
+    Note the consequence for auto-cull: because the frame score is
+    min(frame, face), a soft face now pulls sharpness_score down itself, so the
+    separate `reject_soft_face` rule (face below floor AND frame above it) can
+    no longer fire on Photos — `reject_blurry_frame` covers that case instead.
+    """
+    if corpus != "photos":
+        return sharpness_result
+    if edge is not None and edge.get('face_sharpness_score') is not None:
+        face_result['face_sharpness_score'] = edge['face_sharpness_score']
+    return _photos_sharpness(edge, sharpness_result, image_path, shape)
+
+
 def analyze_photo_quality(
     image_path: str,
     stop_event: threading.Event | None = None,
     sharpness_weight: float | None = None,
     predecoded: tuple | None = None,
+    corpus: str = "folder",
 ) -> dict:
     """
     Run full technical analysis on a photo (Phase 1 + Phase 2 face signals).
+
+    corpus: "photos" scores sharpness by edge width (noise-robust, face-aware —
+      see edge_sharpness.py); anything else keeps the legacy gradient-energy
+      metric so the folder corpus's tuned thresholds are untouched.
 
     Weighting rationale:
     - Default 65% sharpness / 35% exposure — sharpness is non-recoverable,
@@ -389,6 +448,7 @@ def analyze_photo_quality(
         if stop_event is not None and stop_event.is_set():
             raise StopRequested()
 
+    edge_result: dict | None = None
     path = Path(image_path)
     if path.suffix.lower() in RAW_DECODE_SUFFIXES:
         if predecoded is not None:
@@ -468,6 +528,13 @@ def analyze_photo_quality(
             'width': raw_sharpness['width'],
             'height': raw_sharpness['height'],
         }
+        # Measured for every corpus (see measure_edge_sharpness); only Photos
+        # score by it today, folder records it for a later comparison.
+        edge_result = measure_edge_sharpness(rgb_full, face_result)
+        sharpness_result = _apply_edge_sharpness(
+            edge_result, corpus, face_result, sharpness_result, image_path,
+            rgb_full.shape[:2],
+        )
 
         # Drop heavy references immediately — the multi-MB numpy buffers in
         # rgb_full / pil_full are the real memory pressure, and `del` makes
@@ -488,7 +555,7 @@ def analyze_photo_quality(
                 pass
     else:
         # JPEG/PNG — cheap to decode, use path-based scorers + sequential Phase 1.
-        sharpness_result = calculate_sharpness(image_path)
+        sharpness_result = calculate_sharpness(image_path) if corpus != "photos" else None
         _check_stop()
         exposure_result = analyze_exposure(image_path)
         _check_stop()
@@ -499,10 +566,15 @@ def analyze_photo_quality(
         # silently doubled the Stop-acknowledge latency.
         rgb_jpeg = None
         try:
-            from PIL import Image as _PILImage
+            from PIL import Image as _PILImage, ImageOps as _ImageOps
             import numpy as _np
             with _PILImage.open(image_path) as _pil:
-                rgb_jpeg = _np.asarray(_pil.convert("RGB"))
+                # exif_transpose for every corpus: the face bbox comes from
+                # analyze_faces(), which decodes upright. Without it, both the
+                # face crop for the identity embedding and the edge-width face
+                # region land 90° away on any orientation-6/8 file (52 of this
+                # library's 105 Photos JPEGs).
+                rgb_jpeg = _np.asarray(_ImageOps.exif_transpose(_pil.convert("RGB")))
             histogram_result = compute_histogram(rgb_jpeg)
         except Exception:
             histogram_result = None
@@ -546,6 +618,11 @@ def analyze_photo_quality(
             except Exception:
                 logger.exception("face_embedding (jpeg path) failed for %s", image_path)
             _check_stop()
+        edge_result = measure_edge_sharpness(rgb_jpeg, face_result)
+        sharpness_result = _apply_edge_sharpness(
+            edge_result, corpus, face_result, sharpness_result, image_path,
+            None if rgb_jpeg is None else rgb_jpeg.shape[:2],
+        )
         del rgb_jpeg
 
     overall_score = compute_overall_score(
@@ -589,6 +666,10 @@ def analyze_photo_quality(
 
     return {
         'sharpness': sharpness_result,
+        # Raw edge-width measurement, recorded for every corpus (None on a
+        # featureless frame). Photos already score by it above; folder stores it
+        # as a shadow feature so the same comparison can be made there later.
+        'edge': edge_result,
         'exposure': exposure_result,
         'face': face_result,
         'iqa': iqa_result,

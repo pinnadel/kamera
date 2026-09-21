@@ -1693,7 +1693,7 @@ function RailGroupTile({ group, isOpen, isPickTarget, isDropHover, onClick, onDr
 //   ranked (top-N filtered)     → amber chip "AI ranked top N of M" with InfoTooltip
 //                                  + click-to-toggle a filter narrowing Survey/
 //                                  Filmstrip down to just the evaluated photos
-//   no_vision_model             → one-line nudge with `ollama pull qwen2.5vl:7b` hint
+//   no_vision_model             → one-line nudge with `ollama pull qwen3-vl:30b-a3b-instruct` hint
 //   too_few                     → silent (group is out of bounds; nothing went wrong)
 //   near_duplicates             → neutral "Near-duplicate frames" chip explaining
 //                                  that AI dedup found nothing to compare; the
@@ -1785,7 +1785,7 @@ function BurstRankStatus({ status, result, showOnlyEvaluated, onToggleShowOnlyEv
     return (
       <span
         className="inline-flex items-center gap-2 px-2 py-1 rounded-md bg-[rgba(232,184,74,0.10)] border border-[rgba(232,184,74,0.30)] select-none"
-        title="AI burst ranking needs a vision model that can see all photos at once. qwen2.5vl:7b is ~6 GB, downloads once."
+        title="AI burst ranking needs a vision model that can see all photos at once. qwen3-vl:30b-a3b-instruct is ~20 GB, downloads once."
       >
         <span className="w-1.5 h-1.5 rounded-full bg-[#E8B84A] shrink-0" />
         <span className="text-xs text-[#E8B84A] whitespace-nowrap">

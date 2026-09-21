@@ -619,6 +619,66 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
     # to draw a banner. The previous run already counted them, so store it.
     (53, "Add asset_count to photos_albums",
          "ALTER TABLE photos_albums ADD COLUMN asset_count INTEGER"),
+    # v54: edge-width sharpness (phase1_technical/edge_sharpness.py). Measured
+    # for EVERY corpus, but only Photos score by it — folder records it as a
+    # shadow feature so the "does edge width beat the legacy metric on camera
+    # RAW?" question can be answered against real labels later. It is not in
+    # the model's feature vector yet; see feature_extractor._SHADOW_COLUMNS.
+    (54, "Add edge-width sharpness columns",
+         "ALTER TABLE images ADD COLUMN edge_width_px REAL"),
+    (54, "Add face edge-width column",
+         "ALTER TABLE images ADD COLUMN face_edge_width_px REAL"),
+    # v55: pyexiftool defaults to common_args ["-G", "-n"], and "-n" turns off
+    # exiftool's print conversion. Numeric tags benefit; enum-backed ones are
+    # destroyed. FilmMode was stored as the raw Fuji opcode, so the dashboard's
+    # film-simulation histogram was a bar chart of "1536" and "2816".
+    #
+    # exif_parser.py now reads with print conversion on. This backfills the
+    # rows written before that. The mapping is not from the enum spec — it was
+    # read back off the user's own RAF files by running exiftool twice over
+    # them, once with -n and once without, and pairing the results. Those seven
+    # codes are exactly the distinct values present in shooting_log.
+    #
+    # Anything still numeric afterwards is an opcode we cannot resolve, which
+    # is not information: it becomes NULL and is reported as "no film
+    # simulation recorded", matching what the parser now does with one.
+    (55, "Resolve Fuji FilmMode opcodes to names",
+         lambda conn: [
+             conn.execute(
+                 "UPDATE shooting_log SET film_simulation = ? "
+                 "WHERE film_simulation = ?", (name, code))
+             for code, name in (
+                 ("0",    "Provia/Standard"),
+                 ("1280", "Pro Neg. Std"),
+                 ("1281", "Pro Neg. Hi"),
+                 ("1536", "Classic Chrome"),
+                 ("1792", "Eterna"),
+                 ("2048", "Classic Negative"),
+                 ("2560", "Nostalgic Neg"),
+                 ("2816", "Reala ACE"),
+             )
+         ] + [
+             conn.execute(
+                 "UPDATE shooting_log SET film_simulation = NULL "
+                 "WHERE film_simulation GLOB '[0-9]*' "
+                 "AND film_simulation NOT GLOB '*[^0-9]*'"
+             )
+         ]),
+    # v56: one camera was logged under two names depending on which parser
+    # read the file. exifread (JPEG/NEF/3FR) normalised through
+    # camera_shake.canonical_camera_name; the exiftool fallback (RAF/HIF)
+    # assembled "Make Model" itself. So the X100VI appeared twice on the
+    # dashboard — 2 482 shots as "X100VI" and 378 as "FUJIFILM X100VI" —
+    # splitting every per-camera statistic along a parser boundary.
+    #
+    # Both paths now share the normaliser. This folds the rows already
+    # written. "FUJIFILM X100VI" is the only affected spelling in the data;
+    # Z6III and X2D II 100C were never touched because exifread reads NEF and
+    # 3FR directly and so never reached the exiftool branch.
+    (56, "Fold split camera spellings",
+         "UPDATE shooting_log SET camera = 'X100VI' WHERE camera = 'FUJIFILM X100VI'"),
+    (56, "Fold split camera spellings in images",
+         "UPDATE images SET camera = 'X100VI' WHERE camera = 'FUJIFILM X100VI'"),
 ]
 
 
