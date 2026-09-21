@@ -454,6 +454,7 @@ export default function App() {
     skippedExpanded,
     setSkippedExpanded,
     toggleWatchLive,
+    toggleAutoCullAfterAnalysis,
     isLiveActive,
     startNewAnalysis,
     overwriteRequest,
@@ -845,6 +846,65 @@ export default function App() {
       .catch(() => {})
   }, [ensureTabForFolder, setTabs])
 
+  // Filled in below, once handleAutoCullComplete exists. See the note at its
+  // use site for why this is a ref and not a dependency.
+  const autoCullCompleteRef = useRef(null)
+
+  // ── Unattended cull: analysis finished on an armed tab ────────────────────
+  // Fires once per completed batch, only for tabs with "Auto-cull when analysis
+  // finishes" on (Tab settings). Deliberately NOT wired to onBatchComplete,
+  // which also fires mid-batch — culling a folder that is still being analysed
+  // would judge each burst against however much of it had arrived.
+  //
+  // The preview call ahead of the run is not a formality: it is the model gate.
+  // A folder whose taste model isn't ready would silently cull on generic
+  // quality thresholds, and the one time that matters is exactly when nobody is
+  // watching. So it is skipped, with a reason. (A Photos tab refuses
+  // server-side, which arrives here as a non-ok preview and skips the same way.)
+  const handleAnalysisFinished = useCallback(async (tab) => {
+    if (!tab?.autoCullAfterAnalysis || !tab.folderPath) return
+
+    const query = `?source_folder=${encodeURIComponent(tab.folderPath)}`
+      + (threshold != null ? `&threshold=${threshold}` : '')
+    try {
+      const res = await fetch(`${API}/auto-cull/preview${query}`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        addToast({ type: 'info', message: `Auto-cull skipped — ${data.detail || 'preview unavailable'}` })
+        return
+      }
+      if (data.total === 0) return   // nothing new to decide; stay quiet
+      if (data.scoring_mode !== 'personal') {
+        addToast({
+          type: 'info',
+          message: 'Auto-cull skipped — your taste model is not ready yet, and culling unattended on generic thresholds would move files you disagree with. Run it by hand to review first',
+        })
+        return
+      }
+
+      const pending = data.ai_rank?.to_rank ?? 0
+      addToast({
+        type: 'info',
+        message: pending > 0
+          ? `Auto-culling ${data.total} photos — AI ranking ${pending} group${pending === 1 ? '' : 's'} first, about ${Math.max(1, Math.round((data.ai_rank.estimated_seconds || 0) / 60))} min`
+          : `Auto-culling ${data.total} photos…`,
+      })
+
+      const run = await fetch(`${API}/auto-cull${query}`, { method: 'POST' })
+      const result = await run.json().catch(() => ({}))
+      if (!run.ok) throw new Error(result.detail || `${run.status}`)
+      // Same reporting path as the manual run, so a stopped run or an AI-rank
+      // fallback reads identically whether or not a human started it. Read
+      // through a ref: handleAutoCullComplete is declared further down the
+      // component, so naming it here (or in the deps array) would hit the
+      // temporal dead zone on every render.
+      await autoCullCompleteRef.current?.(result)
+    } catch (e) {
+      console.error('Auto-cull after analysis failed:', e)
+      addToast({ type: 'error', message: `Auto-cull after analysis failed: ${e.message}` })
+    }
+  }, [threshold, addToast])
+
   // ── Polling (usePolling) ──────────────────────────────────────────────────
   // Placed *after* useGroups so we can hand it `loadGroupsAndPrerank` as
   // the batch-complete callback. Two things happen on batch completion:
@@ -862,6 +922,7 @@ export default function App() {
     ensureTabForFolder,
     onWatchProgress,
     onBatchComplete: loadGroupsAndPrerank,
+    onAnalysisFinished: handleAnalysisFinished,
     // When the prerank worker advances, re-fetch /similarity-groups (NOT
     // /prerank-groups — we don't want to re-enqueue, just refresh per-tile
     // states). loadGroups also runs on initial mount and threshold changes;
@@ -2418,6 +2479,9 @@ export default function App() {
       : ''
     addToast({ type: 'info', message: `Auto-culled ${result.total} photos — ${result.counts?.maybe ?? 0} maybes to review${aiNote}` })
   }, [loadImages, loadModelInfo, addToast])
+
+  // Hand the completion reporter to the unattended path declared above.
+  useEffect(() => { autoCullCompleteRef.current = handleAutoCullComplete }, [handleAutoCullComplete])
 
   // ── Bulk actions ──────────────────────────────────────────────────────────
   const rejectAllMaybes = useCallback(async () => {
@@ -4543,6 +4607,33 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  {/* ── Auto-cull when analysis finishes ── */}
+                  {activeTab?.folderPath && (
+                    <div className="px-4 py-4 border-t border-[rgba(255,255,255,0.05)]">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="label mb-1">Cull when analysis finishes</p>
+                          <p className="text-xs text-[#9c9c9d] leading-relaxed">
+                            {activeTab.autoCullAfterAnalysis
+                              ? 'When this analysis completes, auto-cull runs on its own — AI ranking first, then files move. No confirmation.'
+                              : 'Run auto-cull automatically the moment this analysis completes, without asking.'}
+                          </p>
+                          <p className="text-xs text-[#8a8b8c] leading-relaxed mt-1.5">
+                            Skipped if your taste model is not ready for this source. Every photo
+                            is still reversible with{' '}
+                            <kbd className="px-1 py-0.5 rounded bg-[#1b1c1e] border border-[rgba(255,255,255,0.12)] text-[10px] font-mono text-[#cecece]">U</kbd>
+                          </p>
+                        </div>
+                        <div className="pt-0.5">
+                          <Toggle
+                            enabled={!!activeTab.autoCullAfterAnalysis}
+                            onChange={() => toggleAutoCullAfterAnalysis(activeTab.id)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {/* ── Folders ── */}
                   {activeTab?.folderPath && !isPhotosTab(activeTab) && (

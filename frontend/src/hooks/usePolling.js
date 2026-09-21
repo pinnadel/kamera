@@ -40,7 +40,7 @@ const MID_BATCH_PRERANK_EVERY = 50
 // than this, so those refetches coalesce instead of queueing up one per photo.
 const IMAGE_REFETCH_MIN_MS = 1500
 
-export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onWatchProgress, onBatchComplete, onPrerankAdvance }) {
+export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onWatchProgress, onBatchComplete, onAnalysisFinished, onPrerankAdvance }) {
   // Keep a ref that always points at the current tabs array so the polling
   // closure never reads a stale snapshot. The effect that writes it is
   // intentionally NOT in this hook — App.jsx owns tabs state and syncs it.
@@ -57,6 +57,12 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
   // owns a single setInterval for the app's lifetime.
   const onBatchCompleteRef = useRef(onBatchComplete)
   useEffect(() => { onBatchCompleteRef.current = onBatchComplete }, [onBatchComplete])
+  // Deliberately NOT onBatchComplete: that one also fires mid-batch, every
+  // MID_BATCH_PRERANK_EVERY photos, to warm the prerank cache. Culling on it
+  // would cull a folder that is still being analysed. This one fires once, on
+  // the running:true→false edge, and carries the tab that finished.
+  const onAnalysisFinishedRef = useRef(onAnalysisFinished)
+  useEffect(() => { onAnalysisFinishedRef.current = onAnalysisFinished }, [onAnalysisFinished])
 
   // Same ref pattern for the prerank-advance callback. Called when the
   // backend reports that the worker either finished an item (completed +
@@ -152,6 +158,9 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
               // manually, which makes it look like clustering never happened.
               if (typeof onBatchCompleteRef.current === 'function') {
                 try { onBatchCompleteRef.current() } catch { /* host-side error, don't break polling */ }
+              }
+              if (tab && typeof onAnalysisFinishedRef.current === 'function') {
+                try { onAnalysisFinishedRef.current(tab) } catch { /* non-fatal */ }
               }
             }
             wasRunning = false

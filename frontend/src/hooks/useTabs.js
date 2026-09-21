@@ -14,6 +14,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { API } from '../api'
 import { makeNewTab, makeReadyTab, isPhotosTab } from '../tabs'
+import { isArmed, setArmed } from '../autoCullArming'
 
 export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }) {
 
@@ -120,6 +121,9 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
             libraryPath: f.library_path || null,
           }),
           watchLive: f.source_folder === liveFolder,
+          // Re-armed from localStorage: tabs are rebuilt from /folders on every
+          // launch, so the flag has nowhere else to survive.
+          autoCullAfterAnalysis: isArmed(f.source_folder),
         }))
         if (liveFolder && !folders.some(f => f.source_folder === liveFolder)) {
           restored.unshift({ ...makeReadyTab(liveFolder), watchLive: true })
@@ -619,6 +623,17 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
 
   // ── Watch live poll for errors ───────────────────────────────────────────
   // While Watch live is on, toast any new per-file errors from the ring buffer.
+  // Arm/disarm "cull this folder the moment its analysis finishes". Purely a
+  // frontend intent: usePolling reports the finished tab and App fires the run.
+  const toggleAutoCullAfterAnalysis = useCallback((tabId) => {
+    setTabs(prev => prev.map(t => {
+      if (t.id !== tabId) return t
+      const next = !t.autoCullAfterAnalysis
+      setArmed(t.folderPath, next)
+      return { ...t, autoCullAfterAnalysis: next }
+    }))
+  }, [setTabs])
+
   const isLiveActive = activeTab?.watchLive === true
   const lastErrorTsRef = useRef(null)
 
@@ -693,6 +708,7 @@ export function useTabs({ tabs, setTabs, activeTabId, setActiveTabId, addToast }
     setSkippedExpanded,
     // Watch live
     toggleWatchLive,
+    toggleAutoCullAfterAnalysis,
     isLiveActive,
     // New analysis flow
     startNewAnalysis,

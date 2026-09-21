@@ -54,6 +54,53 @@ needed — the ledger is just another process's SQLite file).
 
 ---
 
+## Auto-cull: one denominator, and a cull that starts itself (2026-09-21, later)
+
+Two follow-ups from using the feature above on a real 1257-photo import.
+
+**The progress bar counted something the modal never promised.** The modal said
+"50 groups need AI ranking — about 50 min"; the bar then showed `13/72`. Both
+numbers were right about different things: the estimate counted groups needing
+an LLM call, the bar counted every *contested* group. The gap is the
+near-duplicate outcome — measured on that folder, 78 contested groups were 55
+cached + 15 near-duplicate + 8 uncached, and a near-duplicate group resolves
+from embeddings we already have, for free. New `autocull_rank.resolve_cached()`
+is now the single definition of "groups that cost time": it splits contested
+groups into resolved-now and pending, and **both** the preview's estimate and
+the run's `_autocull_progress["total"]` come from that one split. The run also
+stops redoing the cheap pass. Pinned by two tests, one of which asserts the
+`"total": len(pending)` call site directly.
+
+**The preview's counts are pre-ranking, and now say so.** Measured on the same
+folder (2397 rows, warm cache): AI winners move **11 photos (0.5%)** between
+buckets and the totals by **≤2** (keep 245→246, maybe 44→45, reject 2108→2106).
+So the honest line is that ranking changes *which* photo of a group is kept far
+more than *how many* — which is what the modal now says.
+
+**Analyse → cull, unattended.** New per-tab toggle (Tab settings → *Cull when
+analysis finishes*), armed per folder in `frontend/src/autoCullArming.js`
+(localStorage, keyed by folder path — tabs are rebuilt from `GET /folders` every
+launch and carry no state of their own). `usePolling` gained
+`onAnalysisFinished(tab)`, fired **only** on the running:true→false edge —
+deliberately not `onBatchComplete`, which also fires every 50 photos mid-batch
+to warm the prerank cache, and culling a folder still being analysed would judge
+each burst against however much of it had arrived.
+
+The preview call before the run is the model gate, not a formality: if
+`scoring_mode !== "personal"` the cull is **skipped with a toast**, because
+unattended culling on generic quality thresholds is the case most likely to
+produce rejects the user disagrees with, and by definition nobody is watching. A
+Photos tab refuses server-side and arrives here as a non-ok preview, skipping the
+same way. Completion reporting reuses `handleAutoCullComplete`, so a stopped run
+or an AI-rank fallback reads identically whether or not a human started it.
+(`handleAutoCullComplete` is declared further down `App.jsx`, so the handler
+reaches it through a ref — naming it in the deps array is a temporal-dead-zone
+ReferenceError on every render, i.e. a blank screen.)
+
+Suite 714/714.
+
+---
+
 ## Auto-cull asks the AI which photo of a group is the best one (2026-09-21)
 
 Auto-cull already grouped bursts and already picked a winner per group — the
