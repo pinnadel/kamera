@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend import provenance_link
 from backend.database import get_db
 from backend.state import _last_errors, watcher
 from phase2_quality.llm_explainer import (
@@ -40,6 +41,29 @@ class GenerateExplanationRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+@router.get("/import-status")
+def import_status():
+    """What Provenance is doing right now — the return half of the seam.
+
+    Until this existed the relationship was one-way: Provenance drove KaMeRa
+    over HTTP and an import was invisible here while it ran, which is why its
+    results had to be shouted through a modal dialog that blocks the screen
+    for half an hour. With the run readable, the result can live as a banner
+    in the tab the photos are landing in.
+
+    Always 200. `available: false` means Provenance isn't installed on this
+    machine, which is a normal state, not an error — same gating as the Apple
+    Photos source. `run: null` means nothing has been imported yet.
+
+    Phases: reading · copying · analyzing · done · interrupted. `interrupted`
+    is deliberately distinct from `done`: it is what lets the UI offer to
+    resume without guessing.
+    """
+    if not provenance_link.is_available():
+        return {"available": False, "run": None}
+    return {"available": True, "run": provenance_link.import_status()}
 
 
 @router.get("/health")

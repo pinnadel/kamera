@@ -679,6 +679,29 @@ _MIGRATIONS: list[tuple[int, str, str | object]] = [
          "UPDATE shooting_log SET camera = 'X100VI' WHERE camera = 'FUJIFILM X100VI'"),
     (56, "Fold split camera spellings in images",
          "UPDATE images SET camera = 'X100VI' WHERE camera = 'FUJIFILM X100VI'"),
+
+    # v57: Provenance's stable per-photo key (see backend/provenance_link.py).
+    #
+    # images.uuid is a uuid4 assigned per ROW — a handle with no derivation.
+    # It already keys training_samples and shooting_log, the two tables built
+    # to outlive the photo, so when an archived file's row is deleted those
+    # samples are left pointing at an id nothing can ever resolve again.
+    # Provenance's exif_key is the opposite: derived from the bytes
+    # ({serial}|{subsec}|{sequence}|{size}), recomputable forever, with
+    # nothing hanging off it. This column joins the two.
+    #
+    # Deliberately NOT UNIQUE: a RAW and its JPEG are two rows by design and
+    # get two different keys anyway (file_size is in the key), and the same
+    # Photos asset can appear in two album tabs.
+    #
+    # NULL is a normal value — a photo that never came through Provenance has
+    # no key and needs none. The key is read from the ledger, never recomputed
+    # here: the canonical definition stays in one repo.
+    (57, "Add provenance_key to images",
+         "ALTER TABLE images ADD COLUMN provenance_key TEXT"),
+    (57, "Index on images.provenance_key",
+         "CREATE INDEX IF NOT EXISTS idx_images_provenance_key "
+         "ON images(provenance_key)"),
 ]
 
 

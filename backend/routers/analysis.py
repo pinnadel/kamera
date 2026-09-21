@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from phase1_technical.exposure import compute_histogram as _compute_histogram
 
+from backend import provenance_link
 from backend.database import get_bool_setting, get_db, get_setting, write_shooting_log
 from backend.state import (
     PREVIEW_CACHE_DIR,
@@ -468,6 +469,24 @@ _INSERT_SKIPPED_SQL = """
 """
 
 
+
+def _stamp_provenance_key(conn, image_id: int, path) -> None:
+    """Record Provenance's stable per-photo key on a freshly ingested row.
+
+    **Has to happen at ingest.** The join is on the staged path in
+    temp_import, and the first K/M/R moves the file into _Keeps/_Maybes/
+    _Rejects — after which the lookup returns None forever. A silent no-op
+    when Provenance isn't installed, or when the photo didn't come through it.
+
+    Guarded by `if key`, so a re-analysis of an already-moved photo leaves the
+    key it was stamped with rather than clobbering it with NULL.
+    """
+    key = provenance_link.key_for_path(path)
+    if key:
+        conn.execute("UPDATE images SET provenance_key = ? WHERE id = ?",
+                     (key, image_id))
+
+
 def _build_skipped_insert_params(path: Path, exif: dict) -> tuple:
     """Pack EXIF into the positional tuple for _INSERT_SKIPPED_SQL."""
     return (
@@ -620,6 +639,7 @@ def analyze(request: AnalyzeRequest):
             "SELECT id, preview_path FROM images WHERE file_path = ?", (str(path),)
         ).fetchone()
         image_id = row["id"]
+        _stamp_provenance_key(conn, image_id, path)
         write_shooting_log(conn, **_shooting_log_kwargs(path, result, exif, sample_uuid))
 
     # Re-analysis can change features → drop the stale cached score for this id.
@@ -889,6 +909,7 @@ def _run_batch(
                         ).fetchone()
                         if inserted is not None:
                             invalidate_all([inserted["id"]])
+                            _stamp_provenance_key(conn, inserted["id"], file_path)
                             # The shooting log answers "what are my camera
                             # habits" — focal lengths, apertures, bodies. iPhone
                             # shots out of a Photos album would skew every

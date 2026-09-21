@@ -4,6 +4,56 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## KaMeRa can read Provenance back (2026-09-21)
+
+The relationship with Provenance (`~/dev/provenance`) was one-way. Its
+`kamera.py` knows nine of our endpoints, starts our `start.sh` and opens our
+window. We knew Provenance through two code comments. That asymmetry is why an
+import is invisible here while it runs, why its result has to be shouted
+through a modal dialog that holds the screen for up to half an hour, and why
+an archived photo simply 404s and gets its row deleted.
+
+**`backend/provenance_link.py`** is the return channel and the only place that
+touches anything of Provenance's — read-only, no HTTP, no Python import either
+way. Two sources in the `~/Pictures/.kamera/` directory both apps already
+share: `ledger.sqlite` (opened `mode=ro`, so a bug here cannot corrupt another
+app's database) for the durable facts, and `import_status.json` for the run in
+flight.
+
+**A file, not a port.** The flow decided it: KaMeRa only ever needs to *read*,
+because the one thing it asks Provenance to do — "archive this now" — is
+already expressed by moving a file into `_Keeps_reviewed`, and that contract
+works. Nothing justified a server, a bound port, or a second lifecycle.
+
+**`GET /import-status`** always returns 200. `available:false` means Provenance
+isn't installed, which is a normal state rather than an error — the same gating
+idea as `photos_library.is_available()` off macOS.
+
+**`images.provenance_key` (migration v57).** `images.uuid` is a `uuid4()`
+assigned per row: a handle with no derivation. It already keys
+`training_samples` and `shooting_log`, the two tables built to outlive the
+photo — so when an archived file's row is deleted, those samples point at an id
+nothing can ever resolve again. Provenance's `exif_key` is the mirror image:
+derived from the bytes, recomputable forever, with nothing hanging off it. The
+column joins them. Read from the ledger, never recomputed here, so the
+canonical key keeps one definition in one repo. Nullable and deliberately not
+UNIQUE (a RAW and its JPEG are two rows by design). Stamped at ingest at both
+insert sites, because the join is on the staged path and the first K/M/R moves
+the file out from under it.
+
+**No backfill.** The 1870 existing rows stay NULL by decision — their files are
+already archived or already renamed, and a wrong key is worse than none.
+
+**Found while building it:** `is_available()` gated on the ledger alone, but
+Provenance writes its first status *before* creating the ledger, so a
+first-ever import would have reported "not installed" while visibly running.
+`is_available()` now accepts either artifact; the ledger reads gate separately.
+
+Guarded by `tests/test_provenance_link.py` (14 tests, no Provenance install
+needed — the ledger is just another process's SQLite file).
+
+---
+
 ## Browser swipe-navigation gestures disabled (2026-09-20)
 
 A two-finger swipe left/right on the trackpad triggered Chrome's history
