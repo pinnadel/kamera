@@ -151,6 +151,9 @@ function AiRankNotice({ ai }) {
               </>
             )}
             {' '}You can stop while it runs — nothing moves until ranking finishes.
+            {' '}The counts above are computed before that, so ranking can still shift a
+            photo or two between buckets — it changes <em className="not-italic text-[#cecece]">which</em> photo
+            of a group is kept more than how many.
           </>
         ) : (
           <>

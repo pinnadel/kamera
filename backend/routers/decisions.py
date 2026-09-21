@@ -941,7 +941,7 @@ def _ai_rank_preview(bursts: list[list[dict]], decisions: dict[int, str],
     `_winners` for the caller to pop and feed to the burst passes.
     """
     from backend.autocull_rank import (
-        SECONDS_PER_RANK, consequential_bursts, resolve_winners,
+        SECONDS_PER_RANK, consequential_bursts, resolve_cached,
     )
 
     if not enabled:
@@ -949,15 +949,15 @@ def _ai_rank_preview(bursts: list[list[dict]], decisions: dict[int, str],
                 "to_rank": 0, "estimated_seconds": 0}
 
     contested = consequential_bursts(bursts, decisions)
-    winners, stats = resolve_winners(contested, cached_only=True)
-    to_rank = stats["fallback_reasons"].get("not_cached", 0)
+    # Same split the run uses, so `to_rank` here IS the run's progress total.
+    winners, pending, stats = resolve_cached(contested)
     return {
         "_winners": winners,
         "enabled": True,
         "groups": len(contested),
         "cached": stats["ranked"],
-        "to_rank": to_rank,
-        "estimated_seconds": to_rank * SECONDS_PER_RANK,
+        "to_rank": len(pending),
+        "estimated_seconds": len(pending) * SECONDS_PER_RANK,
     }
 
 
@@ -1602,31 +1602,55 @@ def _run_ai_ranking(
     work; this is blocking a user who is waiting, so this wins. rank_burst's
     inflight registry covers the narrower race where both want one exact group.
     """
-    from backend.autocull_rank import consequential_bursts, resolve_winners
+    from backend.autocull_rank import (
+        consequential_bursts, resolve_cached, resolve_winners,
+    )
     from phase2_quality import prerank
 
-    to_rank = consequential_bursts(bursts, decisions)
+    contested = consequential_bursts(bursts, decisions)
     prerank.cancel()
+
+    # Free pass first: cached ranks and near-duplicate groups resolve without
+    # touching the LLM. `total` is then the number of groups that actually cost
+    # time — the same number the preview's estimate quoted. Counting every
+    # contested group here is what made a run promise 50 groups and then display
+    # 13/72.
+    winners, pending, cached_stats = resolve_cached(contested)
 
     _autocull_stop_event.clear()
     _autocull_progress.update({
         "running": True,
         "phase": "ranking",
-        "total": len(to_rank),
+        "total": len(pending),
         "done": 0,
-        "cached": 0,
+        "cached": cached_stats["ranked"],
         "stop_requested": False,
         "source_folder": source_folder,
         "started_at": time.time(),
     })
     try:
-        winners, stats = resolve_winners(
-            to_rank,
+        fresh, stats = resolve_winners(
+            pending,
             on_progress=lambda done, total: _autocull_progress.update(
                 {"done": done, "total": total}),
             should_stop=_autocull_stop_event.is_set,
         )
-        if not stats.get("stopped"):
+        winners.update(fresh)
+        # Merge the free pass into the reported stats so `ranked` means "groups
+        # the AI decided", whether or not this run paid for them.
+        merged_reasons = dict(cached_stats["fallback_reasons"])
+        for reason, n in stats["fallback_reasons"].items():
+            merged_reasons[reason] = merged_reasons.get(reason, 0) + n
+        stats = {
+            "groups": len(contested),
+            "ranked": cached_stats["ranked"] + stats["ranked"],
+            "from_cache": cached_stats["ranked"],
+            "freshly_ranked": stats["ranked"],
+            "fell_back": cached_stats["free"] - cached_stats["ranked"] + stats["fell_back"],
+            "fallback_reasons": merged_reasons,
+            "stopped": stats.get("stopped", False),
+        }
+        if not stats["stopped"]:
             _autocull_progress["phase"] = "applying"
         return winners, stats
     finally:

@@ -25,6 +25,7 @@ import numpy as np
 from backend.autocull_rank import (
     consequential_bursts,
     promote_winner,
+    resolve_cached,
     resolve_winners,
 )
 from backend.routers import decisions as decisions_mod
@@ -304,3 +305,60 @@ def test_promote_winner_leaves_the_rest_of_the_order_alone():
     assert [m["id"] for m in moved] == [3, 1, 2, 4]
     assert [m["id"] for m in promote_winner(ordered, None)] == [1, 2, 3, 4]
     assert [m["id"] for m in promote_winner(ordered, 99)] == [1, 2, 3, 4]
+
+
+# ---------------------------------------------------------------------------
+# 4. The preview's estimate and the run's progress bar must count the same thing
+# ---------------------------------------------------------------------------
+
+def _statuses(mapping):
+    """rank_burst stub that returns a per-first-member status."""
+    def _rank(ids, conn, cached_only=False):
+        status = mapping[ids[0]]
+        if status == "ranked":
+            return {"status": "ranked", "rankings": [{"image_id": ids[0], "rank": 1}]}
+        return {"status": status, "rankings": []}
+    return _rank
+
+
+def test_resolve_cached_only_pends_the_groups_that_cost_an_llm_call(monkeypatch):
+    """A near-duplicate group resolves from embeddings alone and a cached one is
+    free. Counting either as "needs ranking" is what made the modal promise 50
+    groups and the progress bar then show 13/72."""
+    monkeypatch.setattr("phase2_quality.burst_ranker.rank_burst", _statuses({
+        1: "ranked", 10: "near_duplicates", 20: "not_cached", 30: "not_cached",
+    }))
+    bursts = [[_row(i), _row(i + 1), _row(i + 2)] for i in (1, 10, 20, 30)]
+
+    winners, pending, stats = resolve_cached(bursts, conn_factory=_conn_factory)
+
+    assert len(pending) == 2                      # only the two uncached ones
+    assert stats["ranked"] == 1 and stats["free"] == 2
+    assert stats["fallback_reasons"] == {"near_duplicates": 1}
+    assert winners == {1: 1, 2: 1, 3: 1}
+
+
+def test_preview_estimate_equals_the_runs_progress_total(monkeypatch):
+    """The number the modal quotes before you start and the denominator of the
+    bar you then watch come from one call, not two definitions."""
+    monkeypatch.setattr("phase2_quality.burst_ranker.rank_burst", _statuses({
+        1: "ranked", 10: "near_duplicates", 20: "not_cached", 30: "not_cached",
+    }))
+    bursts = [[_row(i), _row(i + 1), _row(i + 2)] for i in (1, 10, 20, 30)]
+    decisions = {m["id"]: "keep" for b in bursts for m in b}
+
+    preview = decisions_mod._ai_rank_preview(bursts, decisions, enabled=True)
+    _, pending, _ = resolve_cached(
+        consequential_bursts(bursts, decisions), conn_factory=_conn_factory)
+
+    assert preview["to_rank"] == len(pending)
+    assert preview["estimated_seconds"] == len(pending) * 60
+    assert preview["groups"] == 4        # contested total, reported separately
+
+
+def test_run_publishes_the_pending_count_as_its_progress_total(monkeypatch):
+    """Call-site check: _run_ai_ranking must publish len(pending), not the
+    contested count. Same failure shape as the winners-map call-site test."""
+    src = inspect.getsource(decisions_mod._run_ai_ranking)
+    assert '"total": len(pending)' in src
+    assert "resolve_cached(contested)" in src

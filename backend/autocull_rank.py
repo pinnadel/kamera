@@ -107,6 +107,49 @@ def _rank_one_winner(member_ids: list[int], conn, *, cached_only: bool) -> tuple
     return int(winner), "ranked"
 
 
+def resolve_cached(
+    bursts: list[list[dict]],
+    *,
+    conn_factory: Callable | None = None,
+) -> tuple[dict[int, int], list[list[dict]], dict]:
+    """Split `bursts` into the ones already answered and the ones that will cost
+    an LLM call. Returns (winners_so_far, bursts_needing_a_fresh_rank, stats).
+
+    Nothing here calls the LLM. Three outcomes resolve for free: a cached
+    ranking, a near-duplicate group (the SigLIP collapse leaves nothing to
+    compare, and that is numpy over embeddings we already have), and an error.
+    Only `not_cached` goes in the pending list.
+
+    This exists so ONE definition of "groups that cost time" feeds both the
+    preview's estimate and the run's progress bar. They used to count different
+    things — the bar counted every contested group, the estimate counted only
+    uncached ones — and a run that promised 50 groups then showed 13/72 is a
+    progress bar nobody can trust.
+    """
+    winners: dict[int, int] = {}
+    pending: list[list[dict]] = []
+    stats = {"ranked": 0, "free": 0, "fallback_reasons": {}}
+
+    if conn_factory is None:
+        from backend.database import get_db as conn_factory  # type: ignore[assignment]
+
+    for burst in bursts:
+        member_ids = [m["id"] for m in burst]
+        with conn_factory() as conn:
+            winner, status = _rank_one_winner(member_ids, conn, cached_only=True)
+        if status == "not_cached":
+            pending.append(burst)
+            continue
+        stats["free"] += 1
+        if winner is not None:
+            stats["ranked"] += 1
+            for mid in member_ids:
+                winners[mid] = winner
+        else:
+            stats["fallback_reasons"][status] = stats["fallback_reasons"].get(status, 0) + 1
+    return winners, pending, stats
+
+
 def resolve_winners(
     bursts: list[list[dict]],
     *,
