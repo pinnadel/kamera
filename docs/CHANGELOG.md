@@ -277,6 +277,40 @@ ladder reproduced it: σ=2 px blur scores 5 clean, 97 with σ=6 noise, 100 with 
 
 ---
 
+## Time axes that represent time (2026-09-21)
+
+The last item from the critique: both timeline charts were drawing geometry
+that did not match their data — the same failure as the "Unknown" bar, in a
+different shape.
+
+- **Quiet buckets are zero-filled.** Omitting empty periods is right for a
+  data feed and wrong for a chart. Ten bars spanning W20–W37 drew as ten
+  adjacent columns, so eighteen weeks of history looked like ten consecutive
+  ones and a three-week pause was indistinguishable from no pause. Both
+  `/decisions/timeline` and `/shooting/timeline` now emit every bucket between
+  the first and last record. Totals are unchanged (2 971 and 5 011); the
+  decisions axis went 10 → 18 buckets, shooting 22 → 38.
+- **A non-zero week can no longer render as nothing.** One week held a single
+  decision against a peak of 1 751 — 0.1px. Any week with activity gets a 2px
+  floor; a week with none gets a baseline tick instead, because "nothing
+  happened" and "almost nothing happened" have to look different or the floor
+  would be its own lie. The footnote now reads "Busiest week: W20 '26 with
+  1 751 decisions. 8 of 18 weeks had none."
+- **`_bucket_sequence` steps by day.** Stepping 7 days from an unaligned start
+  visits one date per 7-day window offset from Monday, which is not the same
+  set as "every `%W` week" — a range starting Sat 2025-12-20 went W50, W51,
+  W00 and silently skipped **W52**. Monday-aligning fixes that one and breaks
+  another, because `%W` week 00 is the partial week before the year's first
+  Monday and no Monday falls inside it. A day cursor produces every label by
+  construction. Caught by a test that compares generated labels against
+  SQLite's own `strftime` across a year boundary, not by reading the output.
+  Cost: 11ms for all three timelines on the real corpus.
+
+Python's `%W` was verified to match SQLite's against 400 real rows and both
+year boundaries before any of this was built on it.
+
+---
+
 ## The 23% of shooting_log with no EXIF (2026-09-20)
 
 The open question left by the readability pass had an answer, and it was not

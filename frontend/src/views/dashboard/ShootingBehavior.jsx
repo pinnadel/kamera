@@ -189,16 +189,23 @@ function TimelineBar({ row, max }) {
     <HoverPopover
       block
       className="group flex-1 min-w-[2px] cursor-default"
-      content={`${formatPeriod(row.period)} — ${row.count.toLocaleString()} shots`}
+      content={row.count === 0
+        ? `${formatPeriod(row.period)} — no shots`
+        : `${formatPeriod(row.period)} — ${row.count.toLocaleString()} shots`}
     >
       <div className="h-20 flex flex-col justify-end">
-        <div
-          className="w-full bg-[#a8a8a8] rounded-[1px] min-h-[1px] opacity-80 group-hover:opacity-100"
-          style={{
-            height: `${height}%`,
-            transition: 'height 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 120ms ease',
-          }}
-        />
+        {row.count === 0 ? (
+          <div className="w-full h-px bg-[#1b1c1e] rounded-full" />
+        ) : (
+          <div
+            className="w-full bg-[#a8a8a8] rounded-[1px] opacity-80 group-hover:opacity-100"
+            style={{
+              height: `${height}%`,
+              minHeight: '2px',
+              transition: 'height 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 120ms ease',
+            }}
+          />
+        )}
       </div>
     </HoverPopover>
   )

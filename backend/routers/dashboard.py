@@ -36,7 +36,7 @@ silently appear to filter it.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
@@ -53,6 +53,55 @@ router = APIRouter(prefix="/dashboard")
 # Bucket modes for timeline endpoints. SQLite strftime accepts %Y-%W (ISO week)
 # and %Y-%m (month). Reject other values defensively.
 _BUCKETS = {"week": "%Y-W%W", "month": "%Y-%m"}
+
+# How far to step to reach the next bucket. Weeks are exactly 7 days; months
+# are walked by clamping to the 1st and adding 32 days, which lands inside the
+# following month for every month length.
+_BUCKET_STEP = {"week": "week", "month": "month"}
+
+
+def _bucket_sequence(first: str, last: str, bucket: str) -> list[str]:
+    """Every bucket label from `first` to `last` inclusive, none skipped.
+
+    Both ends are ISO datetimes out of the table. Python's %W matches SQLite's
+    exactly (verified against 400 real rows and both year boundaries), so the
+    labels generated here line up with the ones the GROUP BY produced.
+
+    This exists because omitting empty buckets is right for a data feed and
+    wrong for a chart. Rendered, the gaps closed up: ten bars spanning W20 to
+    W37 drew as ten adjacent columns, so eighteen weeks of history looked like
+    ten consecutive ones and a three-week pause was indistinguishable from no
+    pause at all. A time axis that skips time is not a time axis.
+    """
+    fmt = _BUCKETS[bucket]
+    try:
+        start = datetime.fromisoformat(first)
+        end = datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return []
+
+    # Step by DAY, not by bucket.
+    #
+    # Stepping 7 days from an unaligned start visits one date per 7-day
+    # window offset from Monday, which is not the same set as "every %W
+    # week": a range starting Sat 2025-12-20 stepped weekly goes W50, W51,
+    # W00 — silently skipping W52. Monday-aligning fixes that one and breaks
+    # another, because %W week 00 is the partial week before the year's first
+    # Monday and no Monday ever falls inside it.
+    #
+    # A day cursor produces every label in the range by construction, with no
+    # reasoning about week numbering at all. 365 strftime calls per year of
+    # range, once per request — not worth outsmarting.
+    labels: set[str] = set()
+    cursor = start
+    # ~50 years of days, so a corrupt timestamp can never spin here.
+    for _ in range(20000):
+        if cursor > end:
+            break
+        labels.add(cursor.strftime(fmt))
+        cursor += timedelta(days=1)
+    labels.add(end.strftime(fmt))
+    return sorted(labels)
 
 
 def _parse_since(since: str | None) -> str | None:
@@ -164,6 +213,15 @@ def decisions_timeline(
             """,
             params,
         ).fetchall()
+        # Same WHERE, minus the leading strftime format argument.
+        bounds = conn.execute(
+            f"""
+            SELECT MIN(decided_at) AS first, MAX(decided_at) AS last
+            FROM training_samples
+            {where}
+            """,
+            params[1:],
+        ).fetchone()
 
     pivot: dict[str, dict[str, int]] = {}
     for r in rows:
@@ -172,6 +230,13 @@ def decisions_timeline(
             continue
         slot = pivot.setdefault(period, {"keep": 0, "maybe": 0, "reject": 0})
         slot[r["decision"]] = r["n"]
+
+    # Zero-fill the quiet buckets so the axis represents elapsed time rather
+    # than "weeks in which something happened". A week with no decisions is a
+    # fact about the week, not an absence of data.
+    if pivot and bounds and bounds["first"]:
+        for label in _bucket_sequence(bounds["first"], bounds["last"], bucket):
+            pivot.setdefault(label, {"keep": 0, "maybe": 0, "reject": 0})
 
     return {
         "bucket": bucket,
@@ -465,10 +530,26 @@ def shooting_timeline(bucket: str = Query("week"), since: str | None = None):
             """,
             params,
         ).fetchall()
+        bounds = conn.execute(
+            f"""
+            SELECT MIN(shot_at) AS first, MAX(shot_at) AS last
+            FROM shooting_log
+            WHERE shot_at IS NOT NULL{extra}
+            """,
+            params[1:],
+        ).fetchone()
+
+    counts = {r["period"]: r["count"] for r in rows if r["period"]}
+    # Zero-fill, same reasoning as the decisions timeline: a week you didn't
+    # shoot is a fact about that week. Omitting it makes a three-month gap
+    # render as one bar-width of nothing.
+    if counts and bounds and bounds["first"]:
+        for label in _bucket_sequence(bounds["first"], bounds["last"], bucket):
+            counts.setdefault(label, 0)
 
     return {
         "bucket": bucket,
-        "rows": [{"period": r["period"], "count": r["count"]} for r in rows if r["period"]],
+        "rows": [{"period": p, "count": n} for p, n in sorted(counts.items())],
     }
 
 

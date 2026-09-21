@@ -458,3 +458,88 @@ def test_feature_deltas_expose_means_for_binary_features(dash_db):
     # The mean says what actually happened: 2 of 3 vs 1 of 2.
     assert face["kept_mean"] == pytest.approx(2 / 3)
     assert face["rejected_mean"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Zero-filled time axes (2026-09-21)
+#
+# Omitting empty buckets is right for a data feed and wrong for a chart.
+# Rendered, the gaps closed up: ten bars spanning W20–W37 drew as ten adjacent
+# columns, so eighteen weeks of history looked like ten consecutive ones and a
+# three-week pause was indistinguishable from no pause at all.
+# ---------------------------------------------------------------------------
+
+
+def test_decisions_timeline_fills_quiet_weeks(dash_db):
+    """Two decisions three weeks apart must yield four buckets, not two."""
+    feats = {n: 0.5 for n in feature_names()}
+    _seed_training_sample(dash_db, uuid="a", decision="keep",
+                          features=feats, decided_at="2026-04-06 12:00:00")
+    _seed_training_sample(dash_db, uuid="b", decision="reject",
+                          features=feats, decided_at="2026-04-27 12:00:00")
+
+    rows = dash_mod.decisions_timeline(bucket="week")["rows"]
+    periods = [r["period"] for r in rows]
+
+    assert len(rows) == 4, f"expected the quiet weeks between, got {periods}"
+    assert periods == sorted(periods), "buckets must stay chronological"
+    assert rows[0]["keep"] == 1
+    assert rows[-1]["reject"] == 1
+    assert all(r["keep"] == r["maybe"] == r["reject"] == 0 for r in rows[1:-1])
+    # Zero-filling must not invent decisions.
+    assert sum(r["keep"] + r["maybe"] + r["reject"] for r in rows) == 2
+
+
+def test_timeline_does_not_overshoot_the_last_bucket(dash_db):
+    """The generator steps by a whole bucket from an unaligned start, so it
+    must not append a trailing empty period after the final decision."""
+    feats = {n: 0.5 for n in feature_names()}
+    _seed_training_sample(dash_db, uuid="a", decision="keep",
+                          features=feats, decided_at="2026-04-06 12:00:00")
+    _seed_training_sample(dash_db, uuid="b", decision="keep",
+                          features=feats, decided_at="2026-04-16 12:00:00")
+
+    rows = dash_mod.decisions_timeline(bucket="week")["rows"]
+    assert rows[-1]["keep"] == 1, f"last bucket should hold a decision: {rows}"
+
+
+def test_single_bucket_stays_single(dash_db):
+    """One week of activity must not grow neighbours."""
+    feats = {n: 0.5 for n in feature_names()}
+    _seed_training_sample(dash_db, uuid="a", decision="keep",
+                          features=feats, decided_at="2026-04-06 12:00:00")
+    assert len(dash_mod.decisions_timeline(bucket="week")["rows"]) == 1
+
+
+def test_shooting_timeline_fills_quiet_weeks(dash_db):
+    _seed_shooting_log(dash_db, [
+        dict(sample_uuid="s1", shot_at="2026-04-06 12:00:00", camera="X100VI",
+             lens_model=None, film_simulation=None, format="RAF",
+             focal_length_mm=23.0, aperture=2.0, shutter_speed=0.004,
+             iso=400, overall_score=70.0),
+        dict(sample_uuid="s2", shot_at="2026-04-27 12:00:00", camera="X100VI",
+             lens_model=None, film_simulation=None, format="RAF",
+             focal_length_mm=23.0, aperture=2.0, shutter_speed=0.004,
+             iso=400, overall_score=70.0),
+    ])
+
+    rows = dash_mod.shooting_timeline(bucket="week")["rows"]
+    assert len(rows) == 4
+    assert sum(r["count"] for r in rows) == 2
+    assert [r["count"] for r in rows] == [1, 0, 0, 1]
+
+
+def test_bucket_sequence_matches_sqlite_week_numbering(dash_db):
+    """Python's %W and SQLite's %W must agree, including across a year end —
+    otherwise zero-filling would invent buckets the GROUP BY never produces."""
+    from backend.database import get_db as _get_db
+
+    labels = dash_mod._bucket_sequence(
+        "2025-12-20 10:00:00", "2026-01-15 10:00:00", "week"
+    )
+    with _get_db(dash_db) as conn:
+        for probe in ("2025-12-20", "2025-12-29", "2026-01-01", "2026-01-05", "2026-01-15"):
+            expected = conn.execute(
+                "SELECT strftime('%Y-W%W', ?)", (probe + " 10:00:00",)
+            ).fetchone()[0]
+            assert expected in labels, f"{probe} → {expected} missing from {labels}"

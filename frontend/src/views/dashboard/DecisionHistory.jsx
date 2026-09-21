@@ -10,6 +10,18 @@
 // tooltip — a light OS tooltip on a #07080a canvas was the loudest break with
 // the design system on this page.
 //
+// The axis is real time. The endpoint zero-fills every bucket between the
+// first and last decision, because omitting quiet weeks made ten bars
+// spanning W20–W37 draw as ten adjacent columns: eighteen weeks of history
+// looked like ten consecutive ones, and a three-week pause was
+// indistinguishable from no pause.
+//
+// A non-zero week can never render as nothing. One week held a single
+// decision against a peak of 1 751 — 0.1px, i.e. invisible — so any week with
+// activity gets a 2px floor, and a week with none gets a baseline tick
+// instead. "Nothing happened" and "almost nothing happened" have to look
+// different or the floor would be a lie.
+//
 // Empty state is one line of copy, never an empty axis.
 
 import { HoverPopover } from '../../ui/primitives'
@@ -44,6 +56,9 @@ export function DecisionHistory({ data, error, loading, stale }) {
   const busiest = rows.find(
     r => (r.keep || 0) + (r.maybe || 0) + (r.reject || 0) === maxWeek,
   )
+  const quietWeeks = rows.filter(
+    r => (r.keep || 0) + (r.maybe || 0) + (r.reject || 0) === 0,
+  ).length
 
   return (
     <Card
@@ -63,7 +78,10 @@ export function DecisionHistory({ data, error, loading, stale }) {
       stale={stale}
       footnote={
         busiest
-          ? `Busiest week: ${formatPeriod(busiest.period)} with ${maxWeek} decisions.`
+          ? `Busiest week: ${formatPeriod(busiest.period)} with ${maxWeek.toLocaleString()} decisions.` +
+            (quietWeeks > 0
+              ? ` ${quietWeeks} of ${rows.length} weeks had none.`
+              : '')
           : null
       }
     >
@@ -116,22 +134,33 @@ function WeekBar({ row, maxTotal }) {
       content={
         <span className="flex flex-col gap-0.5">
           <span className="font-mono">{formatPeriod(row.period)}</span>
-          <span>{row.keep || 0} keep · {row.maybe || 0} maybe · {row.reject || 0} reject</span>
+          <span>
+            {total === 0
+              ? 'no decisions'
+              : `${row.keep || 0} keep · ${row.maybe || 0} maybe · ${row.reject || 0} reject`}
+          </span>
         </span>
       }
     >
       <div className="h-28 flex flex-col justify-end">
-        <div
-          className="w-full flex flex-col-reverse rounded-[2px] overflow-hidden opacity-90 group-hover:opacity-100 transition-opacity"
-          style={{
-            height: `${heightPct}%`,
-            transition: 'height 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 120ms ease',
-          }}
-        >
-          <div style={{ height: `${seg(row.reject)}%`, backgroundColor: COLORS.reject }} />
-          <div style={{ height: `${seg(row.maybe)}%`,  backgroundColor: COLORS.maybe  }} />
-          <div style={{ height: `${seg(row.keep)}%`,   backgroundColor: COLORS.keep   }} />
-        </div>
+        {total === 0 ? (
+          // A week you didn't cull. Not a stub bar — a stub would read as a
+          // very small amount, which is a different statement.
+          <div className="w-full h-px bg-[#1b1c1e] rounded-full" />
+        ) : (
+          <div
+            className="w-full flex flex-col-reverse rounded-[2px] overflow-hidden opacity-90 group-hover:opacity-100 transition-opacity"
+            style={{
+              height: `${heightPct}%`,
+              minHeight: '2px',
+              transition: 'height 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 120ms ease',
+            }}
+          >
+            <div style={{ height: `${seg(row.reject)}%`, backgroundColor: COLORS.reject }} />
+            <div style={{ height: `${seg(row.maybe)}%`,  backgroundColor: COLORS.maybe  }} />
+            <div style={{ height: `${seg(row.keep)}%`,   backgroundColor: COLORS.keep   }} />
+          </div>
+        )}
       </div>
     </HoverPopover>
   )
