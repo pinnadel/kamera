@@ -47,6 +47,30 @@ _progress: dict = {
     "elapsed_seconds": None,
 }
 
+# ---------------------------------------------------------------------------
+# Auto-cull AI-ranking progress — written by run_auto_cull's ranking phase,
+# read by /auto-cull/progress.
+#
+# Separate from _progress above on purpose: an auto-cull can be started while a
+# batch is analysing, and the two would clobber each other's counters. The
+# ranking phase is the only part of auto-cull that takes real time (~60 s per
+# group that isn't in the burst_rankings cache), so this reports groups, not
+# photos. Stopping aborts BEFORE any decision is applied — nothing has moved on
+# disk at that point, so a stopped auto-cull is a no-op, not a half-run.
+# ---------------------------------------------------------------------------
+_autocull_progress: dict = {
+    "running": False,
+    "phase": None,          # "ranking" | "applying" | None
+    "total": 0,             # groups to rank
+    "done": 0,
+    "cached": 0,            # of those done, how many were free (cache hits)
+    "stop_requested": False,
+    "source_folder": None,
+    "started_at": None,
+}
+
+_autocull_stop_event: threading.Event = threading.Event()
+
 # Shared cancellation primitive: the analyzer pool watches this Event so a
 # Stop press can interrupt mid-photo (between scorer boundaries), not just
 # between files. The flag in _progress stays for the loop check; this Event

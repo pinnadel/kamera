@@ -119,6 +119,7 @@ const DECISION_DEFAULTS = {
   uncertainty_threshold:        8.0,
   // Burst keep-cap / multi-keep post-pass.
   auto_cull_cap_burst_keeps:    true,
+  auto_cull_ai_rank:            true,
   max_burst_keeps:              2,
   max_burst_maybes:             2,
   burst_keep_margin:            8.0,
@@ -227,6 +228,7 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
     auto_cull_uncertain_to_maybe: settings?.auto_cull_uncertain_to_maybe ?? DECISION_DEFAULTS.auto_cull_uncertain_to_maybe,
     uncertainty_threshold:        settings?.uncertainty_threshold        ?? DECISION_DEFAULTS.uncertainty_threshold,
     auto_cull_cap_burst_keeps:    settings?.auto_cull_cap_burst_keeps    ?? DECISION_DEFAULTS.auto_cull_cap_burst_keeps,
+    auto_cull_ai_rank:            settings?.auto_cull_ai_rank            ?? DECISION_DEFAULTS.auto_cull_ai_rank,
     max_burst_keeps:              settings?.max_burst_keeps              ?? DECISION_DEFAULTS.max_burst_keeps,
     max_burst_maybes:             settings?.max_burst_maybes             ?? DECISION_DEFAULTS.max_burst_maybes,
     burst_keep_margin:            settings?.burst_keep_margin            ?? DECISION_DEFAULTS.burst_keep_margin,
@@ -740,6 +742,12 @@ export function SettingsModal({ settings, onSave, onClose, onToast, onClear, cle
                     />
                   </>
                 )}
+                <ToggleRow
+                  label="Let the AI pick each burst's best photo"
+                  tooltip="Which frame of a burst is the best one decides who keeps and, in a burst auto-cull would otherwise reject entirely, which photo is rescued. On, the local vision model looks at the frames together and compares them — the same judgement the amber ring in a group shows. Off, that call is made by the score order (sharpest face, eyes open, sharpest frame, …), which can't tell a peak smile from the frame 80ms before it. Only contested groups of 3+ photos are ranked, and only those not already ranked cost time — roughly a minute each, shown before you start. No vision model installed, or Ollama not responding, falls back to the score order and says so."
+                  enabled={decision.auto_cull_ai_rank}
+                  onChange={v => updField('auto_cull_ai_rank', v)}
+                />
               </div>
 
               {/* Fallback cutoffs — collapsed behind Advanced accordion */}

@@ -2394,10 +2394,29 @@ export default function App() {
   // ── AutoCull handler ──────────────────────────────────────────────────────
   const handleAutoCullComplete = useCallback(async (result) => {
     setAutoCullOpen(false)
+    // Stopped during the AI-ranking phase: ranking runs before anything is
+    // applied, so this is a genuine no-op — say so instead of reporting a
+    // cull of zero photos, which reads like a failure.
+    if (result.stopped) {
+      const ranked = result.ai_rank?.ranked ?? 0
+      addToast({
+        type: 'info',
+        message: ranked > 0
+          ? `Auto-cull stopped — nothing moved. ${ranked} group${ranked === 1 ? '' : 's'} already ranked, kept for next time`
+          : 'Auto-cull stopped — nothing moved',
+      })
+      return
+    }
     await loadImages()
     loadModelInfo()
     setDecisionFilter('maybe')
-    addToast({ type: 'info', message: `Auto-culled ${result.total} photos — ${result.counts?.maybe ?? 0} maybes to review` })
+    // A group that fell back to the score pick is invisible in the decisions
+    // themselves, so the toast is the only place the downgrade can surface.
+    const fellBack = result.ai_rank?.fell_back ?? 0
+    const aiNote = fellBack > 0
+      ? ` · ${fellBack} group${fellBack === 1 ? '' : 's'} used scores (AI rank unavailable)`
+      : ''
+    addToast({ type: 'info', message: `Auto-culled ${result.total} photos — ${result.counts?.maybe ?? 0} maybes to review${aiNote}` })
   }, [loadImages, loadModelInfo, addToast])
 
   // ── Bulk actions ──────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -18,7 +19,7 @@ from backend.sources import sink_for
 from backend.sources.folder import _reject_to_system_trash_enabled
 from backend.file_mover import _DECISION_FOLDERS, resolve_dest_folder
 from backend.routers.settings import get_raw_jpeg_display_mode
-from backend.state import _decision_move_lock, model_for
+from backend.state import _autocull_progress, _autocull_stop_event, _decision_move_lock, model_for
 from phase3_learning.auto_trainer import _count_samples, maybe_train_async
 from phase3_learning.personal_model import min_decisions_for
 from phase3_learning.feature_extractor import FEATURE_SCHEMA_VERSION, serialize_features
@@ -932,6 +933,34 @@ def _require_auto_cull_model(corpus: str) -> None:
     )
 
 
+def _ai_rank_preview(bursts: list[list[dict]], decisions: dict[int, str],
+                     *, enabled: bool) -> dict:
+    """Cache-only AI winners for the preview, plus the cost of the missing ones.
+
+    Returns the `ai_rank` block the modal renders, with the winner map under
+    `_winners` for the caller to pop and feed to the burst passes.
+    """
+    from backend.autocull_rank import (
+        SECONDS_PER_RANK, consequential_bursts, resolve_winners,
+    )
+
+    if not enabled:
+        return {"_winners": {}, "enabled": False, "groups": 0, "cached": 0,
+                "to_rank": 0, "estimated_seconds": 0}
+
+    contested = consequential_bursts(bursts, decisions)
+    winners, stats = resolve_winners(contested, cached_only=True)
+    to_rank = stats["fallback_reasons"].get("not_cached", 0)
+    return {
+        "_winners": winners,
+        "enabled": True,
+        "groups": len(contested),
+        "cached": stats["ranked"],
+        "to_rank": to_rank,
+        "estimated_seconds": to_rank * SECONDS_PER_RANK,
+    }
+
+
 @router.get("/auto-cull/preview")
 def auto_cull_preview(
     source_folder: str | None = None,
@@ -1038,17 +1067,29 @@ def auto_cull_preview(
 
     bursts_preview = _group_undecided_into_bursts(rows_dicts, threshold=threshold)
 
+    # AI burst rank, CACHE-ONLY. The real run ranks every contested group, which
+    # costs ~60s apiece; a preview that did the same would make the modal take
+    # as long as the cull it is previewing (and this endpoint promises to write
+    # nothing). So the preview uses the ranks that already exist — from
+    # GroupLoupe or the prerank worker — and reports the rest as work the run
+    # will have to do, with an estimate. Counts for already-ranked groups are
+    # exact; a group ranked for the first time during the run can land on a
+    # different winner than this preview showed, which is the honest cost of not
+    # spending an hour inside a modal.
+    ai_preview = _ai_rank_preview(bursts_preview, decisions,
+                                  enabled=bool(thresholds.get("auto_cull_ai_rank")))
+    ai_winners = ai_preview.pop("_winners")
+
     # Same multi-keep pass as run_auto_cull, ahead of the keep-guarantee pass
     # below, so the preview counts match what the real run would produce.
     demotions_count = 0
     reject_demotions_count = 0
     if thresholds.get("auto_cull_cap_burst_keeps"):
         burst_demotions = _cap_burst_keeps(
-            bursts_preview, decisions, preview_reasons, thresholds)
+            bursts_preview, decisions, preview_reasons, thresholds, ai_winners)
         demotions_count = len(burst_demotions)
         reject_demotions_count = sum(1 for d in burst_demotions if d["to"] == "reject")
 
-    from backend.group_scoring import top_n_candidates
     promotions_count = 0
     for burst in bursts_preview:
         if len(burst) < 2:
@@ -1060,7 +1101,7 @@ def auto_cull_preview(
         burst_reasons = {i: preview_reasons.get(i) for i in burst_ids}
         if all(r in _PHYSICAL_REJECT_REASONS for r in burst_reasons.values() if r is not None):
             continue
-        winner = top_n_candidates(burst, 1)[0]
+        winner = _guarantee_winner(burst, preview_reasons, ai_winners)
         winner_id = winner["id"]
         if decisions.get(winner_id) == "maybe":
             continue
@@ -1112,6 +1153,9 @@ def auto_cull_preview(
         # reject_to_system_trash on, auto-cull sends N files to the OS Trash,
         # which is a materially different promise from "files move".
         "reject_destination": _reject_destination(source_folder),
+        # What the AI-rank phase of the real run will cost, and how much of
+        # this preview's own numbers already reflect an AI pick.
+        "ai_rank": ai_preview,
     }
 
 
@@ -1132,6 +1176,36 @@ _PHYSICAL_REJECT_REASONS = frozenset({"iso_ceiling", "reciprocal_rule", "blurry_
 # reads overall_score against the fallback cutoffs. Mirrors the two branches of
 # _compute_auto_decision so the gates use the same number the Keep verdict did.
 _PERSONAL_KEEP_REASONS = frozenset({"personal_keep"})
+
+
+def _guarantee_winner(
+    burst: list[dict],
+    reasons: dict[int, str],
+    ai_winners: dict[int, int] | None = None,
+) -> dict:
+    """The photo the keep-guarantee floor pass promotes to Maybe for a burst
+    that auto-cull decided entirely against.
+
+    Defaults to the vision LLM's rank-1 when we have one, else the score-based
+    pick — with one guard. The point of this pass is to hand the user something
+    rescuable, so a rank-1 whose own reject reason is physically unrecoverable
+    (ISO ceiling / reciprocal rule / blurry frame / low IQA) loses to any member
+    that is only subjectively rejected. The LLM ranks frames against each other;
+    in an all-mediocre burst its #1 can still be the blurred one, and promoting
+    that would be strictly worse than promoting the soft-smile frame next to it.
+    """
+    from backend.group_scoring import top_n_candidates
+
+    ordered = top_n_candidates(burst, len(burst))
+    winner_id = (ai_winners or {}).get(burst[0]["id"])
+    if winner_id is not None:
+        ai_pick = next((m for m in ordered if m["id"] == winner_id), None)
+        if ai_pick is not None and (
+            reasons.get(winner_id) not in _PHYSICAL_REJECT_REASONS
+            or all(reasons.get(m["id"]) in _PHYSICAL_REJECT_REASONS for m in ordered)
+        ):
+            return ai_pick
+    return ordered[0]
 
 
 def _burst_member_score(row: dict, reason: str | None) -> float | None:
@@ -1262,6 +1336,7 @@ def _cap_burst_keeps(
     decisions: dict[int, str],
     reasons: dict[int, str],
     thresholds: dict | None = None,
+    ai_winners: dict[int, int] | None = None,
 ) -> list[dict]:
     """Burst multi-keep post-pass: mutates `decisions`/`reasons` in place so a
     similarity burst auto-keeps its best-by-priority member plus any additional
@@ -1298,6 +1373,13 @@ def _cap_burst_keeps(
       scoreless frame never counts as clearly weak (no auto-trash on missing
       data) — Maybe slot if free, else redundant-reject.
 
+    `ai_winners` maps a member id to the vision LLM's rank-1 for that burst (see
+    backend/autocull_rank.py). When present, that photo is moved to the front of
+    the priority order, which makes it the winner of its sub-scene — the one
+    frame guaranteed to stay Keep. That is the AI rank's ENTIRE reach here: the
+    keep/maybe gates, the near-dup rep choice for every other pair and the
+    demotion order all still run on `top_n_candidates`' score priority.
+
     max_burst_keeps=1 + max_burst_maybes large reproduces the original cap-at-one
     behaviour PER SUB-SCENE; max_burst_maybes=0 rejects every non-surviving frame
     in each sub-scene. Non-keep decisions in the burst are left untouched. Runs
@@ -1308,6 +1390,7 @@ def _cap_burst_keeps(
     Returns the list of demotions applied:
     [{"image_id", "burst_size", "to"}, ...] where "to" is "maybe" | "reject".
     """
+    from backend.autocull_rank import promote_winner as _promote_winner
     from backend.group_scoring import top_n_candidates
     from phase1_technical.quality_analyzer import get_decision_thresholds
 
@@ -1337,6 +1420,13 @@ def _cap_burst_keeps(
         # Priority order (best→worst) drives every stage: the winner, the
         # near-dup reps, and which frames fill the Keep/Maybe budgets.
         ordered = top_n_candidates(keep_members, len(keep_members))
+        # The AI rank-1, when we have one and it is still a Keep, takes index 0
+        # away from the score pick. A rank-1 that already lost its Keep to an
+        # instant-reject rule isn't in `keep_members`, and promote_winner is a
+        # no-op then — the rules that fire before the burst passes are not
+        # something the LLM gets to overturn.
+        ordered = _promote_winner(
+            ordered, (ai_winners or {}).get(burst_ids[0]))
 
         # Stage A — near-duplicate collapse, applied ACROSS the whole burst: a
         # near-pixel-dup is redundant no matter which sub-scene it lands in
@@ -1494,6 +1584,85 @@ def _group_undecided_into_bursts(rows: list[dict],
     return grouped + singletons
 
 
+def _run_ai_ranking(
+    bursts: list[list[dict]],
+    decisions: dict[int, str],
+    source_folder: str | None,
+) -> tuple[dict[int, int], dict]:
+    """Rank auto-cull's contested groups with the vision LLM, reporting progress.
+
+    Publishes into `state._autocull_progress` so POST /auto-cull can stay a
+    single blocking request while the modal polls GET /auto-cull/progress — the
+    ranking phase can run for tens of minutes on a fresh import and a spinner
+    with no numbers behind it is not an honest way to spend that.
+
+    The prerank worker is cancelled first. It ranks the SAME groups through the
+    same cache, but a second concurrent qwen runner OOMs the unified memory pool
+    on Apple silicon (see phase2_quality/prerank.py). Its queue is warm-cache
+    work; this is blocking a user who is waiting, so this wins. rank_burst's
+    inflight registry covers the narrower race where both want one exact group.
+    """
+    from backend.autocull_rank import consequential_bursts, resolve_winners
+    from phase2_quality import prerank
+
+    to_rank = consequential_bursts(bursts, decisions)
+    prerank.cancel()
+
+    _autocull_stop_event.clear()
+    _autocull_progress.update({
+        "running": True,
+        "phase": "ranking",
+        "total": len(to_rank),
+        "done": 0,
+        "cached": 0,
+        "stop_requested": False,
+        "source_folder": source_folder,
+        "started_at": time.time(),
+    })
+    try:
+        winners, stats = resolve_winners(
+            to_rank,
+            on_progress=lambda done, total: _autocull_progress.update(
+                {"done": done, "total": total}),
+            should_stop=_autocull_stop_event.is_set,
+        )
+        if not stats.get("stopped"):
+            _autocull_progress["phase"] = "applying"
+        return winners, stats
+    finally:
+        _autocull_progress["running"] = False
+        _autocull_progress["phase"] = None
+        _autocull_stop_event.clear()
+
+
+@router.get("/auto-cull/progress")
+def auto_cull_progress():
+    """Progress of a running auto-cull's AI-ranking phase.
+
+    `total`/`done` count GROUPS, not photos — ranking is the only slow part and
+    it is per-group. Safe to poll when nothing is running (`running: false`).
+    """
+    return dict(_autocull_progress)
+
+
+@router.post("/auto-cull/stop")
+def stop_auto_cull():
+    """Abort a running auto-cull between two group ranks.
+
+    Ranking happens before a single decision is applied, so stopping there
+    leaves nothing behind: no files move, no decisions are written. Ranks that
+    already completed stay in the burst_rankings cache, so a later run picks up
+    where this one left off for free. Once the run has left the ranking phase
+    there is nothing long-running left to interrupt, and this reports
+    'not_running'.
+    """
+    if not _autocull_progress.get("running"):
+        return {"status": "not_running"}
+    _autocull_progress["stop_requested"] = True
+    _autocull_stop_event.set()
+    return {"status": "stopping"}
+
+
 @router.post("/auto-cull")
 def run_auto_cull(
     source_folder: str | None = None,
@@ -1573,6 +1742,32 @@ def run_auto_cull(
 
     bursts = _group_undecided_into_bursts(rows_dicts, threshold=threshold)
 
+    # Phase 1.4: AI burst rank. Ask the vision LLM which frame of each
+    # CONTESTED group is the best one, so the two post-passes below pick their
+    # winner by comparative judgement instead of the score heuristic. Only
+    # groups where the winner decides something are ranked (see
+    # autocull_rank.consequential_bursts) — everything else would pay ~60s for
+    # an answer nobody reads. Failures fall back to the score pick and are
+    # counted, never raised: an unreachable Ollama must not block a cull.
+    ai_winners: dict[int, int] = {}
+    rank_stats: dict = {"groups": 0, "ranked": 0, "fell_back": 0,
+                        "fallback_reasons": {}, "stopped": False}
+    if thresholds.get("auto_cull_ai_rank"):
+        ai_winners, rank_stats = _run_ai_ranking(bursts, decisions, source_folder)
+        if rank_stats.get("stopped"):
+            # Stopped during ranking — nothing has been applied yet, so the
+            # honest outcome is a no-op run, not a half-culled folder.
+            return {
+                "scoring_mode": "stopped",
+                "counts": {"keep": 0, "maybe": 0, "reject": 0},
+                "total": 0,
+                "errors": [],
+                "promotions": [],
+                "demotions": [],
+                "ai_rank": rank_stats,
+                "stopped": True,
+            }
+
     # Phase 1.5: burst keep-cap post-pass. Runs BEFORE the keep-guarantee
     # floor pass below — see _cap_burst_keeps docstring for why the ordering
     # is safe (a burst can never end up with zero keeps as a result of this
@@ -1580,14 +1775,13 @@ def run_auto_cull(
     # auto_cull_cap_burst_keeps setting.
     demotions: list[dict] = []
     if thresholds.get("auto_cull_cap_burst_keeps"):
-        demotions = _cap_burst_keeps(bursts, decisions, reasons, thresholds)
+        demotions = _cap_burst_keeps(bursts, decisions, reasons, thresholds, ai_winners)
 
     # Phase 2: burst keep-guarantee post-pass. Walks each similarity group;
     # if it has ≥2 members, zero Keeps, and at least one member has a
     # subjective reject reason (not iso_ceiling / reciprocal_rule /
     # blurry_frame), promote the best-by-priority member to Maybe. Tracks
     # the promotions so the response surfaces them for any future UI nudge.
-    from backend.group_scoring import top_n_candidates
     promotions: list[dict] = []
     for burst in bursts:
         if len(burst) < 2:
@@ -1601,9 +1795,9 @@ def run_auto_cull(
         # would just hand the user a guaranteed-bad photo.
         if all(r in _PHYSICAL_REJECT_REASONS for r in burst_reasons.values() if r is not None):
             continue
-        # Pick the best member by the canonical priority. top_n_candidates
-        # returns descending, so [0] is the winner.
-        winner = top_n_candidates(burst, 1)[0]
+        # Pick the winner: the AI rank-1 when this group got one, else the
+        # best member by the canonical score priority. See _guarantee_winner.
+        winner = _guarantee_winner(burst, reasons, ai_winners)
         winner_id = winner["id"]
         current = decisions.get(winner_id)
         if current == "maybe":
@@ -1675,4 +1869,9 @@ def run_auto_cull(
         # pass. Each entry carries "to": "maybe" | "reject" so the frontend can
         # split near-alternates (Maybe) from clearly-weak duplicates (Reject).
         "demotions": demotions,
+        # How many contested groups had their winner picked by the vision LLM
+        # vs. silently fell back to the score heuristic, and why. A fallback is
+        # invisible in the decisions themselves, so it has to be reported here
+        # or "the AI picked these" becomes a claim nobody can check.
+        "ai_rank": rank_stats,
     }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { AlertTriangle, ChevronDown, ChevronUp, WandSparkles, X } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronUp, Sparkles, WandSparkles, X } from 'lucide-react'
 import { API } from '../api'
 import { BTN_ICON, BTN_PRIMARY, BTN_PRIMARY_DANGER, BTN_SECONDARY } from '../ui/buttons'
 import { DecisionWord } from '../ui/primitives'
@@ -115,6 +115,55 @@ function Consequence({ dest, rejects }) {
   )
 }
 
+// Human-readable duration for the AI-rank estimate. Minutes only — the
+// estimate is ~60s per group, so second-level precision would be false.
+function formatEta(seconds) {
+  const mins = Math.max(1, Math.round(seconds / 60))
+  if (mins < 60) return `${mins} min`
+  const hours = Math.floor(mins / 60)
+  const rest = mins % 60
+  return rest ? `${hours} h ${rest} min` : `${hours} h`
+}
+
+// AiRankNotice — what the AI-rank phase will cost before the user commits.
+// Auto-cull asks the vision model which frame of each contested group is the
+// best one; groups it has already ranked (opened in the loupe, or drained by
+// the background worker) are free, the rest are ~60s each. That is the whole
+// reason this run is no longer instant, so it gets stated up front rather than
+// discovered as a stalled progress bar.
+function AiRankNotice({ ai }) {
+  if (!ai?.enabled || ai.groups === 0) return null
+  const pending = ai.to_rank ?? 0
+  return (
+    <div className="flex items-start gap-2 px-3 py-2 mb-2 border border-[rgba(255,255,255,0.07)] rounded-lg">
+      <Sparkles size={13} className="text-[#5BB8D4] mt-[1px] shrink-0" />
+      <p className="text-[11px] leading-relaxed text-[#9c9c9d]">
+        {pending > 0 ? (
+          <>
+            <span className="text-[#cecece] font-mono tabular-nums">{pending}</span>
+            {pending === 1 ? ' group needs' : ' groups need'} AI ranking to pick their best
+            photo — about <span className="text-[#cecece]">{formatEta(ai.estimated_seconds)}</span>.
+            {ai.cached > 0 && (
+              <>
+                {' '}
+                <span className="text-[#cecece] font-mono tabular-nums">{ai.cached}</span>
+                {' already ranked.'}
+              </>
+            )}
+            {' '}You can stop while it runs — nothing moves until ranking finishes.
+          </>
+        ) : (
+          <>
+            All <span className="text-[#cecece] font-mono tabular-nums">{ai.groups}</span>
+            {' contested '}{ai.groups === 1 ? 'group is' : 'groups are'} already AI-ranked — the
+            best photo of each is the vision model's pick, not a score guess.
+          </>
+        )}
+      </p>
+    </div>
+  )
+}
+
 // AutoCullModal — preview and execute automatic K/M/X assignment
 // Scoped to `folderPath` when provided, so tab-triggered auto-cull only
 // previews and acts on photos from the active tab's folder.
@@ -123,6 +172,11 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
   const [previewError, setPreviewError] = useState(null)
+  // Live AI-ranking progress. The POST stays a single blocking request (the
+  // decisions have to be applied in one transaction-ish pass), so progress
+  // comes from a side channel the backend publishes into.
+  const [rankProgress, setRankProgress] = useState(null)
+  const [stopping, setStopping] = useState(false)
 
   // Build the shared query string. Auto-cull's burst-dedup post-pass groups by
   // VISUAL SIMILARITY only — it deliberately does NOT use the grouping time-gap
@@ -150,8 +204,34 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
       .finally(() => setLoading(false))
   }, [query])
 
+  // Poll the ranking phase while the cull request is in flight. Stops as soon
+  // as `running` goes false, so an idle modal makes no requests.
+  useEffect(() => {
+    if (!running) { setRankProgress(null); return }
+    let alive = true
+    const tick = () => {
+      fetch(`${API}/auto-cull/progress`)
+        .then(r => r.ok ? r.json() : null)
+        .then(p => { if (alive && p) setRankProgress(p) })
+        .catch(() => {})
+    }
+    tick()
+    const id = setInterval(tick, 1500)
+    return () => { alive = false; clearInterval(id) }
+  }, [running])
+
+  async function stopAutoCull() {
+    setStopping(true)
+    try {
+      await fetch(`${API}/auto-cull/stop`, { method: 'POST' })
+    } catch (e) {
+      console.error('Stop auto-cull failed:', e)
+    }
+  }
+
   async function runAutoCull() {
     setRunning(true)
+    setStopping(false)
     try {
       const res = await fetch(`${API}/auto-cull${query}`, { method: 'POST' })
       if (!res.ok) {
@@ -165,6 +245,7 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
       onToast?.({ type: 'error', message: `Auto-cull failed: ${e.message}` })
     } finally {
       setRunning(false)
+      setStopping(false)
     }
   }
 
@@ -272,6 +353,8 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
               )
             })()}
 
+            <AiRankNotice ai={preview.ai_rank} />
+
             {(preview.rule_breakdown?.uncertain ?? 0) > 0 && (
               <div className="flex items-center justify-between px-3 py-2 mb-2 border border-[rgba(255,255,255,0.07)] rounded-lg">
                 <span className="text-xs text-[#9c9c9d]">Uncertain — routed to Maybe</span>
@@ -296,10 +379,38 @@ export function AutoCullModal({ folderPath, groupThreshold, onClose, onComplete,
           <p className="text-sm text-[#8a8a8a] text-center py-4 mb-4">No undecided photos to cull.</p>
         )}
 
+        {running && rankProgress?.phase === 'ranking' && rankProgress.total > 0 && (
+          <div className="px-3 py-2.5 mb-4 border border-[rgba(91,184,212,0.30)] bg-[rgba(91,184,212,0.06)] rounded-lg">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs text-[#cecece]">
+                {stopping ? 'Stopping after this group…' : 'AI ranking groups'}
+              </span>
+              <span className="text-xs font-mono text-[#5BB8D4] tabular-nums">
+                {rankProgress.done}/{rankProgress.total}
+              </span>
+            </div>
+            <div className="bg-[#1b1c1e] rounded-[3px] h-1.5">
+              <div
+                className="bg-[#5BB8D4] h-1.5 rounded-[3px] transition-all"
+                style={{ width: `${(rankProgress.done / rankProgress.total) * 100}%` }}
+              />
+            </div>
+            <p className="text-[11px] text-[#8a8b8c] mt-1.5">
+              No photo has moved yet — stopping now leaves everything as it is
+            </p>
+          </div>
+        )}
+
         <div className="flex justify-end gap-3">
-          <button onClick={onClose} className={BTN_SECONDARY}>
-            <X size={16} /> Cancel
-          </button>
+          {running ? (
+            <button onClick={stopAutoCull} disabled={stopping} className={BTN_SECONDARY}>
+              <X size={16} /> {stopping ? 'Stopping…' : 'Stop'}
+            </button>
+          ) : (
+            <button onClick={onClose} className={BTN_SECONDARY}>
+              <X size={16} /> Cancel
+            </button>
+          )}
           <button
             onClick={runAutoCull}
             disabled={running || loading || !preview || preview.total === 0}

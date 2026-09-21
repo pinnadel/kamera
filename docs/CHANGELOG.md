@@ -54,6 +54,88 @@ needed — the ledger is just another process's SQLite file).
 
 ---
 
+## Auto-cull asks the AI which photo of a group is the best one (2026-09-21)
+
+Auto-cull already grouped bursts and already picked a winner per group — the
+keep-cap pass decides which of several Keeps survives, the keep-guarantee pass
+decides which photo is rescued from a group it rejected entirely. Both asked
+`backend/group_scoring.py` for that winner: face_sharpness → eyes_open →
+sharpness → IQA → aesthetic → overall. Meanwhile the vision burst ranker
+(`phase2_quality/burst_ranker.py`) has been answering the *same question*
+better since May — it sees all the frames in one context and compares them —
+but only when the user opened GroupLoupe or the prerank worker drained a queue.
+`_annotate_prerank_state` has promoted its rank-1 over the score hero in the
+grid since then; auto-cull was the one place that never asked.
+
+**Measured before building anything.** Of the 53 cached rankings whose photos
+still exist, 41 resolve through the new lookup, and on those the LLM picks a
+**different winner than the score heuristic in 29 of 41 groups (71%)** — often
+inverting a large `overall_score` gap (group 8461-8463: score pick 98.7,
+AI pick 71.3). This is not a tiebreaker; it changes the output.
+
+**What was built** (`backend/autocull_rank.py`, new):
+- `consequential_bursts` — only groups where the winner decides something get
+  ranked: ≥3 members (the prerank worker's floor, pinned by a test) AND either
+  ≥2 Keeps (keep-cap picks a survivor) or 0 Keeps (keep-guarantee promotes one).
+  Exactly one Keep means the per-photo scores already settled it and a ~60s call
+  would be paid for and ignored.
+- `resolve_winners` — one short-lived DB connection per group, progress callback,
+  stop check between groups. Returns member→winner plus a stats block.
+- `promote_winner` — the AI rank's ENTIRE reach: it moves the rank-1 to index 0
+  of the priority order. Keep/Maybe budget gates, near-dup rep choice and
+  demotion order still run on scores.
+- `_guarantee_winner` in `decisions.py` carries one guard the cap pass doesn't
+  need: a rank-1 whose own reject reason is physically unrecoverable (ISO
+  ceiling / reciprocal rule / blurry frame / low IQA) loses to any
+  subjectively-rejected member. The LLM ranks frames against *each other*, so in
+  an all-mediocre burst its #1 can be the blurred one — and the whole point of
+  that pass is handing the user something rescuable.
+
+**Cost, and the two things that make it bearable.** A fresh rank is ~60s.
+`rank_burst`'s cache is shared with GroupLoupe and the prerank worker, so a
+group the user already looked at is free; and the consequential filter cuts the
+rest. `POST /auto-cull` stays one blocking request but now publishes into
+`state._autocull_progress` (groups, not photos — ranking is the only slow part),
+read by the new `GET /auto-cull/progress` and polled by the modal.
+`POST /auto-cull/stop` aborts **between two ranks**, which is safe precisely
+because ranking runs before a single decision is applied: a stopped auto-cull is
+a no-op, not a half-culled folder, and completed ranks stay in the cache for the
+next run. The prerank worker is cancelled at the start of the phase — it ranks
+the same groups through the same cache, but a second concurrent qwen runner OOMs
+the unified memory pool.
+
+**The preview is cache-only.** `rank_burst` gained `cached_only=True` (returns
+`not_cached` instead of calling the LLM, and skips the `near_duplicates` cache
+write). A modal that ranked everything would take as long as the cull it is
+previewing, and this endpoint promises to write nothing. So the preview uses the
+ranks that exist and reports the rest as `ai_rank.to_rank` + an estimate; the
+modal states it before the user commits. Counts for already-ranked groups are
+exact, a first-time rank can land elsewhere — the honest cost of not spending an
+hour inside a modal.
+
+**Fallback is silent in the decisions, loud in the report.** No vision model,
+Ollama error, a rank-1 that isn't a member, or the `near_duplicates` outcome →
+that group keeps its score pick. Never raises. `ai_rank.fell_back` +
+`fallback_reasons` ride the response and the completion toast says
+"N groups used scores (AI rank unavailable)" — a silent downgrade to the old
+behaviour would be indistinguishable from the feature working.
+
+Setting `auto_cull_ai_rank` (bool, default on, Settings → Model → Decision
+thresholds) turns it off. Reverses the earlier "don't let LLM rank-1 silently
+override auto-decision yet" hold — it is no longer silent.
+
+18 new tests in `tests/test_autocull_ai_rank.py`, incl. a call-site check that
+both endpoints actually pass their winner map to both passes, and a check that
+the size floor still equals `prerank._MIN_GROUP_SIZE`. Suite 688/688.
+
+**Known, pre-existing:** 12 of the 53 live cached rankings no longer resolve —
+their `members_hash` is keyed on the post-dedup rep set, and re-analysis rewrote
+those embeddings, so the collapse now yields different reps. GroupLoupe misses
+them identically today. Correct behaviour (the old rank described a grouping
+that no longer exists); it just means those groups get re-ranked.
+
+---
+
 ## Browser swipe-navigation gestures disabled (2026-09-20)
 
 A two-finger swipe left/right on the trackpad triggered Chrome's history

@@ -97,6 +97,17 @@ DEFAULT_UNCERTAINTY_THRESHOLD: float = 8.0
 # pass (which rescues a burst from zero keeps).
 DEFAULT_AUTO_CULL_CAP_BURST_KEEPS = True
 
+# AI burst rank in auto-cull (2026-09-21): when on, auto-cull asks the local
+# vision LLM (phase2_quality/burst_ranker.py) which frame of a similarity group
+# is the best one, instead of trusting the score heuristic in
+# backend/group_scoring.py. Only groups where the winner actually decides
+# something are ranked (>=3 members AND either >=2 Keeps, so the keep-cap pass
+# will pick a survivor, or 0 Keeps, so the keep-guarantee pass will promote
+# one) — a group with exactly one Keep already has its winner and an LLM call
+# there buys nothing for ~60s. Off means the score heuristic decides, which is
+# the pre-2026-09-21 behaviour.
+DEFAULT_AUTO_CULL_AI_RANK = True
+
 # Multi-keep tuning (2026-07-26). All read live by _cap_burst_keeps.
 # Max auto-cull Keeps allowed per similarity burst, counting the winner.
 # 1 reproduces the original cap-at-one behaviour exactly (only the hero keeps).
@@ -280,6 +291,8 @@ def get_decision_thresholds(corpus: str | None = None) -> dict:
         # Burst keep-cap / multi-keep post-pass.
         "auto_cull_cap_burst_keeps": b(
             "auto_cull_cap_burst_keeps", DEFAULT_AUTO_CULL_CAP_BURST_KEEPS),
+        # AI burst rank — vision LLM picks the group winner (see the constant).
+        "auto_cull_ai_rank": b("auto_cull_ai_rank", DEFAULT_AUTO_CULL_AI_RANK),
         "max_burst_keeps": f(
             "max_burst_keeps", DEFAULT_MAX_BURST_KEEPS, 1.0, 10.0),
         "burst_keep_margin": f(

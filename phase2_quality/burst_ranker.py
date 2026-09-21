@@ -479,7 +479,7 @@ def _collapse_near_duplicates(
         return list(image_ids), {i: [i] for i in image_ids}
 
 
-def rank_burst(image_ids: list[int], conn) -> dict:
+def rank_burst(image_ids: list[int], conn, *, cached_only: bool = False) -> dict:
     """Rank a burst of photos with a vision LLM. Lazy + cached.
 
     Bursts >_MAX_MEMBERS are pre-filtered server-side to the top-N candidates
@@ -493,10 +493,15 @@ def rank_burst(image_ids: list[int], conn) -> dict:
                    members_hash sorts the (post-filter) list first.
         conn:      sqlite3.Connection from get_db(). We read preview_path
                    for each id and commit a new burst_rankings row on success.
+        cached_only: answer from the burst_rankings cache only — never call the
+                   LLM and never write a row. A miss returns status="not_cached"
+                   instead of taking ~60s. Used by GET /auto-cull/preview, which
+                   has to report what the real run would do without paying for
+                   it (and which promises to write nothing).
 
     Returns:
         {
-          "status":        "ranked" | "no_vision_model" | "too_few" | "near_duplicates" | "error",
+          "status":        "ranked" | "no_vision_model" | "too_few" | "near_duplicates" | "not_cached" | "error",
           "model":         str | None,         # the Ollama model name we used (or would have)
           "members_hash":  str | None,         # hash of the EVALUATED (post-filter) set
           "cached":        bool,                # True if served from burst_rankings
@@ -557,6 +562,13 @@ def rank_burst(image_ids: list[int], conn) -> dict:
         # Whole burst collapsed to one frame (or fewer). Nothing to compare.
         # Persist the outcome so future calls short-circuit and the UI can
         # show the 'Near-duplicate frames' chip without re-running dedup.
+        # A cached_only caller is a dry run and writes nothing — it still gets
+        # the correct status, just without the cache side effect.
+        if cached_only:
+            return _result(
+                "near_duplicates", model=None, members_hash=pre_dedup_hash,
+                evaluated_ids=image_ids, filtered_from=filtered_from,
+            )
         try:
             conn.execute(
                 """
@@ -599,6 +611,14 @@ def rank_burst(image_ids: list[int], conn) -> dict:
             )
         except (json.JSONDecodeError, TypeError, KeyError):
             logger.warning("Stale burst_rankings row for %s — re-ranking", h)
+
+    # Cache miss, and this caller won't pay for a fresh rank. Report the miss
+    # rather than blocking on the vision model.
+    if cached_only:
+        return _result(
+            "not_cached", model=None, members_hash=h,
+            evaluated_ids=evaluated_ids, filtered_from=filtered_from,
+        )
 
     # ── Inflight coalescing ──────────────────────────────────────────────
     # If another caller is already ranking this exact membership, wait for

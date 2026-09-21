@@ -113,8 +113,9 @@ The **Deduplicate Keeps within a burst** pass (Settings → Model → Decision
 thresholds, on by default) reconciles that against the burst grouping you see
 in the UI. For each burst it:
 
-- Always keeps the single best photo (same priority as the group's amber-star
-  hero pick).
+- Always keeps the single best photo — by default the **vision model's** pick
+  for that group, the same judgement behind the amber-star hero (see the next
+  entry); the score priority only decides it when no AI rank is available.
 - Lets a few **extra** frames also Keep — but only genuinely strong ones: each
   must clear the Keep cutoff by a margin *and* score close to the burst's best
   frame, up to a maximum number of Keeps per burst.
@@ -164,6 +165,45 @@ see before committing match what happens. See
 [`_cap_burst_keeps`](backend/routers/decisions.py) and the burst keep-guarantee
 floor pass, which still rescues a burst that would otherwise end up with zero
 Keeps.
+
+### Who decides which photo of a burst auto-cull keeps?
+
+**The local vision model, by default** (Settings → Model → Decision thresholds →
+*Let the AI pick each burst's best photo*). It is the same comparison you get
+when you open a group in GroupLoupe: all the frames go to the model in one
+context and it ranks them against each other — peak smile vs. 80 ms before, eyes
+fully open vs. mid-blink. Turn it off and the winner is chosen by the score
+order instead (sharpest face → eyes open → sharpest frame → IQA → aesthetic →
+overall), which can't see any of that. On this library the two disagree in
+**29 of 41** groups, so it is not a tiebreaker — it changes the outcome.
+
+**Only contested groups are ranked**, because a fresh rank costs about a minute:
+
+- The group needs **3+ photos** (the same floor the background pre-ranker uses).
+- And either **2+ Keeps** — the dedup pass has to choose which survives — or
+  **zero Keeps**, where the keep-guarantee pass decides which photo you get to
+  rescue. A group with exactly one Keep is already settled, so ranking it would
+  be paid for and ignored.
+
+Groups you already opened in GroupLoupe, or that the background pre-ranker
+drained, are **free** — it is one shared cache. The Auto-cull modal tells you how
+many groups still need ranking and roughly how long before you commit, then
+shows the progress. **Stop is safe at any point during ranking**: nothing moves
+until ranking has finished, so stopping leaves the folder untouched, and the
+ranks already computed are kept for next time.
+
+The AI's pick decides **one thing only**: which photo is the group's winner.
+The Keep/Maybe budgets, which near-duplicate survives a pair, and the order
+things demote in all still run on the scores. And in the keep-guarantee case it
+will not promote a frame that was rejected as physically unrecoverable (blurry,
+over the ISO ceiling, breaks the reciprocal rule, low IQA) when a merely
+subjectively-rejected alternative exists — ranking frames against each other
+answers "which of these is best", not "is this one good enough".
+
+**No vision model installed, or Ollama not responding?** Every group falls back
+to the score pick and the run completes — but it says so, both in the response
+and in the completion toast ("N groups used scores"). A silent fallback would be
+indistinguishable from the feature working.
 
 ### Does the grouping Time-gap slider affect auto-cull?
 

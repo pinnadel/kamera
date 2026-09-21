@@ -47,6 +47,9 @@ class SettingsRequest(BaseModel):
     # burst always keeps; extra strong frames may also keep (up to
     # max_burst_keeps), the rest demote graded to Maybe or Reject.
     auto_cull_cap_burst_keeps:    bool  | None = None
+    # AI burst rank — the vision LLM picks the winner of each contested group
+    # during auto-cull instead of the score heuristic.
+    auto_cull_ai_rank:            bool  | None = None
     max_burst_keeps:              float | None = None
     burst_keep_margin:            float | None = None
     burst_keep_winner_delta:      float | None = None
@@ -117,6 +120,7 @@ def _init_setting_specs() -> None:
         DEFAULT_AUTO_CULL_UNCERTAIN_TO_MAYBE,
         DEFAULT_UNCERTAINTY_THRESHOLD,
         DEFAULT_AUTO_CULL_CAP_BURST_KEEPS,
+        DEFAULT_AUTO_CULL_AI_RANK,
         DEFAULT_MAX_BURST_KEEPS,
         DEFAULT_BURST_KEEP_MARGIN,
         DEFAULT_BURST_KEEP_WINNER_DELTA,
@@ -178,6 +182,10 @@ def _init_setting_specs() -> None:
         # Burst keep-cap post-pass — caps auto-cull Keep at one photo per
         # similarity burst; the rest demote to Maybe.
         "auto_cull_cap_burst_keeps": DEFAULT_AUTO_CULL_CAP_BURST_KEEPS,
+        # AI burst rank — the vision LLM picks each contested group's winner
+        # during auto-cull instead of the score heuristic. Costs ~60s per
+        # group that isn't already in the burst_rankings cache.
+        "auto_cull_ai_rank": DEFAULT_AUTO_CULL_AI_RANK,
     })
 
 
