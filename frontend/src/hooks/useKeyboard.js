@@ -14,12 +14,12 @@
 // Selection model: each grid cell carries a roving tabIndex (one cell at
 // tabIndex=0, others at tabIndex=-1). Arrow keys walk `displayGridItems` —
 // landing on a photo sets `selectedIdx`, landing on an undecided group sets
-// `selectedGroupId`, landing on a collapsed same-decision group (Maybe/Reject
-// views) sets `selectedDecidedGroupKey`. K/M/R only act on photos — neither
-// group kind has a single decision to apply. Enter or Space on a focused
-// undecided group opens GroupLoupe; on a focused decided group it opens
-// GroupPartnersOverlay (already-decided members, nothing to rank); Space on a
-// focused photo toggles DetailView — unless 2+ photos are staged for
+// `selectedGroupId`, landing on a collapsed burst in a decision view
+// (Keeps/Maybes/Rejects) sets `selectedDecidedGroupKey`. K/M/R only act on
+// photos — neither group kind has a single decision to apply. Enter or Space
+// on a focused undecided group opens GroupLoupe; on a focused decided group it
+// opens DetailView carrying the burst (already-decided members, nothing to
+// rank); Space on a focused photo toggles DetailView — unless 2+ photos are staged for
 // comparison, in which case Space opens the Compare overlay (matches the
 // floating "Compare N" button).
 //
@@ -48,7 +48,7 @@ export function useKeyboard({
   setSelectedDecidedGroupKey,
   displayGridItems,
   enterLoupe,
-  openPartnersOverlay,
+  openDecidedGroupDetail,
   sendDecision,
   setUserCols,
   undoImage,
@@ -156,8 +156,8 @@ export function useKeyboard({
   // ── Decision keys (K / R / M) ────────────────────────────────────────────
   // No-op when a group tile (undecided OR a collapsed decided group) is
   // focused — neither has a single photo to decide on; re-culling members of
-  // a decided group happens via GroupPartnersOverlay or the bulk-action bar,
-  // not K/M/R. Also gated on grid focus so K from the search bar etc. is inert.
+  // a decided group happens in the peek panel, DetailView or the bulk-action
+  // bar, not K/M/R. Also gated on grid focus so K from the search bar etc. is inert.
 
   // Decision keys take the bulk path when a multi-selection is active —
   // K/M/R applies to every selected photo and the selection stays in place.
@@ -209,8 +209,8 @@ export function useKeyboard({
 
   // ── Open / detail / escape ───────────────────────────────────────────────
   // Space and Enter both open the focused thing: an undecided group →
-  // GroupLoupe, a collapsed decided group → GroupPartnersOverlay, a photo →
-  // DetailView. Symmetric "open this cell" gesture.
+  // GroupLoupe, a collapsed decided group → DetailView carrying the burst, a
+  // photo → DetailView. Symmetric "open this cell" gesture.
 
   useHotkeys('space', (e) => {
     if (loupeOpen || scrubOpen) return
@@ -226,11 +226,11 @@ export function useKeyboard({
       return
     }
     if (selectedDecidedGroupKey != null) {
-      openPartnersOverlay?.(selectedDecidedGroupKey)
+      openDecidedGroupDetail?.(selectedDecidedGroupKey)
       return
     }
     setDetailOpen(true)
-  }, [loupeOpen, scrubOpen, activeView, detailOpen, closeDetail, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openPartnersOverlay])
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, closeDetail, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openDecidedGroupDetail])
 
   useHotkeys('enter', (e) => {
     if (loupeOpen || scrubOpen) return
@@ -244,9 +244,9 @@ export function useKeyboard({
     }
     if (selectedDecidedGroupKey != null) {
       e.preventDefault()
-      openPartnersOverlay?.(selectedDecidedGroupKey)
+      openDecidedGroupDetail?.(selectedDecidedGroupKey)
     }
-  }, [loupeOpen, scrubOpen, activeView, detailOpen, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openPartnersOverlay])
+  }, [loupeOpen, scrubOpen, activeView, detailOpen, selectedGroupId, selectedDecidedGroupKey, enterLoupe, openDecidedGroupDetail])
 
   useHotkeys('escape', () => {
     if (scrubOpen) return

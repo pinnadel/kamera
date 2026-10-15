@@ -112,44 +112,61 @@ def _connect() -> sqlite3.Connection | None:
         return None
 
 
-# `temp_path` carries no index in Provenance's schema, and the key is looked up
-# once per photo during a batch. One cached snapshot per ledger revision turns
-# N scans into one; the (mtime, size) stamp invalidates it when Provenance
-# writes, which during an import is constantly.
+# `temp_path` carries no index in Provenance's schema, and both lookups below
+# run once per photo during a batch or a grid load. One cached snapshot per
+# ledger revision turns N scans into one; the (mtime, size) stamp invalidates
+# it whenever Provenance writes, which during an import is constantly.
 _cache_lock = threading.Lock()
 _cache_stamp: tuple[float, int] | None = None
-_cache_map: dict[str, str] = {}
+_cache_by_path: dict[str, str] = {}
+_cache_by_key: dict[str, dict] = {}
 
 
-def _staged_keys() -> dict[str, str]:
-    """{absolute staged path: exif_key} for everything the ledger knows."""
-    global _cache_stamp, _cache_map
+def _snapshot() -> tuple[dict[str, str], dict[str, dict]]:
+    """({staged path: key}, {key: {archived_path, backed_up, status}}).
+
+    Both maps come from one pass, because every caller needs one or the other
+    and the expensive part is the scan, not the dict.
+    """
+    global _cache_stamp, _cache_by_path, _cache_by_key
     try:
         st = ledger_path().stat()
         stamp = (st.st_mtime, st.st_size)
     except OSError:
-        return {}
+        return {}, {}
 
     with _cache_lock:
         if stamp == _cache_stamp:
-            return _cache_map
+            return _cache_by_path, _cache_by_key
 
     conn = _connect()
     if conn is None:
-        return {}
+        return {}, {}
     try:
         rows = conn.execute(
-            "SELECT temp_path, exif_key FROM imports WHERE temp_path IS NOT NULL"
+            "SELECT temp_path, exif_key, archived_path, backed_up, status "
+            "FROM imports"
         ).fetchall()
     except sqlite3.Error:
-        return {}
+        return {}, {}
     finally:
         conn.close()
 
-    fresh = {r["temp_path"]: r["exif_key"] for r in rows if r["exif_key"]}
+    by_path: dict[str, str] = {}
+    by_key: dict[str, dict] = {}
+    for r in rows:
+        key = r["exif_key"]
+        if not key:
+            continue
+        if r["temp_path"]:
+            by_path[r["temp_path"]] = key
+        by_key[key] = {"archived_path": r["archived_path"],
+                       "backed_up": bool(r["backed_up"]),
+                       "status": r["status"]}
+
     with _cache_lock:
-        _cache_stamp, _cache_map = stamp, fresh
-    return fresh
+        _cache_stamp, _cache_by_path, _cache_by_key = stamp, by_path, by_key
+    return by_path, by_key
 
 
 def key_for_path(path: str | Path) -> str | None:
@@ -163,7 +180,55 @@ def key_for_path(path: str | Path) -> str | None:
     """
     if not _has_ledger():
         return None
-    return _staged_keys().get(str(path))
+    return _snapshot()[0].get(str(path))
+
+
+def archive_info_many(keys) -> dict[str, dict]:
+    """Batched `archive_info` — {key: info} for the keys that have a row.
+
+    `GET /images` annotates every photo, so the per-key version would open one
+    connection per photo. This reads the cached snapshot instead.
+    """
+    if not _has_ledger():
+        return {}
+    by_key = _snapshot()[1]
+    return {k: by_key[k] for k in keys if k in by_key}
+
+
+def lifecycle_for(key: str | None, decision: str | None) -> str | None:
+    """Where a photo is in its journey out of KaMeRa, or None.
+
+    Keep-only by design: a maybe or a reject never leaves for the library, so
+    it has no lifecycle to report. `staged` is the state the old completion
+    dialog claimed was `archived` — the keeper sits in `_Keeps` and nothing has
+    reached the library yet.
+    """
+    return _lifecycle(key, decision, archive_info_many([key]) if key else {})
+
+
+def _lifecycle(key: str | None, decision: str | None,
+               infos: dict[str, dict]) -> str | None:
+    if not key or decision != "keep":
+        return None
+    info = infos.get(key)
+    if info is None or info.get("status") != "archived":
+        return "staged"
+    return "backed_up" if info.get("backed_up") else "archived"
+
+
+def annotate_lifecycle(rows: list[dict]) -> None:
+    """Stamp `lifecycle` (and `archived_path`) onto /images rows, in place.
+
+    One ledger snapshot for the whole page. Rows without a key — anything that
+    never came through Provenance — get None and are unaffected.
+    """
+    keys = {r.get("provenance_key") for r in rows if r.get("provenance_key")}
+    infos = archive_info_many(keys) if keys else {}
+    for r in rows:
+        key = r.get("provenance_key")
+        r["lifecycle"] = _lifecycle(key, r.get("decision"), infos)
+        info = infos.get(key) if key else None
+        r["archived_path"] = info.get("archived_path") if info else None
 
 
 def archive_info(key: str) -> dict | None:
@@ -196,6 +261,6 @@ def archive_info(key: str) -> dict | None:
 
 def reset_cache() -> None:
     """Tests, and anything that moves the shared directory at runtime."""
-    global _cache_stamp, _cache_map
+    global _cache_stamp, _cache_by_path, _cache_by_key
     with _cache_lock:
-        _cache_stamp, _cache_map = None, {}
+        _cache_stamp, _cache_by_path, _cache_by_key = None, {}, {}

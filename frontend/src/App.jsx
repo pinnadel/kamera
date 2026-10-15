@@ -44,6 +44,7 @@ import {
   Columns2,
   ExternalLink,
   Eye,
+  Archive,
   Folder,
   FolderInput as FolderInputIcon,
   FolderTree,
@@ -79,8 +80,6 @@ import { ConfirmModal } from './modals/ConfirmModal'
 import { AutoCullModal } from './modals/AutoCullModal'
 import { PhotosReconcileModal } from './modals/PhotosReconcileModal'
 import { SettingsModal } from './modals/SettingsModal'
-import { GroupPartnersOverlay } from './modals/GroupPartnersOverlay'
-import { PartnerCountChips, GroupBulkBar } from './ui/TileChips'
 import { GroupScrubPreview } from './ui/GroupScrubPreview'
 import { ImageCard } from './views/ImageCard'
 import { DetailView } from './views/DetailView'
@@ -122,6 +121,11 @@ import { EMPTY_FILTER, filterPredicate, getActiveFilterChips, groupingPredicate,
 import { ViewModePill } from './ViewModePill'
 
 const EMPTY_IMAGES = []
+
+// The decision buckets as nouns, for copy that is built as a string rather
+// than as JSX (toasts, confirm titles). Anywhere the noun can be rendered as
+// an element, <DecisionWord> is still the right thing — it carries the colour.
+const DECISION_NOUN = { keep: 'Keep', maybe: 'Maybe', reject: 'Reject' }
 
 export default function App() {
   const [tabs, setTabs]               = useState(() => [makeNewTab()])
@@ -176,6 +180,12 @@ export default function App() {
   // "the rest of my work, everywhere" (All view) and as a per-bucket queue.
   // Persisted: a culling session spans reloads.
   const [unconfirmedOnly, setUnconfirmedOnly] = useLocalStorageState('pca.unconfirmedOnly', false)
+  // "Hide archived" — an archived keeper keeps its row and its place in the
+  // Keep view, because that view is exactly "what did I keep". That is a
+  // record, though, and sometimes the Keep view is a working surface
+  // instead; this pill is the opt-out. Off by default: the honest default is
+  // to show what is there.
+  const [hideArchived, setHideArchived] = useLocalStorageState('pca.hideArchived', false)
   // searchInput is the immediately-controlled input value. searchQuery is
   // the debounced value that flows into filtering and HighlightedText. With
   // 741 cards each running a HighlightedText loop, every keystroke previously
@@ -548,6 +558,18 @@ export default function App() {
   const liveLeft        = activeTab?.liveLeft     ?? 0
   const liveAnalyzed    = activeTab?.liveAnalyzed ?? 0
 
+  // Provenance's import run, if one is filling this tab's folder. Unlike the
+  // watcher above this HAS a real denominator from the first second — the
+  // card was read before the copy started — which is the whole difference
+  // between "it's running" and "it'll take this long".
+  const importRun       = activeTab?.importRun ?? null
+  const importCopying   = importRun?.phase === 'reading' || importRun?.phase === 'copying'
+  const importTotal     = importRun?.photos_total ?? 0
+  const importDone      = importRun?.photos_done ?? 0
+  // Photos promised by the run that have no tile yet. Rendered as placeholder
+  // slots so the grid doesn't reflow as each one lands.
+  const importPending   = Math.max(0, importTotal - (activeTab?.images?.length ?? 0))
+
   // ── Semantic search fetch (depends on activeTab being defined above) ─────────
   useEffect(() => {
     if (searchMode !== 'semantic') { setSemanticResults(null); setSemanticLoading(false); return }
@@ -799,6 +821,57 @@ export default function App() {
     })
   }, [setTabs, setActiveTabId])
 
+  // Route Provenance's import run (/import-status) onto the tab whose folder
+  // it is filling. A card import happens entirely outside the browser, so
+  // without this the app cannot show that photos are on their way — which is
+  // why the result used to have to be shouted through a modal dialog.
+  //
+  // Derived every tick and never stored on the tab's own identity. Tabs are
+  // rebuilt from GET /folders on load, so the run state simply re-derives;
+  // there is nothing that could resurrect a finished run as a live one.
+  //
+  // The tab is created if missing but does NOT steal focus. If you are
+  // culling something else, an import quietly appears as a new tab with a
+  // chip rather than yanking you out of your work.
+  const onImportStatus = useCallback((payload) => {
+    const run = payload?.run || null
+    const folder = run?.temp_import || null
+    setTabs(prev => {
+      let next = prev.map(t => {
+        if (!folder || t.folderPath !== folder) {
+          return t.importRun ? { ...t, importRun: null } : t
+        }
+        const same = t.importRun
+          && t.importRun.run_id === run.run_id
+          && t.importRun.phase === run.phase
+          && t.importRun.photos_done === run.photos_done
+          && t.importRun.photos_total === run.photos_total
+        return same ? t : { ...t, importRun: {
+          run_id: run.run_id, phase: run.phase, volume: run.volume,
+          photos_done: run.photos_done ?? 0,
+          photos_total: run.photos_total ?? null,
+        } }
+      })
+      // A run in a moving phase deserves a tab even if the user never opened
+      // the import folder. A finished one does not conjure a tab out of
+      // nowhere on the next launch.
+      const moving = run && ['reading', 'copying', 'analyzing'].includes(run.phase)
+      if (moving && folder && !next.some(t => t.folderPath === folder)) {
+        const fresh = makeReadyTab(folder)
+        fresh.importRun = {
+          run_id: run.run_id, phase: run.phase, volume: run.volume,
+          photos_done: run.photos_done ?? 0,
+          photos_total: run.photos_total ?? null,
+        }
+        const emptyIdx = next.findIndex(t => t.folderPath === null)
+        next = emptyIdx >= 0
+          ? [...next.slice(0, emptyIdx), fresh, ...next.slice(emptyIdx)]
+          : [...next, fresh]
+      }
+      return next
+    })
+  }, [setTabs])
+
   // Route the watcher's live progress (/watch-progress) to a tab as a
   // "analyzing… (N left)" indicator. The /watch live-analysis path (Provenance's
   // "Import & Analyze") is invisible to /analyze-progress, so this is the only
@@ -921,6 +994,7 @@ export default function App() {
     setModelStatus,
     ensureTabForFolder,
     onWatchProgress,
+    onImportStatus,
     onBatchComplete: loadGroupsAndPrerank,
     onAnalysisFinished: handleAnalysisFinished,
     // When the prerank worker advances, re-fetch /similarity-groups (NOT
@@ -1099,6 +1173,12 @@ export default function App() {
   // the number always answers "how much is left in front of me right now";
   // on the All view that widens to the whole remaining workload, undecided
   // photos included.
+  // How many keepers in this tab have already left for the library. Drives
+  // whether the "Hide archived" pill is offered at all.
+  const archivedCount = useMemo(
+    () => images.filter(i => i.lifecycle === 'archived' || i.lifecycle === 'backed_up').length,
+    [images])
+
   const unconfirmedCount = useMemo(() => images.filter(img => {
     if (!isUnconfirmed(img)) return false
     if (decisionFilter === null) return true
@@ -1144,12 +1224,20 @@ export default function App() {
     // Runs HERE, before the decidedGroup clustering further down, so a
     // collapsed group run can't re-gather members this filter just removed.
     const unconfirmedMatches = unconfirmedOnly ? isUnconfirmed : null
-    if (decisionMatches || compositionMatches || groupingMatches || unconfirmedMatches) {
+    // "Hide archived": drop keepers that have already left for the Luminar
+    // library. Folded into the combined predicate below rather than run as
+    // its own pass — a sequential flatMap miscounts group entries, which
+    // carry aggregated member counts.
+    const archivedMatches = hideArchived
+      ? (img => img?.lifecycle !== 'archived' && img?.lifecycle !== 'backed_up')
+      : null
+    if (decisionMatches || compositionMatches || groupingMatches || unconfirmedMatches || archivedMatches) {
       const passesAll = img =>
         (!decisionMatches    || decisionMatches(img)) &&
         (!compositionMatches || compositionMatches(img)) &&
         (!groupingMatches    || groupingMatches(img)) &&
-        (!unconfirmedMatches || unconfirmedMatches(img))
+        (!unconfirmedMatches || unconfirmedMatches(img)) &&
+        (!archivedMatches    || archivedMatches(img))
       filtered = filtered.flatMap(item => {
         if (item.type !== 'group') {
           return passesAll(item.image) ? [item] : []
@@ -1200,36 +1288,23 @@ export default function App() {
       })
     }
 
-    // ── Cluster + annotate group members (Rejects/Maybes only) ────────────────
-    // In these views every item is an individual `image` (group tiles only ever
-    // survive the Undecided filter), and members of the same original burst are
-    // scattered by the active sort. Reorder so groupmates sit adjacent so a
-    // group can be wrapped in one shared border, and attach ONE survivor chip
-    // to the run's first tile.
+    // ── Collapse burst members into group tiles (decided views) ──────────────
+    // In the Keeps/Maybes/Rejects views every item is an individual `image`
+    // (group tiles only ever survive the Undecided filter), and members of the
+    // same original burst are scattered by the active sort. Gather them so one
+    // burst reads as one cell.
     //
-    // Chip semantics: a photo *survives* culling if it's a Keep or Maybe. The
-    // chip answers "did any groupmate survive, and how" — so we show the
-    // SURVIVOR buckets (keep, maybe) MINUS the bucket we're currently viewing:
-    //   • Rejects view → "N Keeps" + "N Maybe" chips (survived elsewhere)
-    //   • Maybes  view → "N Keeps" chip only (a better survivor exists)
-    // A group with no such partners keeps its border but shows no chip. The chip
-    // is clickable → opens an overlay listing the differently-culled members
-    // (and the current bucket) with per-photo re-cull; that overlay needs the
-    // group's full member list, carried on `groupChip.members`.
-    // Gated to reject/maybe so All/Undecided/Keeps stay untouched.
-    if (decisionFilter === 'reject' || decisionFilter === 'maybe') {
-      // Which survivor buckets to surface, given the current view.
-      const chipKinds = decisionFilter === 'maybe' ? ['keep'] : ['keep', 'maybe']
-      const survivorCounts = (counts) => {
-        if (!counts) return null
-        const out = {}
-        let any = false
-        for (const kind of chipKinds) {
-          const n = counts[kind] || 0
-          if (n > 0) { out[kind] = n; any = true }
-        }
-        return any ? out : null
-      }
+    // The rule is membership, not run length: ANY photo belonging to a
+    // multi-photo burst becomes a DecidedGroupTile, even when it is this
+    // bucket's only representative of that burst. That is what makes the peek
+    // panel — which always walks the WHOLE burst — reachable from every photo
+    // that has one, and it is why the old survivor chips ("2 Keeps", "1 Maybe")
+    // are gone: the panel states each member's bucket on the frame itself, so a
+    // chip counting them on the tile said the same thing twice and, on a lone
+    // member, was the only way in.
+    //
+    // Ungrouped photos render as plain image items, unchanged.
+    if (decisionFilter === 'keep' || decisionFilter === 'maybe' || decisionFilter === 'reject') {
       // Bucket by groupId, preserving each group's first-appearance order (so
       // the existing sort still drives the overall sequence). Ungrouped photos
       // are singletons that stay in place by first appearance.
@@ -1242,63 +1317,50 @@ export default function App() {
           continue
         }
         const summary = partnerSummaryByImageId.get(item.image.id)
-        const key = summary ? `g_${summary.groupId}` : `s_${item.image.id}`
+        // members.length > 1 rather than presence alone: a one-member entry
+        // would otherwise turn a lone photo into a "group" of itself.
+        const grouped = !!summary && summary.members.length > 1
+        const key = grouped ? `g_${summary.groupId}` : `s_${item.image.id}`
         if (!buckets.has(key)) { order.push(key); buckets.set(key, []) }
         buckets.get(key).push(item)
       }
       const clustered = []
       for (const key of order) {
         const run = buckets.get(key)
-        // A run of ≥2 present members reads as one enclosure; a lone member
-        // (its groupmates live in other decision views) renders like any
-        // ungrouped photo but still gets a chip on the first (only) tile.
-        const drawBorder = key.startsWith('g_') && run.length >= 2
-        // The group's survivor chip + full member list, computed once and hung
-        // on the run's first tile only. `members` comes from partnerSummary
-        // (the same for every member of the run).
-        const firstSummary = run[0].type === 'image'
-          ? partnerSummaryByImageId.get(run[0].image.id)
-          : null
-        const chipCounts = survivorCounts(firstSummary && firstSummary.counts)
-        const groupChip = chipCounts
-          ? { counts: chipCounts, members: firstSummary.members, viewDecision: decisionFilter }
-          : null
-        // Image ids of the members actually rendered in this run — i.e. the
-        // current view's bucket for this group. Hung on the first tile so the
-        // hover bulk-action bar can move the whole visible run in one call
-        // (survivors culled into other buckets are untouched). Only meaningful
-        // when the run draws a shared border (≥2 adjacent members).
-        const runImageIds = drawBorder
-          ? run.filter(it => it.type === 'image').map(it => it.image.id)
-          : null
-        // A run of ≥2 same-group, same-decision members collapses into ONE
-        // DecidedGroupTile (mirrors the Undecided view's GroupTile) instead of
-        // N individual bordered ImageCards. A solo run (this view's only
-        // representative of that group, or an ungrouped photo) still renders
-        // as a plain image item, unchanged.
-        if (drawBorder) {
-          clustered.push({
-            type: 'decidedGroup',
-            groupKey: key,
-            hero: run[0].image,
-            images: run.map(it => it.image),
-            decision: decisionFilter,
-            groupChip,
-            runImageIds,
-          })
-        } else {
-          clustered.push({
-            ...run[0],
-            groupRun: { id: key, position: 'solo', index: 0, length: 1 },
-            groupChip,
-            runImageIds: null,
-          })
+        if (!key.startsWith('g_')) {
+          clustered.push(run[0])
+          continue
         }
+        // The full live member list — the same for every member of the run,
+        // and what the peek panel scrubs. `images` is this view's bucket only.
+        const members = partnerSummaryByImageId.get(run[0].image.id).members
+        // Image ids of the members actually rendered in this run — i.e. the
+        // current view's bucket for this group. The hover bulk bar moves them
+        // in one call (survivors culled into other buckets are untouched).
+        // Only hung on a run of ≥2: moving "all" of one photo is just a
+        // re-cull, which the peek panel's K/M/R already does on the frame.
+        const runImageIds = run.length >= 2 ? run.map(it => it.image.id) : null
+        // Auto-culled keepers in this run that are still sitting in plain
+        // _Keeps. Collapsing the Keeps view into group tiles took away
+        // ImageCard's per-photo "mark reviewed" check button, so the tile
+        // carries the same action for the members it hides. Empty (and so
+        // unrendered) in every other view — needsReview() is keep-only.
+        const needsReviewIds = run.filter(it => needsReview(it.image)).map(it => it.image.id)
+        clustered.push({
+          type: 'decidedGroup',
+          groupKey: key,
+          hero: run[0].image,
+          images: run.map(it => it.image),
+          members,
+          decision: decisionFilter,
+          runImageIds,
+          needsReviewIds,
+        })
       }
       return clustered
     }
     return filtered
-  }, [gridItems, decisionFilter, unconfirmedOnly, filters, searchQuery, searchMode, semanticResults, partnerSummaryByImageId])
+  }, [gridItems, decisionFilter, unconfirmedOnly, hideArchived, filters, searchQuery, searchMode, semanticResults, partnerSummaryByImageId])
 
   // Index of the currently-focused grid cell — drives scrollIntoView and the
   // GroupTile's selection ring. Computed against the filtered/visible list so
@@ -1314,8 +1376,15 @@ export default function App() {
         item.type === 'decidedGroup' && item.groupKey === selectedDecidedGroupKey
       )
     }
+    const id = images[selectedIdx]?.id
+    const exact = displayGridItems.findIndex(item => item.type === 'image' && item.image.id === id)
+    if (exact >= 0 || id == null) return exact
+    // The photo cursor can sit on a member of a collapsed burst — DetailView's
+    // filmstrip steps onto a DecidedGroupTile by selecting its hero. The tile
+    // IS that photo's cell, so point at it rather than reporting "nowhere" and
+    // leaving the grid with no cursor when DetailView closes.
     return displayGridItems.findIndex(item =>
-      item.type === 'image' && item.image.id === images[selectedIdx]?.id
+      item.type === 'decidedGroup' && item.images.some(img => img.id === id)
     )
   }, [displayGridItems, images, selectedIdx, selectedGroupId, selectedDecidedGroupKey])
 
@@ -1667,7 +1736,7 @@ export default function App() {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) {
-        addToast({ type: 'error', message: data.detail || `Mark reviewed failed (${res.status})`, duration: 6000 })
+        addToast({ type: 'error', message: data.detail || `Releasing to the archive failed (${res.status})`, duration: 6000 })
         return
       }
       setImages(prev => prev.map(img =>
@@ -1737,8 +1806,11 @@ export default function App() {
   // ── Bulk decision (used by GroupLoupe batch actions) ──────────────────────
   // Single round-trip via /bulk-decision, then refreshes images so
   // file_path / decision badges reflect the moves on disk.
+  // Returns the number of photos that actually changed — 0 on any failure.
+  // The group-scrub sweep reads it so it never offers an Undo for a decision
+  // that never landed.
   const bulkDecide = useCallback(async (imageIds, decision) => {
-    if (!imageIds || imageIds.length === 0) return
+    if (!imageIds || imageIds.length === 0) return 0
     // Snapshot prior decisions before mutating — needed for undo + amend-previous.
     const prevMap = new Map(
       imageIds.map(id => {
@@ -1755,7 +1827,7 @@ export default function App() {
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         addToast({ type: 'error', message: data.detail || `Bulk decision failed (${res.status})`, duration: 8000 })
-        return
+        return 0
       }
       const data = await res.json().catch(() => ({}))
       const errorIds = new Set((data.errors || []).map(e => e.id))
@@ -1777,8 +1849,10 @@ export default function App() {
       // DetailView would leave the loupe parked on a fully-decided group.
       maybeResolveActiveGroupRef.current?.(imageIds)
       loadModelInfo()
+      return successfulIds.length
     } catch (err) {
       addToast({ type: 'error', message: `Network error: ${err.message}`, duration: 8000 })
+      return 0
     }
   }, [images, loadImages, loadModelInfo, addToast, undoStack])
 
@@ -1974,17 +2048,6 @@ export default function App() {
   // under the cursor only, not the whole selection (matches Finder behaviour).
   const [tileMenu, setTileMenu] = useState(null)
 
-  // Group-partners overlay: { imageId, viewDecision } of the clicked chip, or
-  // null. Members are re-read live from partnerSummaryByImageId each render so
-  // re-culls restructure it. Close it if the decision filter changes out from
-  // under it (the chip only exists in the reject/maybe views).
-  const [partnersOverlay, setPartnersOverlay] = useState(null)
-  useEffect(() => {
-    if (partnersOverlay && decisionFilter !== partnersOverlay.viewDecision) {
-      setPartnersOverlay(null)
-    }
-  }, [decisionFilter, partnersOverlay])
-
   // Hover-scrub peek on group tiles: sweeping across a tile steps through the
   // burst's members in a panel anchored below it. Suspended whenever a
   // full-screen surface owns the view or the grid is in select mode — those
@@ -2007,7 +2070,7 @@ export default function App() {
     stash: stashGroupScrub,
     restore: restoreGroupScrub,
   } = useGroupScrub({
-    suspended: !!loupeGroup || detailOpen || !!partnersOverlay || gridMultiSelect.isSelectMode
+    suspended: !!loupeGroup || detailOpen || gridMultiSelect.isSelectMode
       || compareOpen || activeView !== 'grid',
     topInset: headerTopInset,
   })
@@ -2089,14 +2152,16 @@ export default function App() {
     await bulkDecide([img.id], decision)
   }, [images, selectedIdx, scrubDetailGroup, bulkDecide, setSelectedIdx])
 
-  // Open the partners overlay for a collapsed DecidedGroupTile by its groupKey
-  // (used by keyboard Enter/Space when a decidedGroup cell is focused — the
-  // same overlay the tile's survivor chip / double-click already open).
-  const openPartnersOverlay = useCallback((groupKey) => {
+  // Open a collapsed DecidedGroupTile by its groupKey — the keyboard twin of
+  // double-clicking it (Enter/Space while the cell is focused). Both land in
+  // DetailView carrying the burst, which is what replaced the old
+  // GroupPartnersOverlay: the same "which members went where, and let me
+  // re-cull one" job, on a screen big enough to actually judge the photo.
+  const openDecidedGroupDetail = useCallback((groupKey) => {
     const item = displayGridItems.find(it => it.type === 'decidedGroup' && it.groupKey === groupKey)
     if (!item) return
-    setPartnersOverlay({ imageId: item.hero.id, viewDecision: item.decision })
-  }, [displayGridItems])
+    openDetailFromScrub(item.hero.id)
+  }, [displayGridItems, openDetailFromScrub])
 
   // Photo-onto-photo drop hover. Independent of dropHoverGroupId because a
   // photo can be hovered while a GroupTile is also under the same drag, and
@@ -2270,6 +2335,45 @@ export default function App() {
 
     return false
   }, [undoStack, setImages, loadModelInfo, addToast, setManualGroup])
+
+  // ── Group-wide sweeps ─────────────────────────────────────────────────────
+  // Two surfaces move a whole burst in one click — the scrub panel's "Maybe /
+  // Reject all undecided" and the group tile's hover bar ("Keep all", "Maybe
+  // all", "Reject all"). Both route through ONE confirm gate rather than
+  // carrying their own, so the question is worded the same way wherever it is
+  // asked and there is a single place to change what counts as a safe sweep.
+  //
+  // Every direction asks, Keep included: the risk in these buttons is not the
+  // bucket they move photos to, it is that one click moves photos you never
+  // looked at. A "Keep all" that quietly promotes five frames is the same
+  // surprise as a "Reject all" that culls them.
+  //
+  // { ids, decision, scope: 'undecided' | 'run', viewDecision } — null = closed.
+  const [groupSweepConfirm, setGroupSweepConfirm] = useState(null)
+
+  // Applied only after the modal's Confirm. The undo toast stays on top of the
+  // confirm rather than instead of it: bulkDecide has already pushed ONE stack
+  // entry covering the whole sweep, so Undo here is the same runUndo the U key
+  // runs — one gesture takes the whole thing back. (Same pattern as the mobile
+  // decision toast.) Nothing is offered when the sweep failed: bulkDecide
+  // returns 0 and has toasted the error itself.
+  // Takes no argument and reads the pending request off state: the modal is
+  // rendered from a render-time IIFE, and handing that closure's copy back
+  // into a callback is what react-hooks/refs flags. `onConfirm={runGroupSweep}`
+  // is also just the plainer call site.
+  const runGroupSweep = useCallback(async () => {
+    const req = groupSweepConfirm
+    setGroupSweepConfirm(null)
+    if (!req || !req.ids || req.ids.length === 0) return
+    const applied = await bulkDecide(req.ids, req.decision)
+    if (!applied) return
+    addToast({
+      type: 'info',
+      message: `Moved ${applied} photo${applied === 1 ? '' : 's'} to ${DECISION_NOUN[req.decision]}`,
+      duration: 6000,
+      action: { label: 'Undo', onClick: () => runUndo() },
+    })
+  }, [groupSweepConfirm, bulkDecide, addToast, runUndo])
 
   // amendLastDecision — "double-press" gesture for changing the previous photo's
   // decision without navigating back. When the previous K/M/R happened within
@@ -2577,7 +2681,7 @@ export default function App() {
     // user sees, and arrow nav has to match that or it feels broken.
     displayGridItems,
     enterLoupe,
-    openPartnersOverlay,
+    openDecidedGroupDetail,
     sendDecision,
     setUserCols,
     undoImage,
@@ -2660,28 +2764,11 @@ export default function App() {
       {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
       {bannerStatesOpen && <BannerStates onClose={() => setBannerStatesOpen(false)} />}
 
-      {/* Group-partners overlay — opened from a group's survivor chip. Members
-          are read LIVE from partnerSummaryByImageId so a re-cull inside the
-          overlay restructures its sections on the next render. Closes on
-          X / backdrop / ESC and auto-closes when nothing differs anymore. */}
-      {partnersOverlay && (() => {
-        const summary = partnerSummaryByImageId.get(partnersOverlay.imageId)
-        if (!summary) return null   // photo left its group (defensive) → render nothing
-        return (
-          <GroupPartnersOverlay
-            members={summary.members}
-            viewDecision={partnersOverlay.viewDecision}
-            onDecide={sendGroupDecision}
-            onBulkDecide={bulkDecide}
-            onClose={() => setPartnersOverlay(null)}
-          />
-        )
-      })()}
-
-      {/* Hover-scrub panel for group tiles. Members are re-read live from
-          partnerSummaryByImageId each render (same pattern as
-          GroupPartnersOverlay) so a decision made inside the panel restyles it
-          on the spot instead of leaving the opening snapshot on screen. */}
+      {/* Hover-scrub panel for group tiles — the one group review surface in
+          the decided views now that GroupPartnersOverlay is gone. Members are
+          re-read live from partnerSummaryByImageId each render, so a decision
+          made inside the panel restyles it on the spot instead of leaving the
+          opening snapshot on screen. */}
       {groupScrubPreview && (() => {
         const anchorId = groupScrubPreview.members[0]?.id
         const liveSummary = anchorId != null ? partnerSummaryByImageId.get(anchorId) : null
@@ -2692,6 +2779,16 @@ export default function App() {
             bestImageId={liveSummary?.groupId}
             bestIsAiPick={liveSummary?.bestIsAiPick}
             onDecide={(imageId, decision) => bulkDecide([imageId], decision)}
+            // The panel closes before the modal opens, for two reasons: it
+            // sits at z-9999 and would paint over a z-60 dialog, and its own
+            // outside-click dismissal would close it on the first mousedown
+            // inside the modal anyway. Doing it deliberately beats watching it
+            // happen. Cancel therefore leaves no panel behind — re-hover the
+            // tile to get it back.
+            onSweepUndecided={(ids, decision) => {
+              groupScrubPreview.onClose?.()
+              setGroupSweepConfirm({ ids, decision, scope: 'undecided' })
+            }}
             onSwap={swapDecisions}
             onUndo={undoImage}
             onOpenDetail={openDetailFromScrub}
@@ -2870,6 +2967,46 @@ export default function App() {
         />
       )}
 
+      {/* One dialog for every group-wide sweep, from either surface. The body
+          states the two things a count alone doesn't: which photos are about
+          to move, and — for the undecided sweeps — which are explicitly not. */}
+      {groupSweepConfirm && (() => {
+        const { ids, decision, scope, viewDecision } = groupSweepConfirm
+        const n = ids.length
+        const photos = `${n} photo${n === 1 ? '' : 's'}`
+        return (
+          <ConfirmModal
+            title={`Move ${photos} to ${DECISION_NOUN[decision]}?`}
+            body={scope === 'undecided' ? (
+              <>
+                Every frame in this group you haven't judged yet moves to{' '}
+                <DecisionWord kind={decision}>{DECISION_NOUN[decision]}</DecisionWord>.
+                Frames you already marked{' '}
+                <DecisionWord kind="keep">Keep</DecisionWord>{', '}
+                <DecisionWord kind="maybe">Maybe</DecisionWord>{' or '}
+                <DecisionWord kind="reject">Reject</DecisionWord>
+                {' '}are left exactly as they are. You can take this back with Undo.
+              </>
+            ) : (
+              <>
+                All {photos} of this group currently in{' '}
+                {viewDecision
+                  ? <DecisionWord kind={viewDecision}>{DECISION_NOUN[viewDecision]}</DecisionWord>
+                  : 'this view'}
+                {' '}move to{' '}
+                <DecisionWord kind={decision}>{DECISION_NOUN[decision]}</DecisionWord>.
+                Groupmates culled into other buckets are not touched. You can
+                take this back with Undo.
+              </>
+            )}
+            confirmLabel={`Move to ${DECISION_NOUN[decision]}`}
+            confirmTone={decision === 'keep' ? 'info' : 'danger'}
+            onCancel={() => setGroupSweepConfirm(null)}
+            onConfirm={runGroupSweep}
+          />
+        )
+      })()}
+
       {bannerDismissConfirm && (
         <ConfirmModal
           title="Hide the personal model banner?"
@@ -3012,7 +3149,14 @@ export default function App() {
             groupFocused = !!item
             focusedGroup = group || null
           } else if (selected) {
+            // Same two-step lookup as selectedGridIdx: a photo in a decision
+            // view may only be present as a member of a collapsed burst.
             filmstripIndex = displayGridItems.findIndex(it => it.type === 'image' && it.image.id === selected.id)
+            if (filmstripIndex < 0) {
+              filmstripIndex = displayGridItems.findIndex(
+                it => it.type === 'decidedGroup' && it.images.some(img => img.id === selected.id)
+              )
+            }
           }
         }
         if (!panelImage) return null
@@ -3020,27 +3164,26 @@ export default function App() {
         const groupIdx = inGroup ? groupImages.findIndex(img => img.id === panelImage.id) : -1
 
         // ── Atomic step over displayGridItems for grid-filmstrip mode ──
-        // A collapsed DecidedGroupTile (Maybe/Reject) isn't something
-        // DetailView can render or open (it has no single "hero" concept the
-        // way an undecided group does — reviewing it belongs to
-        // GroupPartnersOverlay, not the filmstrip) — so it isn't a filmstrip
-        // stop; skip past it in the step direction.
-        const stepFilmstrip = (delta) => {
-          let next = displayGridItems[filmstripIndex + delta]
-          let skip = delta
-          while (next && next.type === 'decidedGroup') {
-            skip += delta
-            next = displayGridItems[filmstripIndex + skip]
-          }
+        // One stop per CELL: a photo, an undecided group (renders its AI hero,
+        // with the loupe affordances), or a collapsed burst in a decision view
+        // (renders its hero as an ordinary photo — there is nothing to rank,
+        // so it gets no group chrome). A decided group used to be skipped
+        // outright, which was survivable while only Maybes/Rejects collapsed;
+        // once Keeps collapses too, skipping would walk past most of the view.
+        const landOn = (next) => {
           if (!next) return
           if (next.type === 'image') {
             const i = images.findIndex(img => img.id === next.image.id)
+            if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
+          } else if (next.type === 'decidedGroup') {
+            const i = images.findIndex(img => img.id === next.hero.id)
             if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
           } else {
             setSelectedDecidedGroupKey(null)
             setSelectedGroupId(next.group.best_image_id)
           }
         }
+        const stepFilmstrip = (delta) => landOn(displayGridItems[filmstripIndex + delta])
 
         const onPrev = inGroup
           ? (groupIdx > 0 ? () => {
@@ -3057,17 +3200,7 @@ export default function App() {
             } : null)
           : (filmstripIndex >= 0 && filmstripIndex < displayGridItems.length - 1 ? () => stepFilmstrip(1) : null)
 
-        const pickFilmstripIndex = (idx) => {
-          const item = displayGridItems[idx]
-          if (!item || item.type === 'decidedGroup') return
-          if (item.type === 'image') {
-            const i = images.findIndex(img => img.id === item.image.id)
-            if (i >= 0) { setSelectedGroupId(null); setSelectedDecidedGroupKey(null); setSelectedIdx(i) }
-          } else {
-            setSelectedDecidedGroupKey(null)
-            setSelectedGroupId(item.group.best_image_id)
-          }
-        }
+        const pickFilmstripIndex = (idx) => landOn(displayGridItems[idx])
 
         const openGroupFromFilmstrip = (group) => {
           // Close DetailView, focus the group, open GroupLoupe. The group's
@@ -3291,6 +3424,35 @@ export default function App() {
             progress bar takes precedence, and while liveAnalyzing (watch-live
             import against this same folder) — otherwise a stale
             unfinishedCount snapshot offers to "resume" an active import. */}
+        {/* Interrupted import — Provenance's run stopped before analysis
+            settled (a timeout, or the analysis step hit an error). This is
+            the only reason `interrupted` is a separate phase from `done`:
+            without it the UI would have to guess whether to offer a resume.
+            It answers for itself here rather than naming a button in another
+            app, which is how the old modal got it wrong. */}
+        {!analyzing && activeTab?.importRun?.phase === 'interrupted' && (
+          <div className="px-6 pt-3">
+            <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-[rgba(232,184,74,0.10)] border border-[rgba(232,184,74,0.30)]">
+              <div className="text-xs text-[#E8B84A]">
+                The import from{' '}
+                <span className="font-semibold">
+                  {activeTab.importRun.volume ? `“${activeTab.importRun.volume}”` : 'the card'}
+                </span>{' '}
+                stopped before every photo was analyzed. Nothing was lost — the files are here.
+              </div>
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => resumeAnalysisForTab(activeTab)}
+                className="px-2.5 py-1 rounded-md text-xs font-medium bg-[rgba(232,184,74,0.20)] text-[#E8B84A] border border-[rgba(232,184,74,0.40)] hover:opacity-80 transition-opacity whitespace-nowrap"
+                title="Re-run analysis on this folder. Already-analyzed photos skip."
+              >
+                Finish analyzing
+              </button>
+            </div>
+          </div>
+        )}
+
         {!analyzing
           && !liveAnalyzing
           && activeTab
@@ -3317,11 +3479,48 @@ export default function App() {
 
         {/* Band 2 — Contextual toolbar */}
         {((analyzing && progress && progress.total > 0)
+          || importCopying
           || liveAnalyzing
           || (!analyzing && analyzeResult && !analyzeResult.error && !resultDismissed)
           || (analyzeResult?.error && !resultDismissed)
         ) && (
         <div className="px-6 py-3 space-y-2">
+
+          {/* Import copy bar — Provenance is writing files into this folder
+              right now. This one HAS a real denominator (the card was read
+              before the copy began), so unlike the watch-live bar below it
+              can answer "how much longer", and the grid can hold empty slots
+              for the photos that haven't landed yet. */}
+          {importCopying && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs font-mono text-[#8a8a8a]">
+                <span className="truncate text-[#f0f0f0]">
+                  {importRun.phase === 'reading'
+                    ? <>Reading {importRun.volume ? `“${importRun.volume}”` : 'the card'}…</>
+                    : <>Importing from {importRun.volume ? `“${importRun.volume}”` : 'the card'}…</>}
+                </span>
+                {importTotal > 0 && (
+                  <span className="text-[#8a8a8a]">
+                    {Math.round((importDone / Math.max(1, importTotal)) * 100)}%
+                    &nbsp;{importDone}/{importTotal}
+                  </span>
+                )}
+              </div>
+              <div className="w-full bg-[#1b1c1e] rounded-[3px] h-1.5 overflow-hidden">
+                {importTotal > 0 ? (
+                  <div
+                    className="bg-[#5BB8D4] h-1.5 rounded-[3px] transition-all duration-300"
+                    style={{ width: `${Math.round((importDone / Math.max(1, importTotal)) * 100)}%` }}
+                  />
+                ) : (
+                  <div className="shimmer h-1.5 rounded-[3px]" />
+                )}
+              </div>
+              <p className="text-xs text-[#9c9c9d]">
+                Photos are analyzed as they arrive — you can start culling before the copy finishes.
+              </p>
+            </div>
+          )}
 
           {/* Watch-live progress bar — same visual language as the manual
               progress bar below, but no fixed total (files trickle in as
@@ -3637,6 +3836,29 @@ export default function App() {
                 )}
               </button>
             )}
+            {/* Hide archived — only offered where archived photos can appear
+                (the Keep view; they are keep-only), and only once there is
+                at least one, so the control never advertises a state the
+                folder cannot reach. */}
+            {!gridMultiSelect.isSelectMode && decisionFilter === 'keep' && archivedCount > 0 && (
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setHideArchived(v => !v)}
+                title={hideArchived
+                  ? 'Archived photos are hidden — click to show them again'
+                  : 'Hide photos already archived into your Luminar library'}
+                aria-pressed={hideArchived}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs border transition-colors ${
+                  hideArchived
+                    ? ACTIVE_PILL
+                    : 'bg-[#0d0e0f] border-[rgba(255,255,255,0.08)] text-[#9c9c9d] hover:bg-[rgba(255,255,255,0.03)]'
+                }`}
+              >
+                <Archive size={14} />
+                Hide archived
+                <span className="font-mono tabular-nums">{archivedCount}</span>
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -3651,6 +3873,15 @@ export default function App() {
             <span className="text-[#9c9c9d]/70">
               {decisionCounts.undecided} {decisionCounts.undecided === 1 ? 'photo' : 'photos'} undecided
             </span>
+            {/* The import finished while you were elsewhere. This bar is
+                already the cull offer — it only needed to say where these
+                photos came from, so the answer doesn't have to arrive as a
+                modal dialog from another app. */}
+            {activeTab?.importRun?.phase === 'done' && activeTab.importRun.volume && (
+              <span className="text-[#7DB89A]">
+                Import from “{activeTab.importRun.volume}” finished
+              </span>
+            )}
             <span className="text-[#8a8b8c] flex items-center gap-1.5">
               Press <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">K</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">M</kbd> <kbd className="px-1 py-0.5 rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] font-mono text-[#9c9c9d]">R</kbd> to decide{isPhotosTab(activeTab) ? '' : ', or let the AI sort them'}
             </span>
@@ -3668,22 +3899,29 @@ export default function App() {
           </div>
         )}
 
-        {/* Bulk action bar — keep filter (mark reviewed) */}
+        {/* Bulk action bar — release keepers to the archive.
+            Named for the consequence, not the bookkeeping: "Mark reviewed"
+            described what the database records, while what actually happens
+            is that the photo leaves KaMeRa's working set for the Luminar
+            library. The old wording is why a completion dialog could claim
+            photos were archived when they were still sitting here. */}
         {decisionFilter === 'keep' && needsReviewIds.length > 0 && (
           <div className="mb-3 flex items-center gap-3 px-3 py-2 bg-[rgba(125,184,154,0.06)] border border-[rgba(125,184,154,0.20)] rounded-lg text-xs">
             <span className="text-[#7DB89A]/70">
-              {needsReviewIds.length} auto-culled {needsReviewIds.length === 1 ? 'photo' : 'photos'} awaiting review
+              {needsReviewIds.length} auto-culled {needsReviewIds.length === 1 ? 'photo' : 'photos'} not archived yet
             </span>
             <span className="text-[#8a8b8c]">
-              Reviewed photos release to Provenance for archiving
+              Releasing moves them into your Luminar library
             </span>
             {bulkConfirm === 'mark-all-reviewed' ? (
               <div className="ml-auto flex items-center gap-2">
-                <span className="text-[#7DB89A]">Mark {needsReviewIds.length} reviewed?</span>
+                <span className="text-[#7DB89A]">
+                  Release {needsReviewIds.length} to the archive?
+                </span>
                 <button onMouseDown={(e) => e.preventDefault()} onClick={() => bulkMarkReviewed(needsReviewIds)} disabled={bulkRunning}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.20)] border border-[rgba(255,255,255,0.10)] text-[#7DB89A] hover:opacity-70 transition-opacity disabled:opacity-50">
                   <Check size={14} />
-                  {bulkRunning ? 'Marking…' : 'Confirm'}
+                  {bulkRunning ? 'Releasing…' : 'Confirm'}
                 </button>
                 <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm(null)}
                   className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#101111] border border-[rgba(255,255,255,0.10)] text-[#9c9c9d] hover:opacity-70 transition-opacity">
@@ -3692,8 +3930,9 @@ export default function App() {
               </div>
             ) : (
               <button onMouseDown={(e) => e.preventDefault()} onClick={() => setBulkConfirm('mark-all-reviewed')}
+                title="Move these keepers into the Luminar library. They leave KaMeRa's working view."
                 className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[rgba(125,184,154,0.12)] border border-[rgba(125,184,154,0.30)] text-[#7DB89A] hover:opacity-70 transition-opacity">
-                <Check size={14} /> Mark all reviewed
+                <Archive size={14} /> Release to archive
               </button>
             )}
           </div>
@@ -4114,10 +4353,12 @@ export default function App() {
                   />
                 </div>
               ) : item.type === 'decidedGroup' ? (
-                // A run of ≥2 same-group photos sharing this view's decision
-                // (Maybe/Reject), collapsed into one stacked tile — mirrors
-                // the undecided GroupTile above. Opening it (double-click /
-                // Enter) shows GroupPartnersOverlay, not GroupLoupe: these
+                // Every photo of a multi-photo burst that landed in this
+                // view's bucket, collapsed into one stacked tile — mirrors the
+                // undecided GroupTile above, and renders even when the bucket
+                // holds just one member of the burst. Clicking peeks the whole
+                // burst (GroupScrubPreview); opening it (double-click / Enter)
+                // goes to DetailView carrying the burst, not GroupLoupe: these
                 // photos are already decided, so there's nothing to rank.
                 <div
                   key={`decided-${item.groupKey}`}
@@ -4135,8 +4376,9 @@ export default function App() {
                     hero={item.hero}
                     images={item.images}
                     decision={item.decision}
-                    groupChip={item.groupChip}
+                    members={item.members}
                     runImageIds={item.runImageIds}
+                    needsReviewIds={item.needsReviewIds}
                     isSelected={selectedDecidedGroupKey === item.groupKey}
                     isSelectMode={gridMultiSelect.isSelectMode}
                     showFilename={showFilenames}
@@ -4155,18 +4397,24 @@ export default function App() {
                     onDrop={(e) => dropOntoGroupTile(
                       e,
                       item.hero.id,
-                      (item.groupChip?.members || item.images).map(i => i.id),
+                      item.members.map(i => i.id),
                     )}
                     onSelect={() => {
                       setSelectedGroupId(null)
                       setSelectedDecidedGroupKey(item.groupKey)
                     }}
-                    onOpen={() => {
-                      setSelectedGroupId(null)
-                      setSelectedDecidedGroupKey(item.groupKey)
-                      setPartnersOverlay({ imageId: item.hero.id, viewDecision: item.decision })
-                    }}
-                    onBulkDecide={(imageIds, decision) => bulkDecide(imageIds, decision)}
+                    // openDetailFromScrub moves the photo cursor to the hero
+                    // and clears both group cursors itself, so there is nothing
+                    // to set up here first.
+                    onOpen={() => openDetailFromScrub(item.hero.id)}
+                    // Straight to the confirm gate, not to bulkDecide: this
+                    // bar is hover-revealed over a tile the pointer is already
+                    // travelling across, so it is the easiest control in the
+                    // app to hit by accident.
+                    onBulkDecide={(imageIds, decision) => setGroupSweepConfirm({
+                      ids: imageIds, decision, scope: 'run', viewDecision: decisionFilter,
+                    })}
+                    onMarkReviewed={bulkMarkReviewed}
                   />
                 </div>
               ) : (
@@ -4175,13 +4423,10 @@ export default function App() {
                   data-grid-idx={idx}
                   role="gridcell"
                   tabIndex={selectedGridIdx === idx ? 0 : -1}
-                  className={`outline-none grid-cell${item.groupRun && item.groupRun.position !== 'solo' ? ' relative group/run' : ''}${
-                    // Selection must win visually over the group-run border overlay
-                    // below (z-10, amber/coral) — otherwise the cyan ring is painted
-                    // first and gets covered on 3 of 4 edges, leaving only the
-                    // unclipped corner near the footer visible. Bumping the whole
-                    // tile above both the border overlay and the partner chip
-                    // (z-20) lets ImageCard's ring paint fully on top.
+                  className={`outline-none grid-cell${
+                    // Keep the selected tile above its neighbours so ImageCard's
+                    // cyan ring paints fully rather than being clipped by the
+                    // next cell's own chrome.
                     (!gridMultiSelect.isSelectMode && selectedGroupId == null && selectedDecidedGroupKey == null && item.image.id === images[selectedIdx]?.id) ||
                     gridMultiSelect.selected.has(item.image.id)
                       ? ' z-30' : ''
@@ -4308,59 +4553,6 @@ export default function App() {
                     } catch { /* silently ignore malformed payloads */ }
                   }}
                 >
-                  {/* Shared group-run border. One enclosure around a run of
-                      adjacent same-group tiles: a non-interactive overlay that
-                      bleeds ±7px into the 12px grid gutters so the top/bottom
-                      lines are continuous across members and the interior
-                      vertical seams disappear. Coloured to the view's decision
-                      (Rejects → coral, Maybes → amber) so it reads in-context.
-                      Kept as an absolute overlay (not a spanning cell) so the
-                      grid rhythm and the 1:1 data-grid-idx ↔ cell mapping that
-                      keyboard nav relies on stay intact; a run that wraps a row
-                      simply splits into two aligned strips. */}
-                  {item.groupRun && item.groupRun.position !== 'solo' && (
-                    <div
-                      aria-hidden="true"
-                      className={`pointer-events-none absolute inset-y-0 z-10 border-y-2 ${
-                        decisionFilter === 'reject' ? 'border-[#C97B7B]' : 'border-[#E8B84A]'
-                      } ${
-                        item.groupRun.position === 'start'
-                          ? 'left-0 -right-[7px] border-l-2 rounded-l-lg'
-                          : item.groupRun.position === 'end'
-                          ? '-left-[7px] right-0 border-r-2 rounded-r-lg'
-                          : '-left-[7px] -right-[7px]'
-                      }`}
-                    />
-                  )}
-                  {/* Group survivor chip — rendered ONCE per group, at the
-                      lower-left inside the run's first tile. Clicking it opens
-                      the partners overlay (differently-culled members + re-cull).
-                      z-20 floats it above the border overlay; pointer-events
-                      re-enabled just on the chip so the click lands. */}
-                  {item.groupChip && (
-                    <div className="absolute bottom-1.5 left-1.5 z-20">
-                      <PartnerCountChips
-                        counts={item.groupChip.counts}
-                        onOpen={() => setPartnersOverlay({ imageId: item.image.id, viewDecision: item.groupChip.viewDecision })}
-                      />
-                    </div>
-                  )}
-                  {/* Group bulk-action bar — hover-revealed at the run's top-left.
-                      Moves every member rendered in this run (this view's bucket)
-                      to a target decision in one call, leaving survivors culled
-                      into other buckets alone. Only on the first tile (where the
-                      run's ids are hung), and only while not multi-selecting so
-                      it never competes with the select flow. group-hover/run keys
-                      off the named group on the cell wrapper above. */}
-                  {item.runImageIds && item.runImageIds.length > 0 && !gridMultiSelect.isSelectMode && (
-                    <div className="absolute top-1.5 left-1.5 z-20 opacity-0 group-hover/run:opacity-100 transition-opacity">
-                      <GroupBulkBar
-                        count={item.runImageIds.length}
-                        viewDecision={decisionFilter}
-                        onDecide={(decision) => bulkDecide(item.runImageIds, decision)}
-                      />
-                    </div>
-                  )}
                   <ImageCard
                     image={item.image}
                     isSelected={!gridMultiSelect.isSelectMode && selectedGroupId == null && selectedDecidedGroupKey == null && item.image.id === images[selectedIdx]?.id}
@@ -4370,7 +4562,6 @@ export default function App() {
                     searchQuery={searchQuery}
                     showFilename={showFilenames}
                     isAllView={decisionFilter === null}
-                    inGroupBorder={!!item.groupRun && item.groupRun.position !== 'solo'}
                     onMarkReviewed={markReviewed}
                     draggable
                     onDragStart={handleCardDragStart}
@@ -4378,18 +4569,26 @@ export default function App() {
                 </div>
               )
             )}
-            {/* Trailing skeletons for photos still being analyzed */}
-            {analyzing
-              && progress?.total > images.length
-              && !decisionFilter
-              && displayGridItems.length === images.length
-              && Array.from({ length: Math.min(progress.total - images.length, 24) }).map((_, i) => (
+            {/* Trailing skeletons for photos still on their way — either a
+                batch we started (progress.total) or a card Provenance is
+                copying in right now (importPending). Both cases have a real
+                denominator, which is the whole point: an empty slot says
+                "more is coming and this is how much", where a spinner only
+                says "something is happening". */}
+            {(() => {
+              const pending = analyzing && progress?.total > images.length
+                ? progress.total - images.length
+                : importPending
+              const show = pending > 0 && !decisionFilter
+                && displayGridItems.length === images.length
+              return !show ? null : Array.from({ length: Math.min(pending, 24) }).map((_, i) => (
                 <div key={`skeleton-${i}`} className="space-y-2">
                   <div className="aspect-[4/3] rounded-lg shimmer border border-[rgba(255,255,255,0.06)]" />
                   <div className="h-3 w-3/4 rounded shimmer" />
                   <div className="h-2 w-1/2 rounded shimmer" />
                 </div>
-              ))}
+              ))
+            })()}
           </div>
         )}
 

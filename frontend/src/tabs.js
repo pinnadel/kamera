@@ -27,12 +27,11 @@ export function makeNewTab() {
     // K/M/R that left the next grid item as a group, and arrow nav can land
     // on groups too — Enter / Space then opens the GroupLoupe.
     selectedGroupId: null,
-    // Same idea as selectedGroupId, but for a run of ALREADY-DECIDED same-
-    // group photos collapsed into one DecidedGroupTile (Maybe/Reject views
-    // only). Holds the run's groupKey. Mutually exclusive with both
-    // selectedIdx and selectedGroupId — Enter/Space on it opens
-    // GroupPartnersOverlay, not GroupLoupe (nothing to rank/cull, only to
-    // review/re-cull already-decided members).
+    // Same idea as selectedGroupId, but for a burst's ALREADY-DECIDED members
+    // collapsed into one DecidedGroupTile (Keeps/Maybes/Rejects views). Holds
+    // the tile's groupKey. Mutually exclusive with both selectedIdx and
+    // selectedGroupId — Enter/Space on it opens DetailView carrying the burst,
+    // not GroupLoupe (nothing to rank/cull, only to review/re-cull).
     selectedDecidedGroupKey: null,
     loaded: true,  // empty tab has nothing to load
     watchLive: false,

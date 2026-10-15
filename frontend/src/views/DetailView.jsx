@@ -773,7 +773,7 @@ export function DetailView({ image, modelInfo, onClose, onDecide, onUndoImage, o
                   className="w-full py-2 px-2 rounded-lg text-xs font-semibold border transition-colors flex items-center justify-center gap-1.5 bg-[rgba(125,184,154,0.10)] text-[#7DB89A] border-[rgba(125,184,154,0.30)] hover:opacity-70"
                   title="Release this photo to Provenance for archiving"
                 >
-                  <CheckIcon size={13} /> Mark reviewed
+                  <CheckIcon size={13} /> Release to archive
                 </button>
               )}
             </div>
@@ -1076,19 +1076,35 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
           )
         }
         if (item.type === 'decidedGroup') {
-          // A collapsed run of already-decided same-group photos (Maybe/
-          // Reject views). DetailView has no single-hero concept for it and
-          // reviewing it belongs to GroupPartnersOverlay, not this filmstrip
-          // — so it's a non-interactive placeholder, not a navigable stop
-          // (stepFilmstrip/pickFilmstripIndex above skip past it).
+          // A burst collapsed into one cell in a decision view. It IS a
+          // navigable stop — picking it selects its hero, which the panel then
+          // renders like any other photo. No double-click-to-open-the-loupe
+          // twin: these photos are decided, so there is nothing to rank.
+          const word = item.decision === 'reject' ? 'rejects'
+            : item.decision === 'keep' ? 'keeps'
+            : 'maybes'
           return (
             <div
               key={`dg-${item.groupKey}`}
               data-filmstrip-idx={idx}
+              role="button"
+              tabIndex={0}
+              onClick={() => onPickIndex(idx)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onPickIndex(idx)
+                }
+              }}
               style={{ width: `${thumbW}px` }}
-              className="relative flex-shrink-0 rounded-md bg-[#161718] ring-1 ring-[rgba(255,255,255,0.06)] opacity-60 cursor-default"
-              title={`Group of ${item.images.length} ${item.decision === 'reject' ? 'rejects' : 'maybes'}`}
+              className={`relative flex-shrink-0 rounded-md bg-[#161718] cursor-pointer transition-all ${ring}`}
+              title={`Group · ${item.images.length} ${word}`}
             >
+              {/* Stacked-paper edge — same two offset rectangles the undecided
+                  group thumb uses, so "this cell is a burst" reads the same
+                  way in both kinds of view. */}
+              <div className="absolute -top-0.5 left-1 right-1 h-1 rounded-sm bg-[#1f2022] ring-1 ring-[rgba(255,255,255,0.06)]" />
+              <div className="absolute -top-1 left-2 right-2 h-1 rounded-sm bg-[#262728] ring-1 ring-[rgba(255,255,255,0.04)]" />
               <div
                 style={{ height: `${thumbH}px` }}
                 className="relative bg-[#07080a] flex items-center justify-center overflow-hidden rounded-t-md"
@@ -1098,6 +1114,9 @@ function DetailGridFilmstrip({ items, focusedIndex, onPickIndex, onOpenGroup, ri
                   alt=""
                   className="max-h-full max-w-full object-contain"
                 />
+                <span className="absolute top-1 right-1 px-1 py-px rounded text-[9px] font-semibold leading-none bg-[rgba(7,8,10,0.75)] text-[#cecece] ring-1 ring-[rgba(255,255,255,0.10)]">
+                  {item.images.length}
+                </span>
               </div>
               <div className="px-1 py-0.5 text-[9px] text-[#9c9c9d] uppercase tracking-wider text-center">
                 Group

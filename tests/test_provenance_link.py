@@ -154,3 +154,65 @@ def test_a_first_run_is_visible_before_the_ledger_exists(shared):
     # Ledger reads still correctly report nothing.
     assert provenance_link.key_for_path("/tmp/A.RAF") is None
     assert provenance_link.archive_info("K1") is None
+
+
+def test_reset_cache_actually_clears(shared):
+    """A reset that assigns to the wrong globals silently does nothing —
+    the tests would still pass because each one gets a fresh tmp dir."""
+    _ledger(shared, [("K1", "/tmp/A.RAF", None, "imported", 0)])
+    assert provenance_link.key_for_path("/tmp/A.RAF") == "K1"
+    provenance_link.reset_cache()
+    assert provenance_link._cache_stamp is None
+    assert provenance_link._cache_by_path == {}
+    assert provenance_link._cache_by_key == {}
+
+
+# --- lifecycle --------------------------------------------------------------
+
+def test_lifecycle_is_keep_only(shared):
+    _ledger(shared, [("K1", "/tmp/A.RAF", None, "imported", 0)])
+    assert provenance_link.lifecycle_for("K1", "keep") == "staged"
+    assert provenance_link.lifecycle_for("K1", "maybe") is None
+    assert provenance_link.lifecycle_for("K1", "reject") is None
+    assert provenance_link.lifecycle_for("K1", None) is None
+    assert provenance_link.lifecycle_for(None, "keep") is None
+
+
+def test_lifecycle_staged_means_nothing_is_archived_yet(shared):
+    """The state the old completion dialog called 'archived'."""
+    _ledger(shared, [("K1", "/tmp/A.RAF", None, "imported", 0)])
+    assert provenance_link.lifecycle_for("K1", "keep") == "staged"
+
+
+def test_lifecycle_archived_and_backed_up(shared):
+    _ledger(shared, [
+        ("K1", "/tmp/A.RAF", "/lib/2026/2026 Bilder/A.RAF", "archived", 0),
+        ("K2", "/tmp/B.RAF", "/lib/2026/2026 Bilder/B.RAF", "archived", 1),
+    ])
+    assert provenance_link.lifecycle_for("K1", "keep") == "archived"
+    assert provenance_link.lifecycle_for("K2", "keep") == "backed_up"
+
+
+def test_annotate_lifecycle_is_one_pass(shared):
+    _ledger(shared, [
+        ("K1", "/tmp/A.RAF", "/lib/A.RAF", "archived", 1),
+        ("K2", "/tmp/B.RAF", None, "imported", 0),
+    ])
+    rows = [
+        {"provenance_key": "K1", "decision": "keep"},
+        {"provenance_key": "K2", "decision": "keep"},
+        {"provenance_key": "K2", "decision": "reject"},
+        {"provenance_key": None, "decision": "keep"},   # never saw Provenance
+    ]
+    provenance_link.annotate_lifecycle(rows)
+    assert [r["lifecycle"] for r in rows] == ["backed_up", "staged", None, None]
+    assert rows[0]["archived_path"] == "/lib/A.RAF"
+    assert rows[3]["archived_path"] is None
+
+
+def test_annotate_lifecycle_without_provenance(shared):
+    """No ledger at all: every row gets the field, all None. The grid must not
+    have to know whether Provenance exists."""
+    rows = [{"provenance_key": None, "decision": "keep"}]
+    provenance_link.annotate_lifecycle(rows)
+    assert rows[0]["lifecycle"] is None and rows[0]["archived_path"] is None

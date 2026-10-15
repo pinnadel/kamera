@@ -40,7 +40,7 @@ const MID_BATCH_PRERANK_EVERY = 50
 // than this, so those refetches coalesce instead of queueing up one per photo.
 const IMAGE_REFETCH_MIN_MS = 1500
 
-export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onWatchProgress, onBatchComplete, onAnalysisFinished, onPrerankAdvance }) {
+export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, onWatchProgress, onImportStatus, onBatchComplete, onAnalysisFinished, onPrerankAdvance }) {
   // Keep a ref that always points at the current tabs array so the polling
   // closure never reads a stale snapshot. The effect that writes it is
   // intentionally NOT in this hook — App.jsx owns tabs state and syncs it.
@@ -86,6 +86,13 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
   // /watch live-analysis path (which /analyze-progress does NOT report on).
   const onWatchProgressRef = useRef(onWatchProgress)
   useEffect(() => { onWatchProgressRef.current = onWatchProgress }, [onWatchProgress])
+
+  // Same ref pattern for the Provenance import run (GET /import-status).
+  // A card import happens entirely outside the browser — Provenance copies
+  // files and writes its progress to a file KaMeRa reads — so this is the
+  // only way the app can know an import is filling a folder right now.
+  const onImportStatusRef = useRef(onImportStatus)
+  useEffect(() => { onImportStatusRef.current = onImportStatus }, [onImportStatus])
 
   // /analyze-progress — 400 ms
   useEffect(() => {
@@ -278,8 +285,9 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
         fetch(`${API}/model-status`).then(r => r.json()).catch(() => null),
         fetch(`${API}/prerank-status`).then(r => r.json()).catch(() => null),
         fetch(`${API}/watch-progress`).then(r => r.json()).catch(() => null),
+        fetch(`${API}/import-status`).then(r => r.json()).catch(() => null),
       ])
-        .then(([model, prerank, watch]) => {
+        .then(([model, prerank, watch, imp]) => {
           if (cancelled) return
           if (model) setModelStatus(model)
           // Loading = at least one model is downloading or initializing.
@@ -291,6 +299,13 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
           const watchActive = !!(watch && (watch.watching || watch.in_flight > 0))
           if (watch && typeof onWatchProgressRef.current === 'function') {
             try { onWatchProgressRef.current(watch) } catch { /* host-side error, don't break polling */ }
+          }
+          // An import in one of its moving phases keeps the poll on its fast
+          // cadence, so the copy counter and the arriving tiles stay live.
+          const importActive = !!(imp?.run && ['reading', 'copying', 'analyzing']
+            .includes(imp.run.phase))
+          if (typeof onImportStatusRef.current === 'function') {
+            try { onImportStatusRef.current(imp) } catch { /* never break polling */ }
           }
           // Detect prerank progress: any of the three terminal counters
           // ticked up, OR the in-flight hash changed (worker moved to
@@ -308,7 +323,7 @@ export function usePolling({ tabs, setTabs, setModelStatus, ensureTabForFolder, 
             }
             prevPrerank = prerank
           }
-          scheduleNext(hasActive || watchActive ? 1000 : 10000)
+          scheduleNext(hasActive || watchActive || importActive ? 1000 : 10000)
         })
         .catch(() => {
           // Network blip or backend restart — back off but keep trying.

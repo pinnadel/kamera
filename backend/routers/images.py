@@ -15,6 +15,7 @@ from backend.constants import (
     is_raw_format, companion_stem_matches, has_processed_sibling,
     is_photos_source_folder,
 )
+from backend import provenance_link
 from backend.database import get_db
 from backend.routers.settings import get_raw_jpeg_display_mode
 from backend.state import (
@@ -163,6 +164,7 @@ def list_images(source_folder: str | None = None):
             i.iqa_score, i.aesthetic_score,
             i.manual_group_id,
             i.explanation,
+            i.provenance_key,
             d.decision, d.reason
         FROM images i
         LEFT JOIN decisions d ON d.image_id = i.id
@@ -178,6 +180,12 @@ def list_images(source_folder: str | None = None):
 
     rows_dicts = [dict(row) for row in rows]
     rows_dicts = _filter_raw_jpeg_pairs(rows_dicts)
+
+    # Where each keeper is on its way out of KaMeRa: staged (sitting in
+    # _Keeps, nothing archived yet) → archived → backed_up. One ledger
+    # snapshot for the whole page; all-None when Provenance isn't installed,
+    # so the grid never has to ask whether it is.
+    provenance_link.annotate_lifecycle(rows_dicts)
 
     # Annotate with personal_score, each source_type scored by the model
     # trained on its own corpus. Running the camera model over iPhone HEICs
@@ -410,11 +418,28 @@ def sync_folder(request: ClearFolderRequest):
     with _decision_move_lock:
         with get_db() as conn:
             rows = conn.execute(
-                "SELECT id, file_path FROM images WHERE source_folder = ?",
+                "SELECT id, file_path, provenance_key FROM images "
+                "WHERE source_folder = ?",
                 (request.source_folder,),
             ).fetchall()
 
-        missing_ids = [r["id"] for r in rows if not Path(r["file_path"]).exists()]
+        # A missing file is NOT always a deleted photo. When Provenance
+        # archives a released keeper it moves the file into the Luminar
+        # library, and this sweep is what used to delete the row seconds
+        # later — the reason an archived photo vanished from KaMeRa
+        # entirely. An archived row keeps its place (and its cached
+        # preview, the only thing that can still render it) and reports
+        # lifecycle='archived' instead.
+        archived_keys = {
+            k for k, info in provenance_link.archive_info_many(
+                {r["provenance_key"] for r in rows if r["provenance_key"]}
+            ).items() if info.get("status") == "archived"
+        }
+        missing_ids = [
+            r["id"] for r in rows
+            if not Path(r["file_path"]).exists()
+            and r["provenance_key"] not in archived_keys
+        ]
         previews_removed = _delete_image_rows(missing_ids)
 
     return {

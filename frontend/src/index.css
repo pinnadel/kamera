@@ -432,3 +432,12 @@ body {
 .pca-day-picker .rdp-nav button:hover {
   background: rgba(255,255,255,0.06);
 }
+
+/* Archive fade — a photo leaving KaMeRa for the Luminar library desaturates
+   rather than vanishing. Deliberately slower than every other transition in
+   the system (400ms vs 120-180ms): a departure should be visible. */
+.archive-fade { transition: filter 400ms ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  .archive-fade { transition: none; }
+}

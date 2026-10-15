@@ -326,15 +326,28 @@ export function useGroupScrub({ suspended = false, topInset } = {}) {
     })
   }, [])
 
-  // Arrow-key step. Pins the pointer so a stationary cursor over the tile
-  // doesn't immediately undo it. No wrap at either end — the position bar
-  // shows where you are, and silently jumping to the far end of the burst
-  // after a decision would hide which frame you just acted on.
-  const stepIndex = useCallback((delta) => {
+  // Step the index. Pins the pointer so a stationary cursor over the tile
+  // doesn't immediately undo it.
+  //
+  // `wrap` is the caller's call because the two callers want opposite things:
+  //   · ARROW KEYS wrap. Walking a burst is a loop — running into a wall at
+  //     the last frame and having to hold ← back through the whole group to
+  //     re-check the first one is the kind of dead end the panel exists to
+  //     avoid.
+  //   · K/M/R do NOT. Their step is "judged that one, show me the next", and
+  //     silently jumping to the far end of the burst after a decision would
+  //     hide which frame you just acted on. Stopping at the last frame is the
+  //     honest answer there: you have reached the end of the group.
+  const stepIndex = useCallback((delta, { wrap = false } = {}) => {
     pinnedXRef.current = xRef.current
     setState(prev => {
       if (prev === null) return prev
-      const i = Math.min(prev.members.length - 1, Math.max(0, prev.index + delta))
+      const n = prev.members.length
+      if (n === 0) return prev
+      const raw = prev.index + delta
+      // Double modulo: JS's % keeps the sign of the dividend, so a plain
+      // `raw % n` returns -1 when stepping left off the front.
+      const i = wrap ? ((raw % n) + n) % n : Math.min(n - 1, Math.max(0, raw))
       if (i === prev.index) return prev
       return { ...prev, index: i }
     })

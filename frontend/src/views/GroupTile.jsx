@@ -1,7 +1,8 @@
 import { memo } from 'react'
+import { Check } from 'lucide-react'
 import { API } from '../api'
 import { middleTruncate } from '../ui/format'
-import { GroupOverlayChips, PartnerCountChips, GroupBulkBar } from '../ui/TileChips'
+import { GroupOverlayChips, GroupBulkBar } from '../ui/TileChips'
 import { SELECTION_RING, SELECTION_RING_STRONG } from '../ui/buttons'
 
 // GroupTile — a single grid cell standing in for the UNDECIDED remainder of a
@@ -176,32 +177,36 @@ function GroupTileImpl({ group, undecidedImages = [], isSelected, onSelect, onOp
 
 export const GroupTile = memo(GroupTileImpl)
 
-// DecidedGroupTile — a single grid cell standing in for a run of ≥2 same-
-// group photos that share the CURRENT decision view (Maybe or Reject).
+// DecidedGroupTile — a single grid cell standing in for the members of one
+// burst that landed in the CURRENT decision view (Keep, Maybe or Reject).
 //
 // Model: mirror of GroupTile, but for decided members instead of undecided
 // ones. Where GroupTile always shows the still-undecided remainder of a
 // burst, DecidedGroupTile shows the already-decided members visible in this
 // view — the run App.jsx's displayGridItems clustering pass already computes
-// (see the "Cluster + annotate group members" block, gated to
-// decisionFilter === 'reject' | 'maybe'). Reuses the same stacked-paper
-// chrome as GroupTile, but:
-//   - the footer names the decision ("Group · 3 maybes" / "Group · 2 rejects")
-//     instead of "N undecided";
+// (see the "Collapse burst members into group tiles" block, gated to
+// decisionFilter === 'keep' | 'maybe' | 'reject'). It renders for a run of
+// ONE too: a lone survivor is still a window onto its burst, and the peek
+// panel is now the only way to see where its groupmates went. Reuses the same
+// stacked-paper chrome as GroupTile, but:
+//   - the footer names the decision and states the burst's size when this
+//     bucket holds only part of it ("Group · 1 of 4 keeps");
 //   - the ring can carry the decision colour (unlike GroupTile, whose members
 //     are always undecided and thus always neutral);
-//   - the survivor chip (PartnerCountChips) and the bulk-action bar
-//     (GroupBulkBar) render on the tile itself — the same components already
-//     used when this run was exploded into individual ImageCards, just
-//     relocated onto the single collapsed tile;
+//   - the bulk-action bar (GroupBulkBar) renders on the tile itself, for a run
+//     of ≥2 — moving "all" of one photo is just a re-cull, which the peek
+//     panel's K/M/R already does;
+//   - in the Keeps view a mark-reviewed action rides along, because collapsing
+//     the run took away ImageCard's per-photo check button for the auto-culled
+//     keepers it now hides;
 //   - there is no "AI ranking" concept for decided photos, so no AI pulse
 //     chip — GroupOverlayChips renders with no prerankState;
-//   - opening the tile (double-click / Enter) goes to GroupPartnersOverlay,
-//     not GroupLoupe — these photos are already decided, so there's nothing
-//     to rank/cull, only to review/re-cull.
+//   - opening the tile (double-click / Enter) goes to DetailView carrying the
+//     burst, not GroupLoupe — these photos are already decided, so there's
+//     nothing to rank, only to look at properly and re-cull.
 function DecidedGroupTileImpl({
-  hero, images = [], decision, groupChip, runImageIds,
-  isSelected, onSelect, onOpen, onBulkDecide,
+  hero, images = [], members, decision, runImageIds, needsReviewIds,
+  isSelected, onSelect, onOpen, onBulkDecide, onMarkReviewed,
   showFilename = true,
   isSelectMode = false,
   isDropHover = false,
@@ -209,15 +214,29 @@ function DecidedGroupTileImpl({
   scrub,
 }) {
   // The peek walks the WHOLE burst, not just this view's bucket — seeing which
-  // members were culled differently is the point of it. groupChip.members is
-  // the full live member list, but it's only present when the group actually
-  // has survivors elsewhere; without one, the visible run IS the whole group.
-  const scrubMembers = groupChip?.members || images
+  // members were culled differently is the point of it. Falls back to the
+  // visible run if a caller doesn't supply the full list.
+  const scrubMembers = members?.length ? members : images
   if (!hero) return null
 
   const count = images.length
-  const decisionWord = decision === 'reject' ? 'rejects' : 'maybes'
-  const borderColorClass = decision === 'reject' ? 'border-[#C97B7B]' : 'border-[#E8B84A]'
+  const total = scrubMembers.length
+  // "3 of 5 rejects" whenever the rest of the burst went elsewhere — the fact
+  // the survivor chips used to carry, said once and without a second colour.
+  // The noun agrees with the number it follows, which in the "of" form is the
+  // TOTAL (always ≥2, so always plural): "1 of 4 keeps", never "1 of 4 keep".
+  const partial = count < total
+  const plural = partial || count !== 1
+  const decisionWord =
+    decision === 'reject' ? (plural ? 'rejects' : 'reject') :
+    decision === 'keep'   ? (plural ? 'keeps'   : 'keep')   :
+                            (plural ? 'maybes'  : 'maybe')
+  const countLabel = partial ? `${count} of ${total} ${decisionWord}` : `${count} ${decisionWord}`
+  const borderColorClass =
+    decision === 'reject' ? 'border-[#C97B7B]' :
+    decision === 'keep'   ? 'border-[#7DB89A]' :
+                            'border-[#E8B84A]'
+  const reviewCount = needsReviewIds?.length ?? 0
 
   // Ring: decision-coloured (matching ImageCard's own per-decision ring), with
   // selection/select-mode dimming taking the same priority order GroupTile
@@ -229,6 +248,8 @@ function DecidedGroupTileImpl({
     ringClass = SELECTION_RING
   } else if (decision === 'reject') {
     ringClass = 'ring-1 ring-[rgba(201,123,123,0.40)] hover:ring-[rgba(201,123,123,0.65)]'
+  } else if (decision === 'keep') {
+    ringClass = 'ring-1 ring-[rgba(125,184,154,0.40)] hover:ring-[rgba(125,184,154,0.65)]'
   } else {
     ringClass = 'ring-1 ring-[rgba(232,184,74,0.40)] hover:ring-[rgba(232,184,74,0.65)]'
   }
@@ -254,7 +275,7 @@ function DecidedGroupTileImpl({
       aria-disabled={disabled || undefined}
       className={`group/run relative block w-full text-left bg-transparent rounded-lg transition-[transform,opacity] ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       style={{ opacity }}
-      title={disabled ? 'Groups can’t be multi-selected — exit Select first' : `${count} ${decisionWord} in this group · click to peek · double-click to review`}
+      title={disabled ? 'Groups can’t be multi-selected — exit Select first' : `${countLabel} in this group · click to peek · double-click to review`}
     >
       <StackedPaperEdges />
 
@@ -269,15 +290,6 @@ function DecidedGroupTileImpl({
             />
             <GroupOverlayChips />
 
-            {groupChip && (
-              <div className="absolute bottom-1.5 left-1.5 z-20">
-                <PartnerCountChips
-                  counts={groupChip.counts}
-                  onOpen={onOpen}
-                />
-              </div>
-            )}
-
             {runImageIds && runImageIds.length > 0 && !isSelectMode && onBulkDecide && (
               <div className="absolute top-1.5 left-1.5 z-20 opacity-0 group-hover/run:opacity-100 transition-opacity">
                 <GroupBulkBar
@@ -287,13 +299,30 @@ function DecidedGroupTileImpl({
                 />
               </div>
             )}
+
+            {/* Mark-reviewed — the collapsed twin of ImageCard's hover check
+                button, releasing this group's auto-culled keepers to
+                Provenance. Hover-only and top-right, exactly where the
+                per-photo button sat before the run was collapsed. */}
+            {reviewCount > 0 && !isSelectMode && onMarkReviewed && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onMarkReviewed(needsReviewIds) }}
+                onDoubleClick={(e) => e.stopPropagation()}
+                title={`Mark ${reviewCount} reviewed — release to Provenance`}
+                className="absolute top-1.5 right-1.5 z-20 inline-flex items-center gap-1 h-6 px-2 rounded-full bg-[rgba(7,8,10,0.65)] ring-1 ring-[rgba(125,184,154,0.50)] text-[#7DB89A] text-[11px] font-semibold leading-none tabular-nums opacity-0 group-hover/run:opacity-100 hover:bg-[rgba(125,184,154,0.25)] transition-opacity"
+              >
+                <Check size={13} strokeWidth={2.5} />
+                {reviewCount}
+              </button>
+            )}
           </div>
 
           {showFilename && (
             <div className="px-2 py-1.5">
               <div className="h-[30px] space-y-0.5 overflow-hidden">
                 <p className="text-xs text-[#cecece] truncate leading-tight">
-                  <span className="text-[#9c9c9d]">Group · </span>{count} {decisionWord}
+                  <span className="text-[#9c9c9d]">Group · </span>{countLabel}
                 </p>
                 <p className="text-[10px] text-[#8a8b8c] truncate font-mono leading-tight" title={`Best pick: ${hero.filename}`}>
                   <span className="text-[#9c9c9d] font-sans">Best: </span>{middleTruncate(hero.filename)}

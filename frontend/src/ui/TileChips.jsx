@@ -8,49 +8,14 @@
 //     actively being ranked. Groups are the sole exception to "nothing on the
 //     image" — the identifier belongs where the eye lands, and a group tile only
 //     ever holds undecided members so it carries no decision chrome at all.
+//
+// PartnerCountChips ("2 Keeps", "1 Maybe") lived here until 2026-09-21. It
+// counted, on the tile, where the rest of a burst was culled — which the peek
+// panel now states on each frame as you scrub it, in the same palette. Two
+// places saying one thing, and on a burst's lone survivor the chip was also
+// the only way into the group at all. Both jobs moved to the panel.
 
 import { Layers } from 'lucide-react'
-
-// PartnerCountChips — how the surviving members of this photo's original burst
-// were decided. Shown ONCE per group (on the run's first tile) at the border's
-// lower-left in the Rejects/Maybes views, so the user can confirm a groupmate
-// survived before trusting a cull. One worded pill per non-zero survivor bucket,
-// e.g. "2 Keeps", "1 Maybe" — pluralized. The whole cluster is a button that
-// opens the group-partners overlay (which lists the differently-culled photos
-// and lets the user re-cull). Colors mirror the canonical decision palette.
-const PARTNER_CHIP_STYLES = {
-  keep:   { bg: 'rgba(125,184,154,0.22)', fg: '#7DB89A', singular: 'Keep',  plural: 'Keeps' },
-  maybe:  { bg: 'rgba(232,184,74,0.22)',  fg: '#E8B84A', singular: 'Maybe', plural: 'Maybes' },
-  reject: { bg: 'rgba(201,123,123,0.22)', fg: '#C97B7B', singular: 'Reject', plural: 'Rejects' },
-}
-
-export function PartnerCountChips({ counts, onOpen }) {
-  if (!counts) return null
-  const chips = ['keep', 'maybe', 'reject'].filter(kind => (counts[kind] || 0) > 0)
-  if (chips.length === 0) return null
-  return (
-    <button
-      type="button"
-      onClick={(e) => { e.stopPropagation(); onOpen?.() }}
-      className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity"
-      title="See which group members were culled differently — click to review or re-cull"
-    >
-      {chips.map(kind => {
-        const s = PARTNER_CHIP_STYLES[kind]
-        const n = counts[kind]
-        return (
-          <span
-            key={kind}
-            className="inline-flex items-center h-[18px] px-1.5 rounded bg-[rgba(7,8,10,0.55)] backdrop-blur-sm text-[10px] font-semibold leading-none tabular-nums"
-            style={{ color: s.fg, boxShadow: `inset 0 0 0 1px ${s.bg}` }}
-          >
-            {n} {n === 1 ? s.singular : s.plural}
-          </span>
-        )
-      })}
-    </button>
-  )
-}
 
 // GroupBulkBar — a hover-revealed action row for a group run in the Rejects /
 // Maybes grid. Answers "move this whole visible group at once" without opening

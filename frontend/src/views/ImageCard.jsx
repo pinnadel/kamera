@@ -141,6 +141,21 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
 
   const sub = subfolderLabel(image)
 
+  // Lifecycle — where a keeper is on its way out of KaMeRa. `staged` looks
+  // like any other keep (it is still working material); `archived` and
+  // `backed_up` mean the file has left for the Luminar library and only the
+  // cached preview can still render it.
+  //
+  // Desaturation is the glanceable channel, the folder name in the footer is
+  // the accessible one. Colour alone never carries state here — the same
+  // rule the decision glyph exists for. Safe next to the reject treatment
+  // because lifecycle is keep-only: an archived tile always wears the sage
+  // ring, a rejected one always coral.
+  const archived = image.lifecycle === 'archived' || image.lifecycle === 'backed_up'
+  const archiveFolder = archived && image.archived_path
+    ? image.archived_path.split('/').slice(-2, -1)[0] || null
+    : null
+
   // Decision-tint for the footer strip. Shared by the filename footer (as its
   // background) and the thin no-filename strip on the All view.
   const decisionTint =
@@ -218,11 +233,15 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
       <div className="bg-[#07080a] aspect-[4/3] flex items-center justify-center overflow-hidden relative">
         <img
           src={`${API}/previews/${image.id}`}
-          alt={decisionWord ? `${image.filename} — ${decisionWord}` : image.filename}
+          alt={[image.filename, decisionWord,
+                archived ? (image.lifecycle === 'backed_up'
+                  ? 'archived and backed up' : 'archived') : null]
+                .filter(Boolean).join(' — ')}
           loading="lazy"
           onLoad={() => setLoaded(true)}
           onError={() => setLoaded(true)}
-          className="max-h-full max-w-full object-contain"
+          className="max-h-full max-w-full object-contain archive-fade"
+          style={archived ? { filter: 'saturate(0.35)' } : undefined}
         />
         {/* Decision glyph — bottom-right, All view only. Redundant with the
             ring/footer/bar colour on purpose (colour-blind safe). */}
@@ -260,7 +279,7 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); onMarkReviewed(image.id) }}
-            title="Mark reviewed — release to Provenance"
+            title="Release to the archive — moves this photo into your Luminar library"
             className="absolute top-1.5 right-1.5 z-10 inline-flex items-center justify-center h-6 w-6 rounded-full bg-[rgba(7,8,10,0.65)] ring-1 ring-[rgba(125,184,154,0.50)] text-[#7DB89A] opacity-0 group-hover:opacity-100 hover:bg-[rgba(125,184,154,0.25)] transition-opacity"
           >
             <Check size={13} strokeWidth={2.5} />
@@ -284,11 +303,22 @@ function ImageCardImpl({ image, isSelected, isMultiSelected = false, isSelectMod
       {showFilename && (
         <div className="px-2 py-1.5" style={{ backgroundColor: decisionTint }}>
           <div className="h-[30px] space-y-0.5 overflow-hidden">
-            {sub && (
+            {archiveFolder ? (
+              <p className="text-[10px] font-mono text-[#7DB89A] truncate leading-tight flex items-center gap-1"
+                 title={`Archived to ${image.archived_path}${image.lifecycle === 'backed_up' ? ' · in a Time Machine backup' : ''}`}>
+                <span
+                  aria-hidden="true"
+                  className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                    image.lifecycle === 'backed_up' ? 'bg-[#7DB89A]' : 'border border-[#7DB89A]'}`}
+                />
+                {archiveFolder}
+                {image.lifecycle === 'backed_up' ? ' · backed up' : ''}
+              </p>
+            ) : sub ? (
               <p className="text-[10px] font-mono text-[#5BB8D4] truncate leading-tight" title={`Subfolder: ${sub}`}>
                 {sub}/
               </p>
-            )}
+            ) : null}
             <p className="text-xs text-[#9c9c9d] truncate font-mono leading-tight" title={image.filename}>
               {/* Middle-truncate the filename so both the date prefix and the
                   frame-number suffix stay visible. Skip it while a filename

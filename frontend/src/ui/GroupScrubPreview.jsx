@@ -20,10 +20,10 @@ import { API } from '../api'
 // It is dismissed by Esc, by a click anywhere outside it, or by clicking its
 // own tile again — not by moving the pointer away. It is a pinned surface.
 //
-// While it's on screen the panel OWNS the keyboard — ←/→ step the burst,
-// K/M/R re-cull the shown frame and advance to the one on its right, U /
-// Cmd+Z takes the last one back, Space/Enter opens it in DetailView, Esc
-// closes. useKeyboard.js backs off wholesale for as long as the panel is up
+// While it's on screen the panel OWNS the keyboard — ←/→ step the burst and
+// wrap around its ends, K/M/R re-cull the shown frame and advance to the one
+// on its right (stopping at the last, not wrapping), U / Cmd+Z takes the last
+// one back, Space/Enter opens it in DetailView, Esc closes. useKeyboard.js backs off wholesale for as long as the panel is up
 // (its `scrubOpen` gate); without that both layers answer the same keypress
 // and fire two competing /decision posts for one press.
 //
@@ -40,6 +40,7 @@ const PAD           = 10   // panel inner padding
 const BAR_H         = 15   // position bar: active segment height (was 5)
 const BAR_BLOCK     = BAR_H + 8   // position bar + its top margin
 const ACTION_BLOCK  = 30   // action row + its top margin
+const SWEEP_BLOCK   = 30   // group-wide sweep row + its top margin (when shown)
 
 // The panel is sized to FILL whichever side of the tile has more room — the
 // whole point of a peek is seeing the frame big enough to judge, and a fixed
@@ -89,9 +90,11 @@ function uiScaleZoom() {
 }
 
 // place — centre the panel on the tile, keep it fully on screen, prefer
-// hanging below. Same below-else-flip-above rule as ui/primitives.jsx's
+// hanging below. `hasSweepRow` is part of the height budget, not cosmetic: the
+// sweep row only renders for a burst with undecided frames, and a panel sized
+// without it would push that row past the fold on exactly those bursts. Same below-else-flip-above rule as ui/primitives.jsx's
 // placePopover, but centred rather than left-aligned, and it aims a caret.
-function place(rect, zoom) {
+function place(rect, zoom, hasSweepRow) {
   // Viewport expressed in fixed space (see uiScaleZoom).
   const vw = window.innerWidth  / zoom
   const vh = window.innerHeight / zoom
@@ -104,7 +107,7 @@ function place(rect, zoom) {
 
   // Vertical: the largest image each side could seat without crossing a fold.
   // + 4: the panel's and the image box's 1px borders, which sit outside imageHeight.
-  const chrome = PAD * 2 + BAR_BLOCK + ACTION_BLOCK + 4
+  const chrome = PAD * 2 + BAR_BLOCK + ACTION_BLOCK + (hasSweepRow ? SWEEP_BLOCK : 0) + 4
   const roomBelow = vh - bottom0 - GAP - MARGIN - chrome
   const roomAbove = top0 - GAP - MARGIN - chrome
 
@@ -176,6 +179,7 @@ function ActionButton({ tint, active, disabled, title, onClick, children }) {
         display: 'inline-flex',
         alignItems: 'center',
         gap: 4,
+        flexShrink: 0,
         borderRadius: 6,
         border: 'none',
         backgroundColor: active ? `${tint}26` : 'rgba(255,255,255,0.04)',
@@ -197,6 +201,10 @@ function ActionButton({ tint, active, disabled, title, onClick, children }) {
 export function GroupScrubPreview({
   anchorRect, members, index, onDecide, onSwap,
   onScrubTo, onStep, onClose, onUndo, onOpenDetail,
+  // Sweep every still-undecided frame of the burst into one bucket.
+  // (ids, 'maybe' | 'reject') => void. The caller closes the panel, asks for
+  // confirmation and offers the undo — this component only names the frames.
+  onSweepUndecided,
   // Which member is the group's pick, and whether that pick is an actual
   // vision-LLM ranking (backend/routers/model.py::_annotate_prerank_state)
   // rather than the score-based fallback. Only the former earns the
@@ -246,9 +254,14 @@ export function GroupScrubPreview({
     if (active) onOpenDetail?.(active.id)
   }, [active, onOpenDetail])
 
-  useHotkeys('arrowRight', (e) => { e.preventDefault(); onStep?.(+1) },
+  // Arrows WRAP: → off the last frame lands on the first, ← off the first
+  // lands on the last. A burst is a ring you circle while making up your mind,
+  // and stopping dead at the end meant holding ← back through the whole group
+  // to re-check the frame you started from. K/M/R deliberately do not wrap —
+  // see stepIndex in hooks/useGroupScrub.js.
+  useHotkeys('arrowRight', (e) => { e.preventDefault(); onStep?.(+1, { wrap: true }) },
     { enabled: open, enableOnFormTags: false }, [open, onStep])
-  useHotkeys('arrowLeft',  (e) => { e.preventDefault(); onStep?.(-1) },
+  useHotkeys('arrowLeft',  (e) => { e.preventDefault(); onStep?.(-1, { wrap: true }) },
     { enabled: open, enableOnFormTags: false }, [open, onStep])
 
   useHotkeys('k', () => decideAndAdvance('keep'),   { enabled: open }, [open, decideAndAdvance])
@@ -265,8 +278,17 @@ export function GroupScrubPreview({
 
   if (!open || !active) return null
 
+  // The frames the group-wide sweeps reach. Deliberately narrower than
+  // GroupLoupe's "Reject whole group": a Keep, Maybe or Reject already on a
+  // frame is a judgement the user made, and a sweep must never overwrite one.
+  // So this reaches only the frames still sitting in no bucket at all — which
+  // is also what makes the undo exact, since every affected frame's prior
+  // state was the same one thing: undecided.
+  const undecided = members.filter(m => !m.decision)
+  const canSweep  = undecided.length > 0 && !!onSweepUndecided
+
   const zoom = uiScaleZoom()
-  const p = place(anchorRect, zoom)
+  const p = place(anchorRect, zoom, canSweep)
   const activeTone = DECISION[active.decision]
   const borderColor = activeTone ? activeTone.color : HAIRLINE
 
@@ -430,9 +452,11 @@ export function GroupScrubPreview({
         })}
       </div>
 
-      {/* Action row. Left: re-cull this frame outright. Right: exchange places
-          with the burst's occupant of another bucket, which leaves the bucket
-          counts untouched — "this frame deserves the Keep slot, not that one". */}
+      {/* Action row — everything here acts on the ONE frame on screen. Left:
+          re-cull it outright. Right: exchange places with the burst's occupant
+          of another bucket, which leaves the bucket counts untouched — "this
+          frame deserves the Keep slot, not that one". Group-wide actions live
+          on their own row below. */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 8, height: 22 }}>
         {ORDER.map(kind => (
           <ActionButton
@@ -477,6 +501,45 @@ export function GroupScrubPreview({
           )
         })}
       </div>
+
+      {/* Sweep row — the only controls here that act on the whole burst, so
+          they get their own line rather than sitting at the end of the
+          per-frame row. Two buttons side by side in the same tints as the row
+          above would otherwise read as "this frame", and the difference
+          between culling one photo and culling five is not a difference to
+          leave to a label. Both ask for confirmation (App.jsx's
+          groupSweepConfirm) before anything moves. */}
+      {canSweep && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          marginTop: 8, height: 22,
+        }}>
+          <span style={{
+            fontSize: 11,
+            fontWeight: 500,
+            color: 'rgba(255,255,255,0.45)',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          }}>
+            {undecided.length} undecided in this group
+          </span>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+            {['maybe', 'reject'].map(kind => (
+              <ActionButton
+                key={kind}
+                tint={DECISION[kind].color}
+                title={`Move the ${undecided.length} frame${undecided.length === 1 ? '' : 's'} you haven't judged yet to ${DECISION[kind].label}. Your Keeps, Maybes and Rejects are left alone.`}
+                onClick={() => onSweepUndecided?.(undecided.map(m => m.id), kind)}
+              >
+                <span style={{ whiteSpace: 'nowrap' }}>
+                  {DECISION[kind].label} all undecided
+                </span>
+              </ActionButton>
+            ))}
+          </div>
+        </div>
+      )}
     </div>,
     document.body,
   )

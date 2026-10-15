@@ -28,8 +28,9 @@ import {
 //   EXIF, only metrics in `visibleMetrics` are rendered. Empty groups hide
 //   their headline + divider.
 // The leading direction toggle (↓/↑ arrow) flips dir without opening the
-// menu — clicking the label opens it. Sibling `Sort: <name>` text loses its
-// trailing direction glyph; direction lives only in the leading icon now.
+// menu — clicking the label opens it. Inside the menu, clicking the row that
+// is already the active sort flips the direction too and leaves the menu
+// open, so "newest → oldest" is a second click on the same row.
 export function SortPill({
   sortField,
   sortDir,
@@ -60,12 +61,24 @@ export function SortPill({
   // Closing the L1 menu always collapses L2 too.
   const closeAll = () => { setScoreOpen(false); onClose() }
 
-  // Pick a metric → close the whole stack. Direction is preserved (no reset
-  // on field change).
+  // A row is the direction toggle for its own field. Clicking the field that
+  // is already active flips desc↔asc and keeps the menu open, so the order can
+  // be reversed by clicking the same row again — the leading pill arrow was
+  // the only way to do it, and the greyed "Newest ↓" readout in each row read
+  // as a control while doing nothing. Picking a *different* field selects it
+  // and closes the stack, direction preserved.
   const pickField = (field) => {
+    if (field === sortField) { onToggleDir(); return }
     onSelectField(field)
     closeAll()
   }
+
+  // Row tooltip: on the active row it explains the flip, elsewhere it names
+  // what the row will produce with the direction currently in force.
+  const rowTitle = (field) =>
+    field === sortField
+      ? getDirectionTooltip(field, sortDir)
+      : `Sort by ${getMetricLabel(field).toLowerCase()} — ${getDirectionShort(field, sortDir).toLowerCase()} first`
 
   const visibleSet = new Set(visibleMetrics)
   const groupedMetrics = SCORE_GROUPS.map(group => ({
@@ -111,12 +124,16 @@ export function SortPill({
               key={field}
               onClick={() => pickField(field)}
               onMouseEnter={() => setScoreOpen(false)}
-              className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between gap-3 ${
-                sortField === field ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
+              title={rowTitle(field)}
+              aria-label={rowTitle(field)}
+              className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between gap-3 hover:opacity-70 ${
+                sortField === field ? 'text-[#f9f9f9]' : 'text-[#8a8b8c]'
               }`}
             >
               <span>{label}</span>
-              <span className="text-xs text-[#8a8b8c] whitespace-nowrap">
+              <span className={`text-xs whitespace-nowrap ${
+                sortField === field ? 'text-[#cecece]' : 'text-[#8a8b8c]'
+              }`}>
                 {getDirectionShort(field, sortDir)} {DIR_GLYPH[sortDir]}
               </span>
             </button>
@@ -154,12 +171,16 @@ export function SortPill({
                         <button
                           key={metric.id}
                           onClick={() => pickField(metric.id)}
-                          className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between gap-3 ${
-                            sortField === metric.id ? 'text-[#f9f9f9]' : 'text-[#8a8b8c] hover:opacity-70'
+                          title={rowTitle(metric.id)}
+                          aria-label={rowTitle(metric.id)}
+                          className={`w-full text-left px-3 py-1.5 text-xs transition-opacity flex items-center justify-between gap-3 hover:opacity-70 ${
+                            sortField === metric.id ? 'text-[#f9f9f9]' : 'text-[#8a8b8c]'
                           }`}
                         >
                           <span>{metric.label}</span>
-                          <span className="text-xs text-[#8a8b8c] whitespace-nowrap">
+                          <span className={`text-xs whitespace-nowrap ${
+                            sortField === metric.id ? 'text-[#cecece]' : 'text-[#8a8b8c]'
+                          }`}>
                             {getDirectionShort(metric.id, sortDir)} {DIR_GLYPH[sortDir]}
                           </span>
                         </button>

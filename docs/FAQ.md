@@ -177,6 +177,15 @@ order instead (sharpest face → eyes open → sharpest frame → IQA → aesthe
 overall), which can't see any of that. On this library the two disagree in
 **29 of 41** groups, so it is not a tiebreaker — it changes the outcome.
 
+**Is the AI's choice actually better?** Measured against a folder of photos you
+really did export from the same shoot — 28 groups, both methods choosing from
+the same candidates: the AI picks a photo you kept in **32%** of groups against
+the score order's **18%**, and ranks your photo a little over one position
+higher on average (mean rank 2.07 vs 3.29; Wilcoxon p = 0.003). Across the whole
+cull, 35% of groups are won by a photo you wanted, up from 24%. So: better, and
+still only right about a third of the time — which is why a burst's non-winners
+go to Maybe rather than straight to Reject.
+
 **Only contested groups are ranked**, because a fresh rank costs about a minute:
 
 - The group needs **3+ photos** (the same floor the background pre-ranker uses).
@@ -751,45 +760,59 @@ of cosine. See [backend/routers/model.py](../backend/routers/model.py)
 Two places, both acting on the group members *you can currently see* — a
 survivor culled into a different bucket is left alone:
 
-- **In the grid** (Maybes or Rejects view): hover the amber/coral-bordered
-  run and a small action bar appears at its top-left — "Keep all" and
-  "Reject all" on the Maybes view, "Keep all" / "Maybe all" on the Rejects
-  view (it only offers the two decisions that aren't the one you're
-  looking at). One click moves every visible member of that run.
-- **In the "Group members" overlay** (opened by clicking the survivor chip,
-  e.g. "1 Keep"): each section header (Keeps / Maybes / Rejects) with two or
-  more photos gets the same "…all" buttons, so you can move a whole bucket
-  without touching each row.
+- **In the grid** (Keeps, Maybes or Rejects view): hover the group tile and a
+  small action bar appears at its top-left — it offers the two decisions that
+  aren't the one you're looking at ("Keep all" / "Maybe all" on Rejects, and
+  so on). One click moves every member of that burst visible in this view.
+  It only appears when the view holds **two or more** members of the burst:
+  moving "all" of a single photo is just a re-cull, which the peek panel's
+  K/M/R already does on the frame itself.
+- **In the peek panel** (click any group tile): scrub to a frame and press
+  K/M/R to re-cull that one photo, wherever its groupmates ended up.
 
 Both route through the same undoable `bulkDecide` batch path (one round-trip,
 one Undo entry), so `U` / Cmd+Z reverses the whole move. The grid bar hangs on
-the run's first tile via `runImageIds`; controls live in
-[frontend/src/ui/TileChips.jsx](../frontend/src/ui/TileChips.jsx) `GroupBulkBar`
-and [frontend/src/modals/GroupPartnersOverlay.jsx](../frontend/src/modals/GroupPartnersOverlay.jsx)
-`SectionBulkBar`.
+the tile via `runImageIds`; the control lives in
+[frontend/src/ui/TileChips.jsx](../frontend/src/ui/TileChips.jsx) `GroupBulkBar`.
+
+*(Before 2026-09-21 the second route was a "Group members" overlay opened from a
+survivor chip. Chip and overlay are both gone — see the next entry.)*
 
 ### Why do burst frames look ungrouped in the Keeps view?
 
-They aren't — the **Keeps view deliberately doesn't draw groups**. Three gates
-in [frontend/src/App.jsx](../frontend/src/App.jsx) stack up:
+**They no longer do** (changed 2026-09-21). Keeps, Maybes and Rejects all draw
+the same group tiles now, and they behave identically: click to peek the whole
+burst, double-click (or Enter/Space) to open it in DetailView.
 
-1. `gridItems` ([App.jsx:896](../frontend/src/App.jsx#L896)) emits a `group`
-   tile only from *undecided* members. Any decided photo becomes an
-   individual `{type:'image'}` card, so a fully-culled burst produces zero
-   group tiles.
-2. `displayGridItems` ([App.jsx:1009](../frontend/src/App.jsx#L1009)) drops
-   surviving group tiles under any decision filter other than Undecided.
-3. The re-clustering pass that rebuilds a visual enclosure for *decided*
-   photos (`DecidedGroupTile` + survivor chip) is gated to
-   `reject`/`maybe` only ([App.jsx:1064](../frontend/src/App.jsx#L1064)).
+Before that date the Keeps view deliberately drew no groups. Two gates in
+[frontend/src/App.jsx](../frontend/src/App.jsx) still shape what you see, and
+one was removed:
 
-The rationale: on Rejects/Maybes you want to confirm "did a groupmate
-survive?", which is what the chip answers. On Keeps every member already
-survived, so there was nothing to reassure you about. Consequence: the Keeps
-view is the one place where burst membership is invisible.
+1. `gridItems` emits a `group` tile only from *undecided* members. Any decided
+   photo becomes an individual `{type:'image'}` card, so a fully-culled burst
+   produces zero undecided group tiles. (Unchanged.)
+2. `displayGridItems` drops surviving undecided group tiles under any decision
+   filter other than Undecided. (Unchanged.)
+3. The pass that rebuilds a group tile for *decided* photos used to be gated to
+   `reject`/`maybe`. It now runs for `keep` too, and its rule is **burst
+   membership rather than run length**: any photo belonging to a multi-photo
+   burst gets a tile, even when this bucket holds only one member of it. See
+   the "Collapse burst members into group tiles" block.
 
-To see the real grouping, switch the filter to **All** or **Undecided**, or
-open the group in GroupLoupe. To verify from the outside:
+The old rationale was that on Rejects/Maybes you want to confirm "did a
+groupmate survive?" — which a survivor chip ("2 Keeps", "1 Maybe") answered —
+whereas on Keeps every member already survived. That reasoning had two holes:
+the Keeps view was then the one place burst membership was invisible, and on a
+burst's *lone* survivor the chip was the only way into the group at all. The
+peek panel already walks the whole burst and states each frame's bucket on the
+frame itself, so the chips said the same thing twice. Chips and the
+`GroupPartnersOverlay` modal were both deleted; the panel and DetailView are the
+only group surfaces in the decided views.
+
+The tile footer carries what the chip used to: "Group · 1 of 4 keeps" means
+three groupmates went somewhere else. Scrub the panel to see where.
+
+To see the underlying clustering from the outside:
 
 ```bash
 curl -s "localhost:8000/similarity-groups?threshold=0.90&time_gap_seconds=60" \

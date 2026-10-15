@@ -4,6 +4,151 @@ Historical sprint log moved out of CLAUDE.md on 2026-05-12 to keep the project's
 
 ---
 
+## One group view in every decided bucket (2026-09-21)
+
+Keeps, Maybes and Rejects now draw the same group tile and it behaves the same
+in all three: click peeks the whole burst in `GroupScrubPreview`, double-click
+(or Enter/Space) opens it in DetailView. Keeps had no grouping at all — the
+clustering pass in `displayGridItems` was gated to `reject`/`maybe`, so the one
+view where every member survived was also the one where burst membership was
+invisible.
+
+**The collapse rule changed from run length to burst membership.** A photo gets
+a group tile because it belongs to a multi-photo burst, not because ≥2 of its
+groupmates share this bucket. A burst's lone survivor is still a window onto
+its burst — and, before this, the only way to reach that burst was a chip.
+
+**`PartnerCountChips` and `GroupPartnersOverlay` are both deleted.** The chips
+("2 Keeps", "1 Maybe") counted on the tile where the rest of a burst was culled;
+the peek panel already walks the whole burst and states each frame's bucket on
+the frame itself, in the same palette. Two surfaces saying one thing, and on a
+lone survivor the chip doubled as the only entrance. The tile footer carries the
+fact instead — "Group · 1 of 4 keeps" — and the panel plus DetailView are now
+the only group surfaces in the decided views. That removed 481 lines of modal.
+
+Consequences worth naming:
+
+- **DetailView's grid filmstrip no longer skips decided groups.** It used to
+  render them as a dimmed, unclickable placeholder, which was survivable while
+  only Maybes/Rejects collapsed; once Keeps collapses too, skipping would walk
+  past most of the view. A decided group is now an ordinary stop that selects
+  its hero — no loupe affordances, because decided photos have nothing to rank.
+  `selectedGridIdx` and `filmstripIndex` both gained a second lookup for a photo
+  that is only present as a *member* of a collapsed tile, so closing DetailView
+  still lands the grid cursor on a cell.
+- **Collapsing the Keeps view hid ImageCard's per-photo "mark reviewed" check
+  button**, so `DecidedGroupTile` carries the same action for the auto-culled
+  keepers it now hides (hover, top-right, with the count). Empty in every other
+  view — `needsReview()` is keep-only.
+- `GroupBulkBar` stays, but only on a tile holding ≥2 members of this bucket.
+  Moving "all" of one photo is just a re-cull, which the panel's K/M/R does.
+- The shared group-run border overlay, `groupRun`, `groupChip` and
+  `ImageCard`'s `inGroupBorder` call site are gone with it: in a decided view an
+  `{type:'image'}` item is now always an ungrouped photo.
+
+**Arrows wrap around the burst** (same day). `←`/`→` in the peek panel used to
+stop dead at the ends, so re-checking the first frame after reaching the last
+meant holding `←` back through the whole group. `stepIndex` grew an opt-in
+`{ wrap }` and the arrow keys pass it. **K/M/R deliberately still clamp**: their
+step means "judged that one, show me the next", and silently jumping to the far
+end of the burst after a decision would hide which frame you just acted on.
+Stopping there is the honest answer — you have reached the end of the group.
+
+
+## Sort direction is reachable from the sort menu (2026-09-21)
+
+"Oldest first" had exactly one control: the small ↓ arrow on the left of the
+Sort pill. The menu itself showed `Newest ↓` and `Z → A ↓` in grey next to
+each field — text that reads like a control and did nothing. Clicking `Date`
+while Date was already the sort re-selected Date and closed the menu, so the
+one gesture a user reaches for produced no visible change at all.
+
+**A row is now the direction toggle for its own field.** Clicking the field
+that is already active flips desc↔asc and **leaves the menu open**, so
+reversing is a second click on the same row; the readouts in every row update
+in place. Clicking a *different* field still selects it and closes the stack,
+direction preserved — the existing pick-and-go flow is untouched, and so is
+the pill arrow.
+
+The order logic itself was never broken: `compareImages` reverses strings via
+`localeCompare` and numbers via subtraction, and `shot_at` is stored as
+`YYYY-MM-DD HH:MM:SS`, which sorts lexicographically. This was a missing
+affordance, not a comparator bug — worth stating because the bug report read
+as "sorting doesn't work".
+
+Every row (L1 Date/Name and the L2 score metrics) also gained a `title` +
+`aria-label`: the flip sentence on the active row, `Sort by <field> —
+<direction> first` elsewhere. The active row's direction readout brightens to
+`#cecece` so it reads as live rather than disabled, and all rows now carry
+`hover:opacity-70` — the active one previously had no hover response, which
+was half the reason it didn't look clickable.
+
+[frontend/src/ui/SortPill.jsx](../frontend/src/ui/SortPill.jsx)
+
+---
+
+## One surface: the import is visible, and an archived photo stays (2026-09-21)
+
+The UI half of the seam, planned in `docs/PLAN-import-ui.md` and built the
+same day. The rule it follows: **Provenance is the sensor and the hands,
+KaMeRa is the only screen**, and feedback volume follows *reversibility*, not
+importance — modal is reserved for the irreversible.
+
+**The import is now visible while it runs.** `usePolling` reads
+`/import-status` alongside the three endpoints it already polled, and
+`onImportStatus` derives the run onto whichever tab's folder it is filling.
+Derived every tick, never stored: tabs are rebuilt from `GET /folders`, so
+there is nothing that could resurrect a finished run as a live one. A tab
+appears on its own for a moving run but **does not steal focus** — if you are
+culling something else, an import arrives as a tab with a chip.
+
+**A copy bar with a real denominator.** Unlike the watch-live bar, an import
+knows its total from the first second: the card was read before the copy
+started. The grid holds placeholder tiles for the photos that haven't landed,
+reusing the trailing-skeleton block that already existed for running batches.
+The difference between "it's running" and "it'll take this long" is the
+denominator; everything else is decoration.
+
+**`lifecycle` on every photo** — `staged` → `archived` → `backed_up`, derived
+per request from one cached ledger snapshot
+(`provenance_link.annotate_lifecycle`), keep-only because a maybe or a reject
+never leaves for the library. `staged` is the state the old completion dialog
+called "archived".
+
+**An archived photo stops vanishing.** `sync_folder` dropped every row whose
+file was missing — which is exactly what Provenance's archive move produces,
+seconds later. That one predicate is why an archived photo disappeared from
+KaMeRa entirely, cached preview and all. It now spares archived rows, and the
+tile desaturates (400ms, slower than every other transition in the app — a
+departure should be visible) and names the year folder in its footer. **No new
+chip:** DESIGN.md §4.2 keeps ImageCard's vocabulary deliberately tiny, and
+lifecycle is not a decision, so it does not borrow decision chrome. The folder
+name is the accessible channel, the desaturation the glanceable one, and the
+alt text carries it too.
+
+**"Hide archived"** is one opt-in pill, offered only in the Keep view and only
+when there is something to hide. No new IA: an archived photo keeps
+`decision='keep'` and belongs in the view that answers "what did I keep". The
+predicate is folded into the existing combined pass, not run as a second
+flatMap — sequential passes miscount group entries.
+
+**"Mark all reviewed" → "Release to archive".** Named for the consequence
+instead of the bookkeeping. The old wording described what the database
+records; what actually happens is that the photo leaves KaMeRa for the Luminar
+library. That gap is how a completion dialog could claim photos were archived
+while they sat in `_Keeps`.
+
+**No hotkey for releasing** — deliberately. `a` is already `runBatch('reject')`
+in GroupLoupe, and a key meaning "reject all" in one view and "irreversibly
+archive" in another is a hazard. More to the point, a one-keystroke,
+no-confirmation, bulk, irreversible action is the loudest possible affordance
+for the most dangerous operation in the app.
+
+Guarded by `tests/test_archived_rows_survive.py` — including the narrow half:
+a genuinely deleted photo is still reaped.
+
+---
+
 ## KaMeRa can read Provenance back (2026-09-21)
 
 The relationship with Provenance (`~/dev/provenance`) was one-way. Its
@@ -54,6 +199,55 @@ needed — the ledger is just another process's SQLite file).
 
 ---
 
+## Validating the AI winner against a real manual cull (2026-09-21, evening)
+
+The 2026-09-21 feature was justified by "the LLM picks a different winner than
+the scores in 71% of groups". Different is not better. A folder of the user's
+**actual** keepers from the same shoot (83 exported photos, 75 of them in the
+analysed set) made the real question answerable: when auto-cull has to choose one
+frame out of a burst, whose choice lands closer to his?
+
+**Method.** For every similarity group of 3+ that contains one of his keepers and
+has a cached ranking, both methods choose from the **same candidate set** — every
+frame the ranker gave a standing to. Judging the heuristic on the full group
+while the AI only sees its pre-filtered subset would compare two different tasks
+(the same fairness trap as `_bootstrap_validate`'s fixed-vs-calibrated cutoffs).
+n = 28 groups.
+
+| | picks a photo he kept | mean rank of his pick | median |
+|---|---|---|---|
+| score heuristic | 5/28 (18%) | 3.29 | 3 |
+| **AI ranking** | **9/28 (32%)** | **2.07** | **2** |
+
+Top-1 agreement is directional but underpowered — 6 groups the AI alone got
+right against 2 for the scores, McNemar exact **p = 0.289**. The rank of his pick
+uses all 28 pairs instead of only the discordant ones and is decisive: the AI
+ranks his photo higher in **17** groups, lower in 3, tied in 8 — Wilcoxon
+signed-rank **p = 0.0028 two-sided**. The AI moves his chosen frame a little over
+one position closer to the top.
+
+So the answer is yes, and the honest size of it: the winner is meaningfully
+closer to his taste, but it is still only the right photo a third of the time.
+Within the whole cull that is worth 4 extra groups out of 37 (24% → 35%).
+
+**Two instrument errors caught on the way, both of which had produced a clean and
+completely wrong finding first:**
+- The folder is `jpeg_priority`, so 1140 of its 2397 `images` rows are unscored
+  RAF stubs. An embedding query filtered to `.RAF` returned 11 of 1150 vectors
+  and reported "0 of 24 rejected keepers had a similar frame survive". Against
+  the scored rows the truth is **19 of 24** — auto-cull kept the moment and
+  chose a different frame. Only 5 moments are actually lost.
+- On a cache hit, `rank_burst` returns `evaluated_ids` as the post-dedup **rep**
+  set while the `rankings` payload carries the absorbed near-duplicates too.
+  Testing membership against `evaluated_ids` dropped 7 groups as "your pick was
+  never ranked", including groups of 4, 5 and 6 that the top-8 pre-filter cannot
+  have touched — the size that gave it away. Corrected sample: 22 → 28.
+
+Recorded because the 71% number alone would have justified this feature on
+novelty. See [docs/FAQ.md](FAQ.md) for the user-facing version.
+
+---
+
 ## Auto-cull: one denominator, and a cull that starts itself (2026-09-21, later)
 
 Two follow-ups from using the feature above on a real 1257-photo import.
@@ -72,10 +266,15 @@ stops redoing the cheap pass. Pinned by two tests, one of which asserts the
 `"total": len(pending)` call site directly.
 
 **The preview's counts are pre-ranking, and now say so.** Measured on the same
-folder (2397 rows, warm cache): AI winners move **11 photos (0.5%)** between
-buckets and the totals by **≤2** (keep 245→246, maybe 44→45, reject 2108→2106).
-So the honest line is that ranking changes *which* photo of a group is kept far
-more than *how many* — which is what the modal now says.
+folder (1257 analysed photos, warm cache): AI winners move **11 photos (0.9%)**
+between buckets and the totals by **≤2** (keep 245→246, maybe 44→45, reject
+968→966). So the honest line is that ranking changes *which* photo of a group is
+kept far more than *how many* — which is what the modal now says.
+
+(The folder holds 2397 `images` rows but only 1257 carry scores: it was analysed
+in `jpeg_priority` mode, so 1140 RAF rows are unscored `skipped` stubs. Measuring
+against the row count instead of the analysed count understates every rate — the
+first cut of this number read 0.5% and a reject total of 2108.)
 
 **Analyse → cull, unattended.** New per-tab toggle (Tab settings → *Cull when
 analysis finishes*), armed per folder in `frontend/src/autoCullArming.js`
